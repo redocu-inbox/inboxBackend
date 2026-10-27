@@ -1,0 +1,85 @@
+# One command starts the whole local stack: API, worker, Postgres, Redis.
+# Compose reads .env in this directory and substitutes ${POSTGRES_*} below.
+name: inbox
+
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Docker Desktop on macOS often misses file-change events. Polling makes
+      # --reload notice saves inside the bind mount.
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      # Your local code replaces /app so edits reload without a rebuild.
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    build: .
+    command: arq app.worker.settings.WorkerSettings --watch /app/app
+    env_file:
+      - .env
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Host port is 5433 so this stack can start when a local Postgres
+    # already owns 5432. Containers still connect to postgres:5432.
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Host port is 6380 so this stack can start when a local Redis
+    # already owns 6379. Containers still connect to redis:6379.
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

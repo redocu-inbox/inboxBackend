@@ -1,0 +1,24 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local object storage (keep the directory, ignore uploaded files)
+storage/*
+!storage/.gitkeep
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
