@@ -15,3 +15,4 @@ class ObjectStorage(Protocol):
 
     def delete(self, key: str) -> None:
         """Remove `key`. Do nothing if it is already gone."""
+

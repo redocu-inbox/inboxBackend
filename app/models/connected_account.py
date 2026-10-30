@@ -31,6 +31,9 @@ class ConnectedAccount(SQLModel, table=True):
     refresh_token: str | None = Field(default=None, sa_column=Column(Text))
     token_expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     scopes: str | None = Field(default=None, sa_column=Column(Text))
+    delta_link: str | None = Field(default=None, sa_column=Column(Text))
+    graph_subscription_id: str | None = Field(default=None,max_length=128)
+    graph_subscription_expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
 
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
