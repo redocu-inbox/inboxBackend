@@ -7,7 +7,12 @@ win over the .env file, which wins over the defaults below.
 
 from functools import lru_cache
 
+from cryptography.fernet import Fernet
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_PLACEHOLDER_SECRET_KEYS = {"change-me", "change-me-to-a-long-random-string"}
+_MIN_SECRET_KEY_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -19,7 +24,12 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
+    # Signs login JWTs. Changing it logs everyone out.
     secret_key: str = "change-me"
+    access_token_expire_minutes: int = 60
+    # Fernet key that encrypts Microsoft tokens at rest. Changing it makes stored
+    # tokens unreadable, so it is separate from secret_key.
+    token_encryption_key: str = ""
 
     # `postgresql+psycopg` means "Postgres, using the psycopg v3 driver".
     database_url: str = "postgresql+psycopg://inbox:inbox@localhost:5432/inbox"
@@ -44,6 +54,26 @@ class Settings(BaseSettings):
     llm_model: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
+
+    @model_validator(mode="after")
+    def _check_secrets(self) -> "Settings":
+        """Refuse to start with a malformed key, or with dev secrets outside development."""
+        if self.token_encryption_key:
+            try:
+                Fernet(self.token_encryption_key)
+            except ValueError as exc:
+                raise ValueError("TOKEN_ENCRYPTION_KEY is not a valid Fernet key") from exc
+
+        if self.app_env == "development":
+            return self
+        if self.secret_key in _PLACEHOLDER_SECRET_KEYS or len(self.secret_key) < _MIN_SECRET_KEY_LENGTH:
+            raise ValueError(
+                f"SECRET_KEY must be a random string of at least {_MIN_SECRET_KEY_LENGTH} "
+                f"characters when APP_ENV is {self.app_env!r}"
+            )
+        if not self.token_encryption_key:
+            raise ValueError(f"TOKEN_ENCRYPTION_KEY is required when APP_ENV is {self.app_env!r}")
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

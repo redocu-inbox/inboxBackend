@@ -7,6 +7,7 @@ from sqlalchemy import Column, DateTime, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from app.models.user import utcnow
+from app.security import EncryptedText
 
 class ConnectedAccount(SQLModel, table=True):
     """Outlook / Microsft Graph credentials for one mailbox."""
@@ -24,11 +25,9 @@ class ConnectedAccount(SQLModel, table=True):
     tenant_id: str | None = Field(default=None, max_length=128)
     email: str = Field(max_length=320)
 
-    # Graph tokens are long. VARCHAR(255) will truncate them and break refresh.
-    # Still plaintext in this phase. Do not log these columns.
-
-    access_token: str = Field(sa_column=Column(Text, nullable=False))
-    refresh_token: str | None = Field(default=None, sa_column=Column(Text))
+    # Encrypted in the database and plaintext on this object. Do not log these columns.
+    access_token: str = Field(sa_column=Column(EncryptedText, nullable=False), repr=False)
+    refresh_token: str | None = Field(default=None, sa_column=Column(EncryptedText), repr=False)
     token_expires_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     scopes: str | None = Field(default=None, sa_column=Column(Text))
     delta_link: str | None = Field(default=None, sa_column=Column(Text))
