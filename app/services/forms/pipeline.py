@@ -6,6 +6,7 @@ from sqlmodel import Session
 
 from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.form_template import FormTemplate
+from app.models.message import Message
 from app.storage import get_storage
 
 
@@ -44,10 +45,14 @@ def create_fill_job(
     template_id: UUID,
     message_id: UUID | None,
 ) -> FormFillJob:
-    """Insert a pending fill job for a template owned by this user."""
+    """Insert a pending fill job for a template and message owned by this user."""
     template = session.get(FormTemplate, template_id)
     if template is None or template.user_id != user_id:
         raise LookupError(f"Form template {template_id} was not found")
+    if message_id is not None:
+        message = session.get(Message, message_id)
+        if message is None or message.user_id != user_id:
+            raise LookupError(f"Message {message_id} was not found")
     job = FormFillJob(
         user_id=user_id,
         template_id=template_id,

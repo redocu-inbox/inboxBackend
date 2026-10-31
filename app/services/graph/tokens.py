@@ -1,6 +1,7 @@
 """Read and write Graph OAuth tokens on a connected account.
 
-Tokens are still stored in plaintext. This file must not log them.
+The token columns encrypt on write and decrypt on read, so this file handles
+plaintext. It must not log them.
 """
 
 from datetime import datetime, timedelta
