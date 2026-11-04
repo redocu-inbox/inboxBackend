@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # Shared secret Graph echoes on each webhook notification.
     graph_webhook_client_state: str = ""
 
+    graph_scopes: str = (
+        "https://graph.microsoft.com/User.Read,"
+        "https://graph.microsoft.com/Mail.Read,"
+        "https://graph.microsoft.com/Mail.ReadWrite"
+    )
+
     # stub for now. Later values: openai, anthropic.
     llm_provider: str = "stub"
     llm_model: str = ""
@@ -79,6 +85,13 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
+    @property
+    def graph_scope_list(self) -> list[str]:
+        return [scope.strip() for scope in self.graph_scopes.split(",") if scope.strip()]
+
+    @property
+    def graph_authority(self) -> str:
+        return f"https://login.microsoftonline.com/{self.graph_tenant_id}"
 
 @lru_cache
 def get_settings() -> Settings:
