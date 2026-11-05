@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
     storage_local_path: str = "./storage"
 
-    # Microsoft Graph. Unused until OAuth and delta sync are implemented.
+    # Microsoft Graph app used to connect a mailbox and list recent messages.
     graph_client_id: str = ""
     graph_client_secret: str = ""
     graph_tenant_id: str = "common"

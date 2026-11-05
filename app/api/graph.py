@@ -1,6 +1,7 @@
 """Webhook route for Microsoft Graph change notifications.
 
-OAuth login is a later phase. Token columns are read through services.graph.tokens.
+Mailbox connect is `GET /auth/microsoft/start`. This route handles the
+subscription handshake and change notifications.
 """
 
 import logging
