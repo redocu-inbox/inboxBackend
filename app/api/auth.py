@@ -1,34 +1,33 @@
-"""Registration and login. Both return a Bearer token.
+"""Registration, login, logout, and Microsoft mailbox connect.
 
-These are plain `def` routes because password hashing is deliberately slow.
-FastAPI runs them in a thread pool, so hashing does not block the event loop.
+Register and login are plain `def` routes because password hashing is deliberately
+slow. FastAPI runs them in a thread pool, so hashing does not block the event loop.
 """
 
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from pydantic import AfterValidator, BaseModel, EmailStr, Field
-from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
-import secrets
-import redis 
-from fastapi.responses import RedirectResponse
-from urllib.parse import urlencode
-
-import logging
 from datetime import timedelta
+import logging
+import re
+import secrets
 from uuid import UUID
 
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import AfterValidator, BaseModel, EmailStr, Field
+from sqlalchemy.exc import IntegrityError
+import redis
+from sqlmodel import Session, select
+from typing import Annotated
+from urllib.parse import urlencode
 
-from app.api.deps import get_current_user, get_session
+from app.api.deps import _bearer, get_arq, get_current_user, get_session
 from app.config import get_settings
-from app.models.user import User
-from app.security import create_access_token, hash_password, verify_password
+from app.models.revoked_token import RevokedToken
+from app.models.user import User, utcnow
+from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.oauth import build_msal_app
-from app.models.connected_account import ConnectedAccount
-from app.models.user import utcnow
-from app.services.graph.tokens import save_tokens
-from app.api.deps import get_arq
+from app.services.mailboxes import disconnect_active_mailbox, mark_sync_enqueue_failed
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +35,11 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Stored and looked up in lowercase, so Ana@x.com and ana@x.com are one account.
 NormalizedEmail = Annotated[EmailStr, AfterValidator(str.lower)]
+
+# token_urlsafe(32) is 43 characters from this alphabet. Reject anything else
+# before it is used as a Redis key.
+_STATE_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+_STATE_TTL_SECONDS = 600
 
 
 class RegisterRequest(BaseModel):
@@ -60,11 +64,18 @@ class MicrosoftStartResponse(BaseModel):
     authorization_url: str
 
 
+class DisconnectResponse(BaseModel):
+    disconnected: bool
+
+
 # The frontend branches on these. Provider text is logged and stays out of the URL.
 _ERR_DENIED = "microsoft_denied"
 _ERR_STATE = "invalid_state"
 _ERR_TOKEN = "token_exchange"
 _ERR_TAKEN = "mailbox_taken"
+_ERR_CONFLICT = "mailbox_conflict"
+
+_UNAVAILABLE = object()
 
 
 def _token_response(user: User) -> TokenResponse:
@@ -108,10 +119,54 @@ def login(body: LoginRequest, session: Session = Depends(get_session)) -> TokenR
     return _token_response(user)
 
 
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    """Revoke the caller's current app JWT. Other jti tokens stay valid.
+
+    A legacy token with no jti sets users.auth_valid_after to that token's iat,
+    which rejects other legacy tokens issued at or before that instant. Tokens
+    that have a jti are not affected by auth_valid_after.
+    """
+    claims = decode_access_token(credentials.credentials) if credentials else None
+    if claims is None or claims.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if claims.jti is not None:
+        session.add(
+            RevokedToken(
+                jti=claims.jti,
+                user_id=user.id,
+                expires_at=claims.expires_at,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+    else:
+        if user.auth_valid_after is None or claims.issued_at > user.auth_valid_after:
+            user.auth_valid_after = claims.issued_at
+            user.updated_at = utcnow()
+            session.add(user)
+            session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _frontend_origin() -> str:
+    """Origin from server config. Never taken from the request."""
+    return get_settings().frontend_url.rstrip("/")
+
+
 def _inbox_redirect(**query: str) -> RedirectResponse:
-    """302 to the Vite origin. Query values are encoded once."""
-    base = get_settings().frontend_url.rstrip("/")
-    url = f"{base}/inbox?{urlencode(query)}"
+    """302 to the configured frontend origin. Query values are encoded once."""
+    url = f"{_frontend_origin()}/inbox?{urlencode(query)}"
     response = RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
     # RedirectResponse quotes the location. Set the already-encoded URL so
     # the email is not encoded a second time.
@@ -119,23 +174,37 @@ def _inbox_redirect(**query: str) -> RedirectResponse:
     return response
 
 
-def _inbox_failure(code: str, **detail: object) -> RedirectResponse:
-    logger.warning("Microsoft sign-in failed (%s): %s", code, detail)
+def _inbox_failure(code: str) -> RedirectResponse:
+    logger.warning("Microsoft sign-in failed (%s)", code)
     return _inbox_redirect(connected="0", error=code)
 
 
-def _consume_oauth_user_id(state: str) -> UUID | None:
-    """Read and delete the one-time state, or return None when it is not ours."""
+def _redis_client() -> redis.Redis:
     settings = get_settings()
-    client = redis.Redis.from_url(
+    return redis.Redis.from_url(
         settings.redis_url,
         socket_connect_timeout=2,
         socket_timeout=2,
     )
+
+
+def _consume_oauth_user_id(state: str) -> UUID | None | object:
+    """Read and delete the one-time state.
+
+    None means the state is missing, malformed, or unknown.
+    `_UNAVAILABLE` means Redis could not be used. The code must not be exchanged.
+    """
+    if not _STATE_RE.fullmatch(state):
+        return None
     try:
-        raw = client.getdel(f"oauth_state:{state}")
-    finally:
-        client.close()
+        client = _redis_client()
+        try:
+            raw = client.getdel(f"oauth_state:{state}")
+        finally:
+            client.close()
+    except Exception:
+        logger.warning("oauth state store unavailable")
+        return _UNAVAILABLE
     if not raw:
         return None
     try:
@@ -145,27 +214,82 @@ def _consume_oauth_user_id(state: str) -> UUID | None:
         return None
 
 
+def _store_oauth_state(state: str, user_id: UUID) -> None:
+    client = _redis_client()
+    try:
+        client.setex(f"oauth_state:{state}", _STATE_TTL_SECONDS, str(user_id))
+    finally:
+        client.close()
+
+
+def _delete_oauth_state(state: str) -> None:
+    try:
+        client = _redis_client()
+        try:
+            client.delete(f"oauth_state:{state}")
+        finally:
+            client.close()
+    except Exception:
+        logger.warning("oauth state cleanup failed")
+
+
 @router.get("/microsoft/start", status_code=status.HTTP_200_OK)
 def microsoft_start(user: User = Depends(get_current_user)) -> MicrosoftStartResponse:
     """Return Microsoft's authorize URL. The Bearer token is not copied into it."""
     state = secrets.token_urlsafe(32)
+    try:
+        _store_oauth_state(state, user.id)
+    except Exception as exc:
+        logger.warning("oauth state store unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outlook connect is temporarily unavailable.",
+        ) from exc
     settings = get_settings()
-    client = redis.Redis.from_url(
-        settings.redis_url,
-        socket_connect_timeout=2,
-        socket_timeout=2,
-    )
-    try: 
-        client.setex(f"oauth_state:{state}", 600, str(user.id))
-    finally:
-        client.close()
-    
-    url = build_msal_app().get_authorization_request_url(
-        settings.graph_scope_list,
-        state=state,
-        redirect_uri=settings.graph_redirect_uri,
-    )
+    try:
+        url = build_msal_app().get_authorization_request_url(
+            settings.graph_scope_list,
+            state=state,
+            redirect_uri=settings.graph_redirect_uri,
+        )
+    except Exception as exc:
+        _delete_oauth_state(state)
+        logger.warning("Microsoft authorize URL failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Outlook connect is temporarily unavailable.",
+        ) from exc
     return MicrosoftStartResponse(authorization_url=url)
+
+
+def _exchange_code(code: str) -> dict | None:
+    settings = get_settings()
+    try:
+        result = build_msal_app().acquire_token_by_authorization_code(
+            code,
+            scopes=settings.graph_scope_list,
+            redirect_uri=settings.graph_redirect_uri,
+        )
+    except Exception as exc:
+        logger.warning("Microsoft token exchange failed error_type=%s", type(exc).__name__)
+        return None
+    if not isinstance(result, dict):
+        return None
+    return result
+
+
+@router.post("/microsoft/disconnect")
+def microsoft_disconnect(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> DisconnectResponse:
+    """Clear the active mailbox's tokens and hide it. Messages stay in the database."""
+    if not disconnect_active_mailbox(session, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No mailbox is connected.",
+        )
+    return DisconnectResponse(disconnected=True)
 
 
 @router.get("/microsoft/callback")
@@ -177,90 +301,96 @@ async def microsoft_callback(
     error_description: str | None = None,
     session: Session = Depends(get_session),
 ) -> RedirectResponse:
-    """Finish Microsoft login and send the browser back to the Vite app.
+    """Finish Microsoft login and send the browser back to the configured frontend.
 
     Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
-    Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...` with one of
-    microsoft_denied, invalid_state, token_exchange, or mailbox_taken.
+    Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
+    The error is one of microsoft_denied, invalid_state, token_exchange,
+    mailbox_taken, or mailbox_conflict. Provider text, codes, and tokens are
+    not copied into the URL. Unexpected failures also redirect to token_exchange
+    unless the mailbox row was already committed, in which case the redirect is
+    connected=1 so a saved refresh token is not described as a failed exchange.
     """
-    if error:
-        # Burn the one-time state when Microsoft sent one back with the error.
-        if state:
-            _consume_oauth_user_id(state)
-        return _inbox_failure(
-            _ERR_DENIED,
-            error=error,
-            error_description=error_description,
-        )
-    if not code or not state:
-        if state:
-            _consume_oauth_user_id(state)
-        return _inbox_failure(_ERR_STATE, reason="missing_code_or_state")
-
-    user_id = _consume_oauth_user_id(state)
-    if user_id is None:
-        return _inbox_failure(_ERR_STATE, reason="unknown_or_malformed_state")
-
-    settings = get_settings()
-    result = build_msal_app().acquire_token_by_authorization_code(
-        code,
-        scopes=settings.graph_scope_list,
-        redirect_uri=settings.graph_redirect_uri,
-    )
-    if "error" in result or "access_token" not in result:
-        return _inbox_failure(
-            _ERR_TOKEN,
-            error=result.get("error"),
-            error_description=result.get("error_description"),
-        )
-
-    refresh_token = result.get("refresh_token")
-    claims = result.get("id_token_claims") or {}
-    provider_account_id = claims.get("oid")
-    email = claims.get("preferred_username") or claims.get("email")
-    if not refresh_token or not provider_account_id or not email:
-        return _inbox_failure(
-            _ERR_TOKEN,
-            error="incomplete_token_response",
-            has_refresh_token=bool(refresh_token),
-            has_oid=bool(provider_account_id),
-            has_email=bool(email),
-        )
+    del error_description  # logged nowhere and never copied into the redirect
+    persisted = False
     try:
-        expires_in = int(result["expires_in"])
-    except (KeyError, TypeError, ValueError):
-        return _inbox_failure(_ERR_TOKEN, error="missing_expires_in")
+        if error:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_DENIED)
+        if not code or not state:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_STATE)
 
-    expires_at = utcnow() + timedelta(seconds=expires_in)
-    account = session.exec(
-        select(ConnectedAccount).where(
-            ConnectedAccount.provider == "microsoft",
-            ConnectedAccount.provider_account_id == provider_account_id,
-        )
-    ).first()
+        user_id = _consume_oauth_user_id(state)
+        if user_id is _UNAVAILABLE or user_id is None:
+            return _inbox_failure(_ERR_STATE)
+        if not isinstance(user_id, UUID):
+            return _inbox_failure(_ERR_STATE)
+        if session.get(User, user_id) is None:
+            return _inbox_failure(_ERR_STATE)
 
-    if account is not None and account.user_id != user_id:
-        return _inbox_failure(_ERR_TAKEN, provider_account_id=provider_account_id)
-    if account is None:
-        account = ConnectedAccount(
+        result = _exchange_code(code)
+        if result is None or "error" in result or "access_token" not in result:
+            return _inbox_failure(_ERR_TOKEN)
+
+        refresh_token = result.get("refresh_token")
+        claims = result.get("id_token_claims") or {}
+        if not isinstance(claims, dict):
+            claims = {}
+        provider_account_id = claims.get("oid")
+        email = claims.get("preferred_username") or claims.get("email")
+        if (
+            not isinstance(refresh_token, str)
+            or not refresh_token
+            or not isinstance(provider_account_id, str)
+            or not provider_account_id
+            or not isinstance(email, str)
+            or not email
+        ):
+            return _inbox_failure(_ERR_TOKEN)
+        try:
+            expires_in = int(result["expires_in"])
+        except (KeyError, TypeError, ValueError):
+            return _inbox_failure(_ERR_TOKEN)
+        tenant = claims.get("tid")
+        tenant_id = tenant if isinstance(tenant, str) else None
+        outcome = connect_microsoft_mailbox(
+            session,
             user_id=user_id,
             provider_account_id=provider_account_id,
-            tenant_id=claims.get("tid"),
+            tenant_id=tenant_id,
             email=email,
             access_token=result["access_token"],
+            refresh_token=refresh_token,
+            expires_at=utcnow() + timedelta(seconds=expires_in),
+            scopes=result.get("scope") if isinstance(result.get("scope"), str) else None,
         )
-        session.add(account)
-    else:
-        account.email = email
-        account.tenant_id = claims.get("tid")
+        if outcome.status is ConnectStatus.mailbox_taken:
+            return _inbox_failure(_ERR_TAKEN)
+        if outcome.status is ConnectStatus.mailbox_conflict:
+            return _inbox_failure(_ERR_CONFLICT)
+        if outcome.status is not ConnectStatus.connected or outcome.account_id is None:
+            return _inbox_failure(_ERR_TOKEN)
+        persisted = True
+        try:
+            await get_arq_enqueue(request, outcome.account_id, outcome.generation)
+        except Exception as exc:
+            logger.warning(
+                "sync enqueue failed account=%s error_type=%s",
+                outcome.account_id,
+                type(exc).__name__,
+            )
+            if outcome.generation is not None:
+                mark_sync_enqueue_failed(session, outcome.account_id, outcome.generation)
+        return _inbox_redirect(connected="1", email=outcome.email or email)
+    except Exception as exc:
+        logger.warning("Microsoft callback failed error_type=%s", type(exc).__name__)
+        if persisted:
+            return _inbox_redirect(connected="1")
+        return _inbox_failure(_ERR_TOKEN)
 
-    save_tokens(
-        session,
-        account,
-        access_token=result["access_token"],
-        refresh_token=refresh_token,
-        expires_at=expires_at,
-        scopes=result.get("scope"),
-    )
-    await get_arq(request).enqueue_job("sync_mailbox_delta", str(account.id))
-    return _inbox_redirect(connected="1", email=email)
+
+async def get_arq_enqueue(request: Request, account_id: UUID, generation: int | None) -> None:
+    await get_arq(request).enqueue_job("sync_mailbox_delta", str(account_id), generation)

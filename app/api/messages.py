@@ -1,10 +1,10 @@
 """Message list, detail, and a manual mailbox sync.
 
-The JSON keys are frozen for the frontend. Sender, read state, conversation id,
-and priority band are null until phase 6 stores them. priority_score is the
-stored column, which stays null until phase 6 writes it. priority_reasons is
-empty until phase 6. suggested_form is null until phase 10. On the detail
-route, body_text and draft are null until phase 7.
+The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
+body_text are filled from Graph when a sync stores them, and stay null when
+Graph omits them. body_text is plain text, never raw HTML. priority_score stays
+null until a later phase writes it. priority_reasons is empty until then.
+suggested_form is null until a later phase. draft stays null.
 """
 
 from datetime import datetime
@@ -17,9 +17,10 @@ from sqlalchemy import func, nulls_last
 from sqlmodel import Session, select
 
 from app.api.deps import get_arq, get_current_user, get_session
-from app.api.users import latest_connected_account
+from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
 from app.models.user import User
+from app.services.mailboxes import mark_sync_enqueue_failed, request_mailbox_sync
 
 router = APIRouter(tags=["messages"])
 
@@ -46,6 +47,16 @@ class MessageDetailResponse(MessageResponse):
 
 class SyncResponse(BaseModel):
     enqueued: bool
+    sync_status: Literal["idle", "pending", "running", "failed"]
+
+
+def _visible_message_filter(user_id: UUID):
+    """Messages on this user's active mailbox. Disconnected mailboxes stay in the database."""
+    active_ids = select(ConnectedAccount.id).where(
+        ConnectedAccount.user_id == user_id,
+        ConnectedAccount.disconnected_at.is_(None),
+    )
+    return Message.user_id == user_id, Message.connected_account_id.in_(active_ids)
 
 
 def _message_response(row: Message) -> MessageResponse:
@@ -53,7 +64,10 @@ def _message_response(row: Message) -> MessageResponse:
         id=row.id,
         subject=row.subject,
         body_preview=row.body_preview,
+        from_name=row.from_name,
+        from_email=row.from_email,
         received_at=row.received_at,
+        is_read=row.is_read,
         priority_score=row.priority_score,
     )
 
@@ -77,12 +91,13 @@ def list_messages(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> list[MessageResponse]:
-    """List this user's messages. X-Total-Count ignores limit and offset."""
-    total = session.scalar(select(func.count(Message.id)).where(Message.user_id == user.id))
+    """List this user's active-mailbox messages. X-Total-Count ignores limit and offset."""
+    visible = _visible_message_filter(user.id)
+    total = session.scalar(select(func.count(Message.id)).where(*visible))
     response.headers["X-Total-Count"] = str(total or 0)
     rows = session.exec(
         select(Message)
-        .where(Message.user_id == user.id)
+        .where(*visible)
         .order_by(*_order_by(sort))
         .offset(offset)
         .limit(limit)
@@ -99,8 +114,11 @@ def read_message(
     row = session.get(Message, message_id)
     if row is None or row.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
+    account = session.get(ConnectedAccount, row.connected_account_id)
+    if account is None or account.user_id != user.id or account.disconnected_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
     item = _message_response(row)
-    return MessageDetailResponse(**item.model_dump(), body_text=None, draft=None)
+    return MessageDetailResponse(**item.model_dump(), body_text=row.body_text, draft=None)
 
 
 @router.post("/messages/sync", status_code=status.HTTP_202_ACCEPTED)
@@ -109,12 +127,30 @@ async def sync_messages(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> SyncResponse:
-    """Enqueue sync_mailbox_delta for the same mailbox GET /users/me reports."""
-    account = latest_connected_account(session, user.id)
-    if account is None:
+    """Enqueue sync_mailbox_delta for the active mailbox, or report the job already in flight.
+
+    `enqueued` is true only when this call took a new generation. A 202 with
+    `enqueued` false means a pending or running job is still the current one.
+    Queuing does not set last_successful_at. A queue outage is 503 and the row
+    is failed, not idle.
+    """
+    requested = request_mailbox_sync(session, user.id)
+    if requested is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No mailbox is connected.",
         )
-    await get_arq(request).enqueue_job("sync_mailbox_delta", str(account.id))
-    return SyncResponse(enqueued=True)
+    if requested.enqueued:
+        try:
+            await get_arq(request).enqueue_job(
+                "sync_mailbox_delta",
+                str(requested.account_id),
+                requested.generation,
+            )
+        except Exception as exc:
+            mark_sync_enqueue_failed(session, requested.account_id, requested.generation)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Mailbox sync could not be queued.",
+            ) from exc
+    return SyncResponse(enqueued=requested.enqueued, sync_status=requested.sync_status)
