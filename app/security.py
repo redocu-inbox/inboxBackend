@@ -42,6 +42,9 @@ class AccessTokenClaims:
     jti: UUID | None
     issued_at: datetime
     expires_at: datetime
+    # None means the token was issued before session_version existed. Callers
+    # treat that as version 0. Password reset bumps the user and rejects 0.
+    session_version: int | None
 
 
 def _as_utc(value: datetime | int | float) -> datetime:
@@ -52,11 +55,17 @@ def _as_utc(value: datetime | int | float) -> datetime:
     return datetime.fromtimestamp(value, timezone.utc)
 
 
-def create_access_token(user_id: UUID) -> str:
+def create_access_token(user_id: UUID, session_version: int = 0) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=settings.access_token_expire_minutes)
-    claims = {"sub": str(user_id), "iat": now, "exp": expires_at, "jti": str(uuid4())}
+    claims = {
+        "sub": str(user_id),
+        "iat": now,
+        "exp": expires_at,
+        "jti": str(uuid4()),
+        "ver": int(session_version),
+    }
     return jwt.encode(claims, settings.secret_key, algorithm=_JWT_ALGORITHM)
 
 
@@ -76,11 +85,19 @@ def decode_access_token(token: str) -> AccessTokenClaims | None:
         )
         jti_raw = claims.get("jti")
         jti = UUID(str(jti_raw)) if jti_raw is not None else None
+        if "ver" in claims:
+            version = claims["ver"]
+            if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                return None
+            session_version: int | None = version
+        else:
+            session_version = None
         return AccessTokenClaims(
             user_id=UUID(claims["sub"]),
             jti=jti,
             issued_at=_as_utc(claims["iat"]),
             expires_at=_as_utc(claims["exp"]),
+            session_version=session_version,
         )
     except (jwt.InvalidTokenError, ValueError):
         return None

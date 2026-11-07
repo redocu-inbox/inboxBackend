@@ -31,9 +31,10 @@ def _production(**overrides) -> Settings:
         ),
         "redis_url": "rediss://:s3cret@kv.internal:6379/0",
         "frontend_url": "https://redocu.app",
-        "cors_origins": "https://redocu.app/",
+        "cors_origins": "https://redocu.app",
         "graph_redirect_uri": "https://inbox-api.onrender.com/auth/microsoft/callback",
         "graph_webhook_client_state": "w" * 32,
+        "email_provider": "disabled",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -71,6 +72,10 @@ def test_production_settings_accept_direct_tls_postgres_and_rediss():
         {"graph_redirect_uri": "http://inbox-api.onrender.com/auth/microsoft/callback"},
         {"graph_redirect_uri": "https://inbox-api.onrender.com/callback"},
         {"graph_webhook_client_state": "short"},
+        {"frontend_url": "https://redocu.app/", "cors_origins": "https://redocu.app/"},
+        {"email_provider": "fake"},
+        {"email_provider": "console"},
+        {"email_provider": "resend", "email_api_key": "", "email_from": ""},
     ],
 )
 def test_production_settings_reject_unsafe_defaults(overrides):

@@ -32,6 +32,9 @@ def _token_is_revoked(session: Session, claims) -> bool:
     user = session.get(User, claims.user_id)
     if user is None:
         return True
+    token_version = 0 if claims.session_version is None else claims.session_version
+    if token_version != int(user.session_version or 0):
+        return True
     if claims.jti is not None:
         row = session.get(RevokedToken, claims.jti)
         return row is not None and row.expires_at > utcnow()
