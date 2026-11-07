@@ -11,9 +11,13 @@ from urllib.parse import urlsplit
 from cryptography.fernet import Fernet
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine.url import make_url
 
 _PLACEHOLDER_SECRET_KEYS = {"change-me", "change-me-to-a-long-random-string"}
 _MIN_SECRET_KEY_LENGTH = 32
+_LOCAL_DB_PASSWORD = "inbox"
+_ACCEPTED_SSLMODES = {"require", "verify-ca", "verify-full"}
+_GRAPH_CALLBACK_PATH = "/auth/microsoft/callback"
 
 
 class Settings(BaseSettings):
@@ -85,6 +89,8 @@ class Settings(BaseSettings):
             )
         if not self.token_encryption_key:
             raise ValueError(f"TOKEN_ENCRYPTION_KEY is required when APP_ENV is {self.app_env!r}")
+        if self.app_env == "production":
+            self._check_production_deployment()
         return self
 
     def _check_frontend_url(self) -> None:
@@ -103,6 +109,31 @@ class Settings(BaseSettings):
         if parts.path not in {"", "/"}:
             raise ValueError("FRONTEND_URL must not include a path")
 
+    def _check_production_deployment(self) -> None:
+        """Refuse a public boot that still has local defaults or a cleartext database.
+
+        These checks run only when APP_ENV is production. Local Compose and the
+        test suite stay on development and test.
+        """
+        frontend = _normalize_origin(self.frontend_url, what="FRONTEND_URL")
+        if not frontend.startswith("https://"):
+            raise ValueError("FRONTEND_URL must use https when APP_ENV is production")
+        if not self.cors_origins.strip() or "*" in self.cors_origin_list:
+            raise ValueError("CORS_ORIGINS must be an explicit https origin list when APP_ENV is production")
+        origins = [_normalize_origin(item, what="CORS_ORIGINS") for item in self.cors_origin_list]
+        if any(not origin.startswith("https://") for origin in origins):
+            raise ValueError("CORS_ORIGINS must use https when APP_ENV is production")
+        if frontend not in origins:
+            raise ValueError("CORS_ORIGINS must include FRONTEND_URL when APP_ENV is production")
+        _check_production_database(self.database_url)
+        _check_production_redis(self.redis_url)
+        _check_production_redirect(self.graph_redirect_uri)
+        if len(self.graph_webhook_client_state) < 16:
+            raise ValueError(
+                "GRAPH_WEBHOOK_CLIENT_STATE must be a random string of at least 16 characters "
+                "when APP_ENV is production"
+            )
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
@@ -114,6 +145,57 @@ class Settings(BaseSettings):
     @property
     def graph_authority(self) -> str:
         return f"https://login.microsoftonline.com/{self.graph_tenant_id}"
+
+def _normalize_origin(value: str, *, what: str) -> str:
+    parts = urlsplit(value.strip())
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(f"{what} must be an absolute http(s) origin")
+    if parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}:
+        raise ValueError(f"{what} must be an origin with no path, query, or userinfo")
+    if parts.port:
+        return f"{parts.scheme}://{parts.hostname}:{parts.port}"
+    return f"{parts.scheme}://{parts.hostname}"
+
+
+def _check_production_database(database_url: str) -> None:
+    try:
+        url = make_url(database_url)
+    except Exception as exc:
+        raise ValueError("DATABASE_URL is not a valid database URL") from exc
+    if url.drivername != "postgresql+psycopg":
+        raise ValueError("DATABASE_URL must use the postgresql+psycopg driver when APP_ENV is production")
+    if not url.password or url.password == _LOCAL_DB_PASSWORD:
+        raise ValueError("DATABASE_URL must not use the local example password when APP_ENV is production")
+    host = (url.host or "").lower()
+    if "-pooler" in host or url.query.get("pgbouncer") == "true":
+        raise ValueError(
+            "DATABASE_URL must be a direct Postgres host when APP_ENV is production. "
+            "A transaction pooler breaks migrations and advisory locks."
+        )
+    sslmode = url.query.get("sslmode")
+    if sslmode not in _ACCEPTED_SSLMODES:
+        raise ValueError(
+            "DATABASE_URL must set sslmode=require, verify-ca, or verify-full when APP_ENV is production"
+        )
+
+
+def _check_production_redis(redis_url: str) -> None:
+    parts = urlsplit(redis_url)
+    if parts.scheme not in {"redis", "rediss"}:
+        raise ValueError("REDIS_URL must use redis:// or rediss:// when APP_ENV is production")
+    if not parts.password:
+        raise ValueError("REDIS_URL must include a password when APP_ENV is production")
+
+
+def _check_production_redirect(redirect_uri: str) -> None:
+    parts = urlsplit(redirect_uri)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("GRAPH_REDIRECT_URI must be an https URL when APP_ENV is production")
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError("GRAPH_REDIRECT_URI must not include userinfo, a query, or a fragment")
+    if parts.path.rstrip("/") != _GRAPH_CALLBACK_PATH:
+        raise ValueError("GRAPH_REDIRECT_URI path must be /auth/microsoft/callback")
+
 
 @lru_cache
 def get_settings() -> Settings:

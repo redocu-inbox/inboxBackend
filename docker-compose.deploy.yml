@@ -1,0 +1,53 @@
+# Separate API and worker. No database and no Redis are started here.
+# Supply DATABASE_URL and REDIS_URL from outside this file. Do not put passwords
+# in this file. Copy deploy.env.example to the gitignored file deploy.env.
+# This file is not the local Compose stack.
+#
+# Local development stays on `docker compose up`.
+# A one-process demo is `python -m app.deploy.demo`, not this file.
+
+name: inbox-deploy
+
+services:
+  migrate:
+    build: .
+    command: python -m app.deploy.migrate_once
+    env_file:
+      - deploy.env
+    restart: "no"
+    profiles: ["migrate"]
+
+  api:
+    build: .
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file:
+      - deploy.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - api_storage:/app/storage
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m arq app.worker.settings.WorkerSettings
+    env_file:
+      - deploy.env
+    volumes:
+      - api_storage:/app/storage
+    restart: unless-stopped
+
+volumes:
+  api_storage:

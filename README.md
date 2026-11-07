@@ -330,7 +330,9 @@ Watch the sync with `docker compose logs -f worker`.
 
 ## Production
 
-The SPA origin is `https://redocu.app`. The API's public HTTPS hostname is not in this repository. Call it `<API_ORIGIN>` (scheme and host, no path) until it is known. Do not guess one, and do not put it in source.
+Host layout, the free-demo limits, migration, rollback, and a no-send Outlook smoke test are in [docs/deployment.md](docs/deployment.md). That guide is not a claim that a host is already running.
+
+The SPA origin is `https://redocu.app`. The API's public HTTPS hostname is not in this repository. Call it `<API_ORIGIN>` (scheme and host, no path) until it is known. Do not guess one, and do not put it in source. A free web host's default `https://<name>.onrender.com` hostname can be that origin until a custom domain is chosen. This repo does not create that service.
 
 Set these on the API and worker only. None of the secrets belong in the frontend bundle. `GRAPH_CLIENT_ID` appears inside the authorize URL the API returns. The SPA does not need its own copy.
 
@@ -357,11 +359,13 @@ The API process does not terminate TLS and does not redirect HTTP to HTTPS. What
 Deploy:
 
 1. Back up Postgres.
-2. Set the environment above. Do not point `FRONTEND_URL` at a path.
-3. `alembic upgrade head` (`b7d3e9a41c20`).
-4. Restart the API and the worker together so they share the new columns.
-5. Existing JWTs without `jti` keep working until they expire. New logins get a `jti`. `POST /auth/logout` revokes that `jti` only.
+2. Set the environment above in `deploy.env`. Do not point `FRONTEND_URL` at a path. Do not commit that file.
+3. Run `python -m app.deploy.migrate_once` once. It holds a Postgres advisory lock. The API and the worker do not migrate on their own.
+4. Start the API and the worker as two processes. Restart them together so they share the new columns.
+5. Existing JWTs without `jti` keep working until they expire. New logins get a `jti`. `POST /auth/logout` stores that `jti` in Postgres. A Redis restart does not undo a logout.
 6. Users who already had two Microsoft rows keep both rows. Only the newest stays visible. Tokens and messages on the others are not deleted.
+
+`APP_ENV=production` refuses the local database password, a database URL without `sslmode=require` (or stricter), a Redis URL without a password, an http frontend origin, a CORS list that omits that origin or contains `*`, a redirect URI that is not `https://<API_ORIGIN>/auth/microsoft/callback`, and a webhook client state shorter than 16 characters. `APP_ENV=development` and `APP_ENV=test` do not apply those checks.
 
 ## Tests
 
