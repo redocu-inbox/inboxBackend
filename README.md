@@ -14,6 +14,7 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | 4 | Register and login, profile read and update, Argon2 password hashes, HS256 login JWTs, Fernet encryption for Microsoft tokens, and tests for auth, data isolation, and token encryption |
 | 5 | Outlook mailbox connect (`GET /auth/microsoft/start`, `GET /auth/microsoft/callback`), refresh of encrypted Graph tokens, sync of recent messages, and `GET /messages` |
 | F | Frontend connection: `authorization_url` from Microsoft start, callback redirect to `FRONTEND_URL`, `mailbox` on `GET /users/me`, `POST /messages/sync`, and the frozen message list and detail contract |
+| F2 | One active Outlook mailbox per user, callback failures always redirect, Graph sender/read/plain-text body, sync status, disconnect, and server-side logout |
 
 ## Run it
 
@@ -50,7 +51,7 @@ A healthy response looks like this:
 
 FastAPI also publishes interactive docs at http://localhost:8000/docs.
 
-The API allows the origins in `CORS_ORIGINS` and allows credentials. The default is the Vite dev server at http://localhost:5173 and http://127.0.0.1:5173. `X-Total-Count` is exposed to those origins so the Vite app can read the message total.
+The API allows the origins in `CORS_ORIGINS` and allows credentials. It does not set a session cookie. Browsers may send `Authorization`, `Content-Type`, and `Accept`. `X-Total-Count` is exposed so the app can read the message total. The local default is the Vite dev server at http://localhost:5173 and http://127.0.0.1:5173. Do not set `CORS_ORIGINS` to `*`.
 
 Stop the stack with `Ctrl+C`, then:
 
@@ -116,7 +117,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 
 Microsoft tokens on `ConnectedAccount` are encrypted by the column type (`EncryptedText`), so code reads and writes plaintext as usual. This needs `TOKEN_ENCRYPTION_KEY`; see `.env.example`. Losing that key means every mailbox has to reconnect. It is separate from `SECRET_KEY`.
 
-Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset. The message sync stores `graph_id`, subject, body preview, and received time. `priority_score` stays unset. The list and detail JSON still include sender, read state, conversation id, priority band, reasons, and a suggested form. Those are null or empty until a later phase stores them. Detail adds `body_text` and `draft`, both null until phase 7.
+Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset until a later phase. The message sync stores `graph_id`, subject, preview, received time, sender name, sender email, read state, and plain-text body. `priority_score` stays unset. `conversation_id`, `priority_band`, `priority_reasons`, and `suggested_form` stay null or empty. Detail adds `body_text` and `draft`. `draft` stays null.
 
 ## Routes
 
@@ -125,13 +126,15 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /health`                | no   | API, database, pgvector, Redis, and storage |
 | `POST /auth/register`        | no   | Create an account and return a token |
 | `POST /auth/login`           | no   | Return a token |
-| `GET /auth/microsoft/start`  | yes  | Return `200` and `{"authorization_url": "..."}`. The Bearer token stays on this request |
-| `GET /auth/microsoft/callback` | no | Exchange the code, save the mailbox, enqueue `sync_mailbox_delta`, then `302` to the Vite app |
-| `GET /users/me`              | yes  | Read your profile, including `mailbox` |
-| `PATCH /users/me`            | yes  | Update `display_name`. The response includes `mailbox` too |
-| `GET /messages`              | yes  | List your messages. `X-Total-Count` is the full count |
-| `GET /messages/{id}`         | yes  | One message, or `404` with detail `Message not found.` |
-| `POST /messages/sync`        | yes  | `202` and `{"enqueued": true}`, or `404` when no mailbox is connected |
+| `GET /auth/microsoft/start`  | yes  | Return `200` and `{"authorization_url": "..."}`. The Bearer token stays on this request. Redis down is `503` |
+| `GET /auth/microsoft/callback` | no | Exchange the code, save or reject the mailbox, enqueue sync, then `302` to `{FRONTEND_URL}/inbox` |
+| `POST /auth/microsoft/disconnect` | yes | Clear the active mailbox's tokens and hide its messages. `200` or `404` |
+| `POST /auth/logout`          | yes  | `204`. Revoke this app JWT on the server |
+| `GET /users/me`              | yes  | Read your profile, including `mailbox` and `sync` |
+| `PATCH /users/me`            | yes  | Update `display_name`. The response includes `mailbox` and `sync` too |
+| `GET /messages`              | yes  | List messages for the active mailbox. `X-Total-Count` is that count |
+| `GET /messages/{id}`         | yes  | One active-mailbox message, or `404` with detail `Message not found.` |
+| `POST /messages/sync`        | yes  | `202` with `enqueued` and `sync_status`, `404` when no mailbox is connected, `503` when the queue rejects the job |
 | `POST /webhooks/graph`       | no   | Graph subscription handshake, or enqueue `sync_mailbox_delta` |
 | `POST /forms/templates`      | yes  | Upload a PDF template (`application/pdf` only) |
 | `POST /forms/jobs`           | yes  | Create a pending fill job and enqueue `match_form_template` |
@@ -153,9 +156,9 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | `run_form_fill`             | nothing yet | Logs a TODO. `PdfFormFiller.fill` is not implemented |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
 
-`sync_mailbox_delta` takes one string. It loads the `connected_accounts` row whose `graph_subscription_id` equals that string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id, so that path finds the mailbox. Sync uses the same row `GET /users/me` reports: the caller's mailbox with the latest `updated_at`. The webhook passes a Graph subscription id. With `graph_subscription_id` empty, that UUID lookup misses, the job logs `No connected account for ...`, and it returns.
+`sync_mailbox_delta` takes the account or subscription id, and an optional generation integer. It loads the `connected_accounts` row whose `graph_subscription_id` equals the first string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id and the generation they just stored. The webhook passes only a Graph subscription id. With `graph_subscription_id` empty, that lookup misses, the job logs that no account was found, and it returns. A disconnected mailbox or a generation that is no longer current returns without calling Graph.
 
-When `token_expires_at` is missing or within five minutes, the job exchanges the stored refresh token and saves the new tokens. A failed refresh raises `RuntimeError` and the job stops. It then calls `GET https://graph.microsoft.com/v1.0/me/messages` with `$select=id,subject,bodyPreview,receivedDateTime`, `$top=25`, and `$orderby=receivedDateTime desc`, and follows `@odata.nextLink` for at most four pages. An item that has both `id` and `receivedDateTime` is inserted or updated for that mailbox and `graph_id`.
+When `token_expires_at` is missing or within five minutes, the job exchanges the stored refresh token and saves the new tokens only if the mailbox is still connected and the job's generation still matches. A failed refresh sets `sync_status` to `failed` and `sync.error_code` to `token_refresh_failed`. The job then calls `GET https://graph.microsoft.com/v1.0/me/messages` with `$select=id,subject,bodyPreview,receivedDateTime,from,isRead,body`, `$top=25`, and `$orderby=receivedDateTime desc`, and follows `@odata.nextLink` only when it starts with `https://graph.microsoft.com/`, for at most four pages. HTML bodies are stored as plain text. A disconnect or a newer sync generation makes the job return without writing tokens or messages. `last_sync_at` changes only after that write commits. Graph errors set `sync_error_code` to `graph_unavailable` and leave `last_sync_at` as it was. The job does not raise after it has recorded that failure, so ARQ does not retry it into a newer generation.
 
 `LLM_PROVIDER=stub` (the default) returns the fixed string `[stub llm]`. Any other provider raises `NotImplementedError`.
 
@@ -195,6 +198,9 @@ The chain is:
 1. `8c125a803a3b` — core tables, and `CREATE EXTENSION vector`
 2. `55194b925077` — `delta_link` and Graph subscription columns on `connected_accounts`
 3. `a1f4c7d29e10` — `hashed_password` on `users`
+4. `b7d3e9a41c20` — one active Microsoft mailbox per user, sync status, plain-text message fields, and `revoked_tokens`
+
+`b7d3e9a41c20` does not delete messages or tokens. If a user already has more than one Microsoft row, the one with the latest `updated_at` (then the greatest `id`) stays active. The others get `disconnected_at` set and stay in the database with their tokens and mail. The API hides those rows until that same Microsoft account is connected again. An explicit disconnect is different: it clears tokens and the delta link, and it keeps the messages.
 
 ## Authentication
 
@@ -210,9 +216,30 @@ curl http://localhost:8000/users/me -H 'Authorization: Bearer <token>'
 
 Emails are stored in lowercase, so `Ana@x.com` and `ana@x.com` are one account. Passwords must be 8–128 characters. A duplicate email is `409`. A wrong email or password is the same `401`, and the hasher still runs when the email is unknown so the two cases take the same time.
 
-`hashed_password` can be null. That account cannot log in with a password (reserved for a later OAuth-only sign-in). Connecting a mailbox is a separate step. `GET /auth/microsoft/start` requires a Bearer token for an account that already exists. Profile responses never include the hash. `GET /users/me` adds `mailbox`: `null` before connect, or `{"connected": true, "provider": "microsoft", "email": "..."}` for the mailbox with the latest `updated_at`. That object does not include tokens, scopes, or the delta link. `PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`. The patch response uses the same shape, including `mailbox`.
+`hashed_password` can be null. That account cannot log in with a password (reserved for a later OAuth-only sign-in). Connecting a mailbox is a separate step. `GET /auth/microsoft/start` requires a Bearer token for an account that already exists. Profile responses never include the hash. `GET /users/me` adds `mailbox` and `sync`. `mailbox` is `null` before connect and after disconnect. When a mailbox is active it is exactly:
 
-Tokens last `ACCESS_TOKEN_EXPIRE_MINUTES` and cannot be revoked individually. Changing `SECRET_KEY` logs everyone out. Outside `APP_ENV=development`, the API refuses to start with the placeholder secret or without `TOKEN_ENCRYPTION_KEY`.
+```json
+{"connected": true, "provider": "microsoft", "email": "ana@outlook.com"}
+```
+
+That object does not include tokens, scopes, the delta link, or sync fields. `sync` is `null` when `mailbox` is `null`. Otherwise:
+
+```json
+{"status": "idle", "last_successful_at": null, "error_code": null}
+```
+
+`status` is `idle`, `pending`, `running`, or `failed`. `last_successful_at` is an ISO-8601 UTC timestamp (`2026-11-07T20:43:08.343229Z`) set only after a sync finishes writing messages. It stays null, or stays at the previous success, while a job is queued, running, or failed. `error_code` is `null`, `queue_unavailable`, `token_refresh_failed`, or `graph_unavailable`. It is not an exception string and it never includes a token.
+
+`PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`. The patch response uses the same shape, including `mailbox` and `sync`.
+
+New login JWTs are HS256 with `sub`, `iat`, `exp`, and `jti`. `POST /auth/logout` with that token returns `204` and stores the `jti` in `revoked_tokens` until `exp`. A later request with the same token is `401 {"detail":"Not authenticated"}`. A second login's token has a different `jti` and keeps working. Logout does not disconnect the mailbox and does not affect another user.
+
+Tokens issued before `jti` existed (only `sub`, `iat`, `exp`) still work until they expire. Logging one of those out sets `users.auth_valid_after` to that token's `iat`. Other legacy tokens with an `iat` at or before that instant stop working. Tokens that have a `jti` ignore `auth_valid_after`. Changing `SECRET_KEY` still logs everyone out. Outside `APP_ENV=development`, the API refuses to start with the placeholder secret or without `TOKEN_ENCRYPTION_KEY`.
+
+```bash
+curl -X POST http://localhost:8000/auth/logout \
+  -H 'Authorization: Bearer <token>'
+```
 
 ## Connecting an Outlook mailbox
 
@@ -226,7 +253,7 @@ The connect flow uses a confidential Microsoft Entra app (MSAL) and stores the t
 | `GRAPH_REDIRECT_URI` | Redirect URI registered on the app, and the callback this API serves. Locally: `http://localhost:8000/auth/microsoft/callback` |
 | `GRAPH_SCOPES` | Comma-separated scopes sent on the authorize redirect, the code exchange, and token refresh. The default is `https://graph.microsoft.com/User.Read`, `https://graph.microsoft.com/Mail.Read`, and `https://graph.microsoft.com/Mail.ReadWrite` |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key for the token columns |
-| `FRONTEND_URL` | Vite origin, with no path. The callback redirects to `{FRONTEND_URL}/inbox`. The default is `http://localhost:5173` |
+| `FRONTEND_URL` | One http(s) origin, no path. The callback redirects to `{FRONTEND_URL}/inbox`. Local default `http://localhost:5173`. Production `https://redocu.app`. Rejected at startup if it has whitespace, a path, a query, or userinfo |
 
 Create an app registration with a client secret and those delegated permissions, and allow the account type you set in `GRAPH_TENANT_ID`. Register `GRAPH_REDIRECT_URI` as that app's redirect URI. `consumers` only applies to personal Microsoft accounts.
 
@@ -256,13 +283,32 @@ Failure uses `connected=0` and one of these `error` values. The provider's own t
 | `error` | When |
 | ------- | ---- |
 | `microsoft_denied` | Microsoft sent an `error` query parameter (the user cancelled, or the authorize step failed) |
-| `invalid_state` | `code` or `state` is missing, or the state is expired, already used, or not a user id |
-| `token_exchange` | The code exchange failed, or the token response has no access token, refresh token, `expires_in`, `oid`, or email (`preferred_username`, otherwise `email`) |
-| `mailbox_taken` | That Microsoft `oid` is already connected to a different user |
+| `invalid_state` | `code` or `state` is missing, the state is not 32–128 url-safe characters, Redis could not be read, or the state is expired, already used, or not a user id |
+| `token_exchange` | The code exchange failed, the token response is incomplete, or an unexpected error happened before the mailbox row was committed. General failure for the SPA |
+| `mailbox_taken` | That Microsoft `oid` is already stored for a different app user, including a disconnected row. This user's mailbox is not changed |
+| `mailbox_conflict` | This user already has a different active Outlook mailbox. Disconnect it first. Stored tokens are not replaced |
 
-The callback finds `connected_accounts` by provider `microsoft` and that `oid`. Connecting the same mailbox again as the same user updates the email, tenant id (`tid`), and tokens. On success it saves the encrypted tokens and enqueues `sync_mailbox_delta` with the account id.
+The redirect target is only `FRONTEND_URL` from the server environment. The request cannot choose a different host. Provider text, the authorization code, and tokens are not placed in the URL. If Redis is down, start returns `503 {"detail":"Outlook connect is temporarily unavailable."}` and the callback returns `invalid_state` without calling Microsoft.
 
-`GET /users/me` then shows that mailbox. `POST /messages/sync` enqueues the same account again and returns `202` with `{"enqueued": true}`. With no mailbox the status is `404` and the detail is `No mailbox is connected.`
+The callback finds `connected_accounts` by provider `microsoft` and that `oid`. The same user connecting that same mailbox again, including after disconnect, updates the email, tenant id (`tid`), and tokens and clears `disconnected_at`. A different `oid` while one mailbox is active returns `mailbox_conflict` and does not write. The user row is locked for the duration of the decision, and the unique index `uq_connected_accounts_one_active_microsoft` plus `(provider, provider_account_id)` rejects the race. A lost race rolls back and redirects with `mailbox_conflict` or `mailbox_taken`. It does not return `500`.
+
+On success the new tokens are committed before the worker is enqueued, because Microsoft may have rotated the refresh token and rolling that back would destroy the only working credential. The row is `sync.status` `pending`. If the enqueue fails, the tokens stay, `sync.status` becomes `failed`, `error_code` is `queue_unavailable`, `last_successful_at` is unchanged, and the browser still lands on `connected=1`.
+
+`POST /auth/microsoft/disconnect` with the bearer token clears `access_token`, `refresh_token`, `scopes`, `token_expires_at`, and `delta_link`, sets `disconnected_at`, and bumps `sync_generation` so a queued or running job cannot write tokens or messages back. Messages and form rows stay. The list and detail routes hide that mail until the same Microsoft account connects again. Another user's mailbox is not touched. No active mailbox is `404 {"detail":"No mailbox is connected."}`. Success is `200 {"disconnected": true}`. This does not call Microsoft to revoke the grant. The stored refresh token is gone, so this API cannot refresh access. The user can still remove the app in their Microsoft account if they want the grant itself revoked. One Graph call already in flight can finish at Microsoft, and its result is discarded.
+
+`GET /users/me` then shows the active mailbox. `POST /messages/sync` locks that row. When no job is in flight it bumps the generation, sets `pending`, and enqueues `sync_mailbox_delta` with the account id and that generation:
+
+```json
+{"enqueued": true, "sync_status": "pending"}
+```
+
+`enqueued` true means this call queued a job. It does not mean the sync finished. `last_successful_at` is still null or still the previous success. A second call while that job is `pending` or `running` and younger than 10 minutes returns `202` and does not queue another job:
+
+```json
+{"enqueued": false, "sync_status": "running"}
+```
+
+`pending` or `running` older than 10 minutes is treated as abandoned and a new generation is queued. The old job then sees the generation mismatch and does not write. If Redis rejects the enqueue, the response is `503 {"detail":"Mailbox sync could not be queued."}` and `sync.status` is `failed` with `queue_unavailable`. With no mailbox the status is `404` and the detail is `No mailbox is connected.`
 
 ```bash
 curl -X POST http://localhost:8000/messages/sync \
@@ -271,7 +317,9 @@ curl -X POST http://localhost:8000/messages/sync \
 
 After the worker logs `sync_mailbox_delta`, list messages. The body is a JSON array of that user's rows. `limit` is 1–100 and defaults to 50. `offset` defaults to 0. `sort` is `received_at` (the default, newest first) or `priority` (highest `priority_score` first, null scores after every number, then newest first). `X-Total-Count` is the user's message count and ignores `limit` and `offset`.
 
-Each item has `id`, `subject`, `body_preview`, `from_name`, `from_email`, `received_at`, `is_read`, `conversation_id`, `priority_score`, `priority_band`, `priority_reasons`, and `suggested_form`. Until phase 6 stores them, sender, read state, conversation id, score, and band are null, and `priority_reasons` is `[]`. `suggested_form` is null until phase 10. `GET /messages/{id}` adds `body_text` and `draft`, both null until phase 7. Another user's id, or an id that does not exist, is `404` with detail `Message not found.`
+Each item has `id`, `subject`, `body_preview`, `from_name`, `from_email`, `received_at`, `is_read`, `conversation_id`, `priority_score`, `priority_band`, `priority_reasons`, and `suggested_form`. After a sync, `from_name`, `from_email`, and `is_read` come from Graph. Missing values stay `null` (`is_read` is not assumed false). `conversation_id` is still always `null`. `priority_score` stays `null` until a later phase writes it, so `sort=priority` currently matches newest-first for synced mail. `priority_reasons` is `[]`. `priority_band` and `suggested_form` stay `null`. `GET /messages/{id}` adds `body_text` (plain text, or `null`) and `draft` (`null`). `body_text` is not on the list. Tags, script, and style are removed before storage, and the stored strings do not contain `<` or `>`. Empty text is `null`, so the client keeps showing `body_preview`. Text is capped at 100000 characters. Another user's id, a disconnected mailbox's id, or an unknown id is `404` with detail `Message not found.` A non-UUID is `422`.
+
+Timestamps are UTC ISO-8601. Whole seconds look like `2024-06-01T00:00:00Z`. Values with microseconds look like `2026-11-07T20:43:08.343229Z`. A stored score of 50 is the JSON number `50.0`.
 
 ```bash
 curl -D - 'http://localhost:8000/messages?limit=50&offset=0&sort=received_at' \
@@ -280,9 +328,44 @@ curl -D - 'http://localhost:8000/messages?limit=50&offset=0&sort=received_at' \
 
 Watch the sync with `docker compose logs -f worker`.
 
+## Production
+
+The SPA origin is `https://redocu.app`. The API's public HTTPS hostname is not in this repository. Call it `<API_ORIGIN>` (scheme and host, no path) until it is known. Do not guess one, and do not put it in source.
+
+Set these on the API and worker only. None of the secrets belong in the frontend bundle. `GRAPH_CLIENT_ID` appears inside the authorize URL the API returns. The SPA does not need its own copy.
+
+```text
+APP_ENV=production
+SECRET_KEY=<random 32+ characters, not the example placeholder>
+TOKEN_ENCRYPTION_KEY=<Fernet key>
+FRONTEND_URL=https://redocu.app
+CORS_ORIGINS=https://redocu.app
+GRAPH_REDIRECT_URI=https://<API_ORIGIN>/auth/microsoft/callback
+GRAPH_CLIENT_ID=<Entra application id>
+GRAPH_CLIENT_SECRET=<Entra client secret>
+GRAPH_TENANT_ID=<common, consumers, or the directory id>
+DATABASE_URL=<postgres>
+REDIS_URL=<redis>
+```
+
+`www.redocu.app` is a different origin and is not allowed unless you add that exact string to `CORS_ORIGINS` and also change `FRONTEND_URL`. The callback can only return to one origin. Local `FRONTEND_URL` and `CORS_ORIGINS` stay on `localhost:5173` so Compose still works.
+
+Entra: Web platform, not SPA. Redirect URI exactly `GRAPH_REDIRECT_URI`. The SPA URL is not the redirect URI.
+
+The API process does not terminate TLS and does not redirect HTTP to HTTPS. Whatever is in front of Uvicorn has to do that. This repo does not choose that proxy.
+
+Deploy:
+
+1. Back up Postgres.
+2. Set the environment above. Do not point `FRONTEND_URL` at a path.
+3. `alembic upgrade head` (`b7d3e9a41c20`).
+4. Restart the API and the worker together so they share the new columns.
+5. Existing JWTs without `jti` keep working until they expire. New logins get a `jti`. `POST /auth/logout` revokes that `jti` only.
+6. Users who already had two Microsoft rows keep both rows. Only the newest stays visible. Tokens and messages on the others are not deleted.
+
 ## Tests
 
-The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, per-user isolation on templates and fill jobs, encryption of `ConnectedAccount` tokens, and the Milestone F HTTP contract (profile mailbox, sync enqueue, message list and detail, and the Microsoft callback redirect). The worker's calls to Graph stay outside this suite.
+The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, logout, per-user isolation, token encryption, the mailbox and OAuth rules, sync status, and plain-text Graph fields. Microsoft, Graph, and LLM calls are mocked or not made. A green suite is not a production connect.
 
 ```bash
 docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pytest"
@@ -290,6 +373,4 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ## Not built yet
 
-Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`, and the worker leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). This phase leaves `graph_subscription_id` and `graph_subscription_expires_at` unset, so a webhook notification has no mailbox to load. Passwordless Microsoft sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json`, filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`), setting `priority_score`, and any LLM provider other than `stub`.
-
-The message JSON already has the later fields so the frontend contract does not change. `from_name`, `from_email`, `is_read`, `conversation_id`, and `priority_band` are null until phase 6 stores them. `priority_score` is the column phase 6 will write, so it is null today. `priority_reasons` is `[]` until phase 6. `suggested_form` is null until phase 10. `body_text` and `draft` are null until phase 7. `sort=priority` already orders by the stored score.
+Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json`, filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`), setting `priority_score`, and any LLM provider other than `stub`. Disconnect does not revoke the Microsoft grant remotely. Priority, drafts, and sending mail are not implemented.

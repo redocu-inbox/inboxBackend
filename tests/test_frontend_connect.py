@@ -70,11 +70,14 @@ def _add_account(
     email: str = "ana@outlook.com",
     oid: str | None = None,
     updated_at: datetime | None = None,
+    disconnected_at: datetime | None = None,
     access_token: str = "secret-access-token",
 ) -> str:
     fields = {}
     if updated_at is not None:
         fields["updated_at"] = updated_at
+    if disconnected_at is not None:
+        fields["disconnected_at"] = disconnected_at
     with Session(engine) as session:
         account = ConnectedAccount(
             user_id=UUID(user_id),
@@ -154,18 +157,19 @@ def test_profile_mailbox_is_null_until_a_mailbox_is_connected(client, register_u
     assert "hashed_password" not in connected
 
 
-def test_profile_uses_the_latest_mailbox_and_patch_keeps_it(client, register_user):
+def test_profile_hides_a_disconnected_mailbox_and_patch_keeps_the_active_one(client, register_user):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
     _add_account(
         user_id,
         email="old@outlook.com",
-        updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        disconnected_at=datetime(2024, 6, 2, tzinfo=timezone.utc),
     )
     _add_account(
         user_id,
         email="new@outlook.com",
-        updated_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
     )
 
     assert client.get("/users/me", headers=headers).json()["mailbox"]["email"] == "new@outlook.com"
@@ -185,17 +189,19 @@ def test_sync_requires_a_mailbox_and_enqueues_the_latest_account(client, registe
     _add_account(
         user_id,
         email="old@outlook.com",
-        updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        disconnected_at=datetime(2024, 6, 2, tzinfo=timezone.utc),
     )
     latest = _add_account(
         user_id,
         email="new@outlook.com",
-        updated_at=datetime(2024, 6, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
     )
     response = client.post("/messages/sync", headers=headers)
     assert response.status_code == 202
-    assert response.json() == {"enqueued": True}
-    app.state.arq.enqueue_job.assert_awaited_once_with("sync_mailbox_delta", latest)
+    assert response.json()["enqueued"] is True
+    assert response.json()["sync_status"] == "pending"
+    app.state.arq.enqueue_job.assert_awaited_once_with("sync_mailbox_delta", latest, 1)
 
 
 def test_message_list_contract_sort_and_total(client, register_user):
@@ -324,6 +330,9 @@ def _query(location: str) -> dict[str, list[str]]:
     return parse_qs(urlsplit(location).query)
 
 
+_OAUTH_STATE = "a" * 43
+
+
 def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
@@ -333,7 +342,7 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
     _patch_redis(monkeypatch, None)
     denied = _callback(
         client,
-        "error=access_denied&error_description=The+user+cancelled&state=denied-state",
+        f"error=access_denied&error_description=The+user+cancelled&state={_OAUTH_STATE}",
     )
     assert denied.status_code == 302
     assert _query(denied.headers["location"]) == {"connected": ["0"], "error": ["microsoft_denied"]}
@@ -344,7 +353,7 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
     assert _query(missing.headers["location"])["error"] == ["invalid_state"]
 
     _patch_redis(monkeypatch, b"not-a-uuid")
-    bad_state = _callback(client, "code=abc&state=nope")
+    bad_state = _callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert _query(bad_state.headers["location"])["error"] == ["invalid_state"]
 
     _patch_redis(monkeypatch, user_id.encode())
@@ -352,7 +361,7 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
         "app.api.auth.build_msal_app",
         lambda: _Msal({"error": "invalid_grant", "error_description": "bad code"}),
     )
-    exchanged = _callback(client, "code=abc&state=ok")
+    exchanged = _callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert _query(exchanged.headers["location"])["error"] == ["token_exchange"]
     assert "invalid_grant" not in exchanged.headers["location"]
     assert "bad code" not in exchanged.headers["location"]
@@ -369,7 +378,7 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
             }
         ),
     )
-    taken = _callback(client, "code=abc&state=ok")
+    taken = _callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert _query(taken.headers["location"])["error"] == ["mailbox_taken"]
     app.state.arq.enqueue_job.assert_not_awaited()
 
@@ -389,7 +398,7 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
             }
         ),
     )
-    success = _callback(client, "code=abc&state=ok")
+    success = _callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert success.status_code == 302
     location = success.headers["location"]
     base = get_settings().frontend_url.rstrip("/")
@@ -401,4 +410,4 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
         account = session.exec(
             select(ConnectedAccount).where(ConnectedAccount.provider_account_id == "oid-ana")
         ).one()
-    app.state.arq.enqueue_job.assert_awaited_once_with("sync_mailbox_delta", str(account.id))
+    app.state.arq.enqueue_job.assert_awaited_once_with("sync_mailbox_delta", str(account.id), 1)

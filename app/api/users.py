@@ -1,6 +1,7 @@
 """Routes for the logged-in user's own profile."""
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
@@ -10,6 +11,7 @@ from sqlmodel import Session, select
 from app.api.deps import get_current_user, get_session
 from app.models.connected_account import ConnectedAccount
 from app.models.user import User, utcnow
+from app.services.mailboxes import SYNC_STATUSES
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -20,6 +22,14 @@ class MailboxResponse(BaseModel):
     connected: bool
     provider: str
     email: str
+
+
+class SyncStatusResponse(BaseModel):
+    """Worker lifecycle for the active mailbox. last_successful_at is only a finished sync."""
+
+    status: Literal["idle", "pending", "running", "failed"]
+    last_successful_at: datetime | None = None
+    error_code: str | None = None
 
 
 class UserResponse(BaseModel):
@@ -33,6 +43,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     mailbox: MailboxResponse | None = None
+    sync: SyncStatusResponse | None = None
 
 
 class UpdateProfileRequest(BaseModel):
@@ -44,23 +55,38 @@ class UpdateProfileRequest(BaseModel):
 
 
 def latest_connected_account(session: Session, user_id: UUID) -> ConnectedAccount | None:
-    """The user's mailbox with the latest updated_at. id breaks a tie."""
+    """The user's active Microsoft mailbox. Disconnected rows are kept but hidden."""
     return session.exec(
         select(ConnectedAccount)
-        .where(ConnectedAccount.user_id == user_id)
+        .where(
+            ConnectedAccount.user_id == user_id,
+            ConnectedAccount.provider == "microsoft",
+            ConnectedAccount.disconnected_at.is_(None),
+        )
         .order_by(ConnectedAccount.updated_at.desc(), ConnectedAccount.id.desc())
     ).first()
+
+
+def _sync_response(account: ConnectedAccount) -> SyncStatusResponse:
+    status = account.sync_status if account.sync_status in SYNC_STATUSES else "idle"
+    return SyncStatusResponse(
+        status=status,
+        last_successful_at=account.last_sync_at,
+        error_code=account.sync_error_code,
+    )
 
 
 def _user_response(user: User, session: Session) -> UserResponse:
     account = latest_connected_account(session, user.id)
     mailbox = None
+    sync = None
     if account is not None:
         mailbox = MailboxResponse(
             connected=True,
             provider=account.provider,
             email=account.email,
         )
+        sync = _sync_response(account)
     return UserResponse(
         id=user.id,
         email=user.email,
@@ -68,6 +94,7 @@ def _user_response(user: User, session: Session) -> UserResponse:
         created_at=user.created_at,
         updated_at=user.updated_at,
         mailbox=mailbox,
+        sync=sync,
     )
 
 

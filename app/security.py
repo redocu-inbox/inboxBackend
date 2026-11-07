@@ -1,8 +1,9 @@
 """Password hashing, login JWTs, and encryption of stored OAuth tokens."""
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 from argon2 import PasswordHasher
@@ -33,16 +34,38 @@ def verify_password(password: str, hashed: str | None) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class AccessTokenClaims:
+    """Verified login JWT. `jti` is None for tokens issued before revocation existed."""
+
+    user_id: UUID
+    jti: UUID | None
+    issued_at: datetime
+    expires_at: datetime
+
+
+def _as_utc(value: datetime | int | float) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.fromtimestamp(value, timezone.utc)
+
+
 def create_access_token(user_id: UUID) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=settings.access_token_expire_minutes)
-    claims = {"sub": str(user_id), "iat": now, "exp": expires_at}
+    claims = {"sub": str(user_id), "iat": now, "exp": expires_at, "jti": str(uuid4())}
     return jwt.encode(claims, settings.secret_key, algorithm=_JWT_ALGORITHM)
 
 
-def decode_access_token(token: str) -> UUID | None:
-    """Return the user id from a valid token, or None if it is invalid or expired."""
+def decode_access_token(token: str) -> AccessTokenClaims | None:
+    """Return claims from a valid token, or None if it is invalid or expired.
+
+    `jti` is optional so tokens issued before this change still work until they expire.
+    A present `jti` that is not a UUID is rejected.
+    """
     try:
         claims = jwt.decode(
             token,
@@ -51,7 +74,14 @@ def decode_access_token(token: str) -> UUID | None:
             algorithms=[_JWT_ALGORITHM],
             options={"require": ["exp", "iat", "sub"]},
         )
-        return UUID(claims["sub"])
+        jti_raw = claims.get("jti")
+        jti = UUID(str(jti_raw)) if jti_raw is not None else None
+        return AccessTokenClaims(
+            user_id=UUID(claims["sub"]),
+            jti=jti,
+            issued_at=_as_utc(claims["iat"]),
+            expires_at=_as_utc(claims["exp"]),
+        )
     except (jwt.InvalidTokenError, ValueError):
         return None
 
