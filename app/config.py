@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         "https://graph.microsoft.com/Mail.ReadWrite"
     )
 
+    # Vite origin, with no path. The Microsoft callback redirects to
+    # {frontend_url}/inbox. Override with FRONTEND_URL.
+    frontend_url: str = "http://localhost:5173"
+
     # stub for now. Later values: openai, anthropic.
     llm_provider: str = "stub"
     llm_model: str = ""
