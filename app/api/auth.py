@@ -25,6 +25,13 @@ from app.config import get_settings
 from app.models.revoked_token import RevokedToken
 from app.models.user import User, utcnow
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.services.auth.password_reset import consume_reset_token, open_reset_request
+from app.services.auth.rate_limit import (
+    RateLimitExceeded,
+    RateLimitUnavailable,
+    client_ip,
+    enforce_password_reset_limit,
+)
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.oauth import build_msal_app
 from app.services.mailboxes import disconnect_active_mailbox, mark_sync_enqueue_failed
@@ -54,6 +61,15 @@ class LoginRequest(BaseModel):
     password: str = Field(max_length=128)
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: NormalizedEmail
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -78,11 +94,15 @@ _ERR_CONFLICT = "mailbox_conflict"
 _UNAVAILABLE = object()
 
 
-def _token_response(user: User) -> TokenResponse:
-    return TokenResponse(
-        access_token=create_access_token(user.id),
+def _token_response(session: Session, user: User) -> TokenResponse:
+    """Mint a JWT for the session_version currently stored on the user row."""
+    locked = session.exec(select(User).where(User.id == user.id).with_for_update()).one()
+    response = TokenResponse(
+        access_token=create_access_token(locked.id, int(locked.session_version or 0)),
         expires_in=get_settings().access_token_expire_minutes * 60,
     )
+    session.commit()
+    return response
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -103,7 +123,7 @@ def register(body: RegisterRequest, session: Session = Depends(get_session)) -> 
             detail="An account with this email already exists",
         ) from exc
     session.refresh(user)
-    return _token_response(user)
+    return _token_response(session, user)
 
 
 @router.post("/login")
@@ -116,7 +136,54 @@ def login(body: LoginRequest, session: Session = Depends(get_session)) -> TokenR
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _token_response(user)
+    return _token_response(session, user)
+
+
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Accept a reset request without saying whether the email is registered.
+
+    The response is always 202 and an empty object after the rate limit passes.
+    Delivery happens in the worker, which is the only place that creates the code.
+    """
+    try:
+        enforce_password_reset_limit(email=body.email, ip=client_ip(request))
+    except RateLimitUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="password_reset_unavailable",
+        ) from None
+    except RateLimitExceeded:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+        ) from None
+    user = session.exec(select(User).where(User.email == body.email)).first()
+    if user is None:
+        return {}
+    request_id = open_reset_request(session, user)
+    try:
+        await get_arq(request).enqueue_job("send_password_reset", str(user.id), str(request_id))
+    except Exception:
+        logger.warning("password reset enqueue failed")
+    return {}
+
+
+@router.post("/reset-password", status_code=status.HTTP_204_NO_CONTENT)
+def reset_password(
+    body: ResetPasswordRequest,
+    session: Session = Depends(get_session),
+) -> Response:
+    if not consume_reset_token(session, body.token, body.password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="reset_token_invalid",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

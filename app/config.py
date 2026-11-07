@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
 
+    # fake and console are local only. production must be resend or disabled.
+    email_provider: str = "fake"
+    email_api_key: str = ""
+    email_from: str = ""
+    # How many trusted proxies append X-Forwarded-For. 0 ignores that header.
+    forwarded_for_hops: int = 0
+    password_reset_limit: int = 5
+    password_reset_window_seconds: int = 3600
+
     @model_validator(mode="after")
     def _check_secrets(self) -> "Settings":
         """Refuse to start with a malformed key, or with dev secrets outside development."""
@@ -133,6 +142,23 @@ class Settings(BaseSettings):
                 "GRAPH_WEBHOOK_CLIENT_STATE must be a random string of at least 16 characters "
                 "when APP_ENV is production"
             )
+        if self.frontend_url.endswith("/") or any(origin.endswith("/") for origin in self.cors_origin_list):
+            raise ValueError("FRONTEND_URL and CORS_ORIGINS must not have a trailing slash in production")
+        self._check_production_email()
+
+    def _check_production_email(self) -> None:
+        provider = self.email_provider.strip().lower()
+        if provider in {"", "fake", "console"}:
+            raise ValueError(
+                "EMAIL_PROVIDER must be resend or disabled when APP_ENV is production. "
+                "fake and console must not report that a reset email was sent."
+            )
+        if provider == "disabled":
+            return
+        if provider != "resend":
+            raise ValueError("EMAIL_PROVIDER must be resend or disabled when APP_ENV is production")
+        if not self.email_api_key or not self.email_from:
+            raise ValueError("EMAIL_API_KEY and EMAIL_FROM are required when EMAIL_PROVIDER is resend")
 
     @property
     def cors_origin_list(self) -> list[str]:

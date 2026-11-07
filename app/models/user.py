@@ -20,6 +20,9 @@ class User(SQLModel, table=True):
     # Legacy JWTs have no jti. Logout of one of those rejects tokens whose iat
     # is at or before this instant. JWTs that carry a jti ignore this column.
     auth_valid_after: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    # Bumped when a password reset must reject every token issued before it.
+    # Login JWTs carry the same integer. A missing claim is version 0.
+    session_version: int = Field(default=0)
     created_at: datetime = Field(
         default_factory=utcnow,
         sa_type=DateTime(timezone=True),

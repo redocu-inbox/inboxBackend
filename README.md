@@ -126,6 +126,8 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /health`                | no   | API, database, pgvector, Redis, and storage |
 | `POST /auth/register`        | no   | Create an account and return a token |
 | `POST /auth/login`           | no   | Return a token |
+| `POST /auth/forgot-password` | no   | `202 {}` whether or not the email exists. Sends a reset link asynchronously |
+| `POST /auth/reset-password`  | no   | `204` when the code is valid. `400 {"detail":"reset_token_invalid"}` otherwise |
 | `GET /auth/microsoft/start`  | yes  | Return `200` and `{"authorization_url": "..."}`. The Bearer token stays on this request. Redis down is `503` |
 | `GET /auth/microsoft/callback` | no | Exchange the code, save or reject the mailbox, enqueue sync, then `302` to `{FRONTEND_URL}/inbox` |
 | `POST /auth/microsoft/disconnect` | yes | Clear the active mailbox's tokens and hide its messages. `200` or `404` |
@@ -140,7 +142,7 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `POST /forms/jobs`           | yes  | Create a pending fill job and enqueue `match_form_template` |
 | `GET /forms/jobs/{job_id}`   | yes  | Status, confidence, error, and extracted values |
 
-A new route is protected by adding `user: User = Depends(get_current_user)`, and it must filter its queries by `user.id`. Return 404, not 403, for another user's row, so a caller cannot tell the row exists. `/health`, `/auth/register`, `/auth/login`, `/auth/microsoft/callback`, and `/webhooks/graph` are public on purpose. The callback is public because Microsoft redirects the browser there. The Redis state from `/auth/microsoft/start` is what ties that request to a user.
+A new route is protected by adding `user: User = Depends(get_current_user)`, and it must filter its queries by `user.id`. Return 404, not 403, for another user's row, so a caller cannot tell the row exists. `/health`, `/auth/register`, `/auth/login`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/microsoft/callback`, and `/webhooks/graph` are public on purpose. The callback is public because Microsoft redirects the browser there. The Redis state from `/auth/microsoft/start` is what ties that request to a user.
 
 Graph sends `validationToken` when a subscription is created. The webhook answers with that exact token as `text/plain`. Other calls are change notifications. A notification whose `clientState` matches `GRAPH_WEBHOOK_CLIENT_STATE` is accepted with `202` and enqueued with that notification's `subscriptionId`. A mismatch is logged and skipped. This API does not create the subscription. See Background jobs for how the id is resolved.
 
@@ -152,6 +154,7 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | --------------------------- | ---------- | ------------------ |
 | `heartbeat`                 | nothing yet | Logs and returns `"ok"` |
 | `sync_mailbox_delta`        | `GET /auth/microsoft/callback` and `POST /messages/sync` (account id), and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, then lists recent messages and upserts them |
+| `send_password_reset`       | `POST /auth/forgot-password` (user id and request id only) | Creates a reset code, stores its hash, and sends the link. The code is not a job argument |
 | `match_form_template`       | `POST /forms/jobs` | Sets the job to `running`, then logs a TODO. It does not call the LLM |
 | `run_form_fill`             | nothing yet | Logs a TODO. `PdfFormFiller.fill` is not implemented |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
@@ -232,9 +235,25 @@ That object does not include tokens, scopes, the delta link, or sync fields. `sy
 
 `PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`. The patch response uses the same shape, including `mailbox` and `sync`.
 
-New login JWTs are HS256 with `sub`, `iat`, `exp`, and `jti`. `POST /auth/logout` with that token returns `204` and stores the `jti` in `revoked_tokens` until `exp`. A later request with the same token is `401 {"detail":"Not authenticated"}`. A second login's token has a different `jti` and keeps working. Logout does not disconnect the mailbox and does not affect another user.
+New login JWTs are HS256 with `sub`, `iat`, `exp`, `jti`, and `ver`. `ver` is `users.session_version` at the moment the token is minted. `POST /auth/logout` with that token returns `204` and stores the `jti` in `revoked_tokens` until `exp`. A later request with the same token is `401 {"detail":"Not authenticated"}`. A second login's token has a different `jti` and keeps working. Logout does not disconnect the mailbox, does not bump `session_version`, and does not affect another user.
 
-Tokens issued before `jti` existed (only `sub`, `iat`, `exp`) still work until they expire. Logging one of those out sets `users.auth_valid_after` to that token's `iat`. Other legacy tokens with an `iat` at or before that instant stop working. Tokens that have a `jti` ignore `auth_valid_after`. Changing `SECRET_KEY` still logs everyone out. Outside `APP_ENV=development`, the API refuses to start with the placeholder secret or without `TOKEN_ENCRYPTION_KEY`.
+Tokens issued before `jti` existed (only `sub`, `iat`, `exp`) still work until they expire, as long as `session_version` is still 0. A missing `ver` claim is treated as version 0. Logging one of those out sets `users.auth_valid_after` to that token's `iat`. Other legacy tokens with an `iat` at or before that instant stop working. Tokens that have a `jti` ignore `auth_valid_after`. Changing `SECRET_KEY` still logs everyone out. Outside `APP_ENV=development`, the API refuses to start with the placeholder secret or without `TOKEN_ENCRYPTION_KEY`.
+
+Passwords are Argon2id hashes with the same 8–128 character rule on register and reset. Argon2 does not apply bcrypt's 72-byte truncation.
+
+### Password reset
+
+`POST /auth/forgot-password` takes `{"email": "ana@example.com"}`. The email is stored and rate-limited in lowercase, so `Ana@x.com` and `ana@x.com` share one bucket. A valid address always returns `202` and `{}`, whether or not an account exists. An address that is not an email is `422`. The fifth request in an hour for that email, and the fifth request in an hour for that client IP, is `429 {"detail":"rate_limited"}`. The next one is too. Both limits are counted for every well-formed request, including unknown emails. `X-Forwarded-For` is ignored unless `FORWARDED_FOR_HOPS` is at least 1. That number is how many proxies you trust to append the header. The address used is that many entries from the right, not the left-most value a client can set. If the rate-limit store is down, the response is `503 {"detail":"password_reset_unavailable"}` and the account is not looked up.
+
+The worker then creates a code with `secrets.token_urlsafe(32)` (32 random bytes), stores only its SHA-256 hash, and sends mail. The job arguments are the user id and the request id. A newer request invalidates older unused codes. The link is `{FRONTEND_URL}/reset-password#token=<code>`. The fragment is not a query parameter. The subject is `Reset your redocu password`. The plain body is:
+
+```text
+Someone asked to reset the password for your redocu account. Use this link within 30 minutes: <link>. If it wasn't you, ignore this email; your password hasn't changed.
+```
+
+`POST /auth/reset-password` takes `{"token": "<code>", "password": "<new password>"}`. A valid code sets the password, marks the code used, increments `session_version`, and returns `204`. Every access token issued before that commit then gets `401`, including a legacy token with no `ver` and a token whose `iat` is the same second. A login after the commit works. An unknown, expired, or already used code is `400 {"detail":"reset_token_invalid"}`. A password outside 8–128 characters is `422`.
+
+`EMAIL_PROVIDER` is `fake` in local development (the message stays in process memory and is not logged). `console` is also local-only. `APP_ENV=production` refuses both. Set `disabled` to boot without sending, or `resend` with `EMAIL_API_KEY` and `EMAIL_FROM` (for example `redocu <no-reply@redocu.app>`). The Resend from-domain has to be verified in that account before delivery works. This repository does not call Resend from the test suite. A delivery failure is logged as a status class, not the link, the code, or the request body.
 
 ```bash
 curl -X POST http://localhost:8000/auth/logout \
@@ -354,7 +373,9 @@ REDIS_URL=<redis>
 
 Entra: Web platform, not SPA. Redirect URI exactly `GRAPH_REDIRECT_URI`. The SPA URL is not the redirect URI.
 
-The API process does not terminate TLS and does not redirect HTTP to HTTPS. Whatever is in front of Uvicorn has to do that. This repo does not choose that proxy.
+The API process does not terminate TLS and does not redirect HTTP to HTTPS. Whatever is in front of Uvicorn has to do that. `GRAPH_REDIRECT_URI` is that public `https://<API_ORIGIN>/auth/microsoft/callback`. The app does not build it from the `Host` header or from `X-Forwarded-Proto`. This repo does not choose that proxy, and it does not record a verified Entra registration.
+
+CORS allows `GET`, `POST`, `PATCH`, and `OPTIONS`. No route in this repository uses `PUT`, `DELETE`, or `HEAD`. Allowed request headers are `Authorization`, `Content-Type`, and `Accept`. `X-Total-Count` is exposed. `allow_credentials` is off because the API does not set a session cookie. The bearer token is a header. `CORS_ORIGINS` is a comma-separated list of exact origins, with no `*` and no trailing slash. Production for this product is `https://redocu.app`.
 
 Deploy:
 

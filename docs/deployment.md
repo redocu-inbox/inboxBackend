@@ -64,7 +64,9 @@ Inside this compose file both listen assumptions use port 8000 on the API contai
 - `GRAPH_REDIRECT_URI` is not `https://<host>/auth/microsoft/callback`
 - `GRAPH_WEBHOOK_CLIENT_STATE` is shorter than 16 characters
 
-`GRAPH_CLIENT_ID` and `GRAPH_CLIENT_SECRET` are not required for the process to boot. Outlook connect will fail until they are set. They stay on the API and the worker. They are not frontend build variables.
+`GRAPH_CLIENT_ID` and `GRAPH_CLIENT_SECRET` are not required for the process to boot. Outlook connect will fail until they are set. They stay on the API and the worker. They are not frontend build variables. No Entra app has been verified from this repository.
+
+`EMAIL_PROVIDER` is `resend` or `disabled` in production. `fake` and `console` refuse to boot. Resend also needs `EMAIL_API_KEY` and `EMAIL_FROM`. Password-reset logout is not the same as `POST /auth/logout`: a reset bumps `session_version` in Postgres and rejects every older access token. The reset code's hash is in Postgres. The code itself is not. Redis still only holds the rate-limit counters and the job ids.
 
 `rediss://` is the TLS Redis scheme. ARQ's `RedisSettings.from_dsn` sets TLS when it sees that scheme. `redis://` is plain TCP, which is only appropriate on a private network. This repository does not open either URL during tests.
 

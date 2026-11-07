@@ -43,8 +43,9 @@ app = FastAPI(title="Inbox API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "HEAD", "OPTIONS"],
+    # Bearer tokens are sent on Authorization, not cookies.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
     # Browsers hide this from the Vite app unless it is listed here.
     expose_headers=["X-Total-Count"],
