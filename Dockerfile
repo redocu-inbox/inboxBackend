@@ -13,5 +13,7 @@ COPY . .
 
 EXPOSE 8000
 
-# Compose overrides this for the API (--reload) and the worker (arq).
+# Default process is the API only, without --reload. Local Compose overrides
+# this. The worker is a second process. The optional one-container demo is
+# `python -m app.deploy.demo` and is not the default.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
