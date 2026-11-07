@@ -1,6 +1,6 @@
 # Inbox API
 
-Backend for an AI-powered inbox. Through phase 5 this repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Accounts can register and log in, connect an Outlook mailbox, and sync recent messages. PDF form templates can be uploaded, and a Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams.
+Backend for an AI-powered inbox. Through phase 5 this repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Accounts can register and log in, connect an Outlook mailbox, and sync recent messages. Milestone F is the frontend connection: a Vite app can start Microsoft login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and a Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams.
 
 You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or another Docker engine with Compose v2). You do not need a local Python install to run the stack.
 
@@ -13,6 +13,7 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | 3 | Graph webhook, form upload and fill-job routes, and the Graph, form-fill, and LLM service seams. Worker jobs are registered; at that point sync, matching, filling, and subscription renewal logged a TODO |
 | 4 | Register and login, profile read and update, Argon2 password hashes, HS256 login JWTs, Fernet encryption for Microsoft tokens, and tests for auth, data isolation, and token encryption |
 | 5 | Outlook mailbox connect (`GET /auth/microsoft/start`, `GET /auth/microsoft/callback`), refresh of encrypted Graph tokens, sync of recent messages, and `GET /messages` |
+| F | Frontend connection: `authorization_url` from Microsoft start, callback redirect to `FRONTEND_URL`, `mailbox` on `GET /users/me`, `POST /messages/sync`, and the frozen message list and detail contract |
 
 ## Run it
 
@@ -49,7 +50,7 @@ A healthy response looks like this:
 
 FastAPI also publishes interactive docs at http://localhost:8000/docs.
 
-The API allows the origins in `CORS_ORIGINS` and allows credentials. The default is the Vite dev server at http://localhost:5173 and http://127.0.0.1:5173.
+The API allows the origins in `CORS_ORIGINS` and allows credentials. The default is the Vite dev server at http://localhost:5173 and http://127.0.0.1:5173. `X-Total-Count` is exposed to those origins so the Vite app can read the message total.
 
 Stop the stack with `Ctrl+C`, then:
 
@@ -83,8 +84,8 @@ app/
   security.py             Password hashing, login JWTs, EncryptedText
   api/health.py           GET /health
   api/auth.py             Register, login, and Microsoft mailbox connect
-  api/users.py            GET and PATCH /users/me
-  api/messages.py         GET /messages
+  api/users.py            GET and PATCH /users/me, including mailbox
+  api/messages.py         GET /messages, GET /messages/{id}, POST /messages/sync
   api/graph.py            POST /webhooks/graph
   api/forms.py            Form template upload and fill jobs
   api/deps.py             Current user, database session, ARQ pool
@@ -115,7 +116,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 
 Microsoft tokens on `ConnectedAccount` are encrypted by the column type (`EncryptedText`), so code reads and writes plaintext as usual. This needs `TOKEN_ENCRYPTION_KEY`; see `.env.example`. Losing that key means every mailbox has to reconnect. It is separate from `SECRET_KEY`.
 
-Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset. The message sync stores `graph_id`, subject, body preview, and received time. `priority_score` stays unset.
+Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset. The message sync stores `graph_id`, subject, body preview, and received time. `priority_score` stays unset. The list and detail JSON still include sender, read state, conversation id, priority band, reasons, and a suggested form. Those are null or empty until a later phase stores them. Detail adds `body_text` and `draft`, both null until phase 7.
 
 ## Routes
 
@@ -124,11 +125,13 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /health`                | no   | API, database, pgvector, Redis, and storage |
 | `POST /auth/register`        | no   | Create an account and return a token |
 | `POST /auth/login`           | no   | Return a token |
-| `GET /auth/microsoft/start`  | yes  | Store a short-lived state and redirect (302) to Microsoft |
-| `GET /auth/microsoft/callback` | no | Exchange the code, save the mailbox, enqueue `sync_mailbox_delta` |
-| `GET /users/me`              | yes  | Read your profile |
-| `PATCH /users/me`            | yes  | Update `display_name` |
-| `GET /messages`              | yes  | List your synced messages, newest first |
+| `GET /auth/microsoft/start`  | yes  | Return `200` and `{"authorization_url": "..."}`. The Bearer token stays on this request |
+| `GET /auth/microsoft/callback` | no | Exchange the code, save the mailbox, enqueue `sync_mailbox_delta`, then `302` to the Vite app |
+| `GET /users/me`              | yes  | Read your profile, including `mailbox` |
+| `PATCH /users/me`            | yes  | Update `display_name`. The response includes `mailbox` too |
+| `GET /messages`              | yes  | List your messages. `X-Total-Count` is the full count |
+| `GET /messages/{id}`         | yes  | One message, or `404` with detail `Message not found.` |
+| `POST /messages/sync`        | yes  | `202` and `{"enqueued": true}`, or `404` when no mailbox is connected |
 | `POST /webhooks/graph`       | no   | Graph subscription handshake, or enqueue `sync_mailbox_delta` |
 | `POST /forms/templates`      | yes  | Upload a PDF template (`application/pdf` only) |
 | `POST /forms/jobs`           | yes  | Create a pending fill job and enqueue `match_form_template` |
@@ -145,12 +148,12 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | Job                         | Started by | What it does today |
 | --------------------------- | ---------- | ------------------ |
 | `heartbeat`                 | nothing yet | Logs and returns `"ok"` |
-| `sync_mailbox_delta`        | `GET /auth/microsoft/callback` (account id) and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, then lists recent messages and upserts them |
+| `sync_mailbox_delta`        | `GET /auth/microsoft/callback` and `POST /messages/sync` (account id), and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, then lists recent messages and upserts them |
 | `match_form_template`       | `POST /forms/jobs` | Sets the job to `running`, then logs a TODO. It does not call the LLM |
 | `run_form_fill`             | nothing yet | Logs a TODO. `PdfFormFiller.fill` is not implemented |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
 
-`sync_mailbox_delta` takes one string. It loads the `connected_accounts` row whose `graph_subscription_id` equals that string. When no row matches and the string is a UUID, it loads that primary key. The connect callback passes the account id, so that path finds the mailbox. The webhook passes a Graph subscription id. With `graph_subscription_id` empty, that UUID lookup misses, the job logs `No connected account for ...`, and it returns.
+`sync_mailbox_delta` takes one string. It loads the `connected_accounts` row whose `graph_subscription_id` equals that string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id, so that path finds the mailbox. Sync uses the same row `GET /users/me` reports: the caller's mailbox with the latest `updated_at`. The webhook passes a Graph subscription id. With `graph_subscription_id` empty, that UUID lookup misses, the job logs `No connected account for ...`, and it returns.
 
 When `token_expires_at` is missing or within five minutes, the job exchanges the stored refresh token and saves the new tokens. A failed refresh raises `RuntimeError` and the job stops. It then calls `GET https://graph.microsoft.com/v1.0/me/messages` with `$select=id,subject,bodyPreview,receivedDateTime`, `$top=25`, and `$orderby=receivedDateTime desc`, and follows `@odata.nextLink` for at most four pages. An item that has both `id` and `receivedDateTime` is inserted or updated for that mailbox and `graph_id`.
 
@@ -207,7 +210,7 @@ curl http://localhost:8000/users/me -H 'Authorization: Bearer <token>'
 
 Emails are stored in lowercase, so `Ana@x.com` and `ana@x.com` are one account. Passwords must be 8–128 characters. A duplicate email is `409`. A wrong email or password is the same `401`, and the hasher still runs when the email is unknown so the two cases take the same time.
 
-`hashed_password` can be null. That account cannot log in with a password (reserved for a later OAuth-only sign-in). Connecting a mailbox is a separate step. `GET /auth/microsoft/start` requires a Bearer token for an account that already exists, and the callback body is `connected` plus the mailbox email. Profile responses never include the hash. `PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`.
+`hashed_password` can be null. That account cannot log in with a password (reserved for a later OAuth-only sign-in). Connecting a mailbox is a separate step. `GET /auth/microsoft/start` requires a Bearer token for an account that already exists. Profile responses never include the hash. `GET /users/me` adds `mailbox`: `null` before connect, or `{"connected": true, "provider": "microsoft", "email": "..."}` for the mailbox with the latest `updated_at`. That object does not include tokens, scopes, or the delta link. `PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`. The patch response uses the same shape, including `mailbox`.
 
 Tokens last `ACCESS_TOKEN_EXPIRE_MINUTES` and cannot be revoked individually. Changing `SECRET_KEY` logs everyone out. Outside `APP_ENV=development`, the API refuses to start with the placeholder secret or without `TOKEN_ENCRYPTION_KEY`.
 
@@ -223,31 +226,55 @@ The connect flow uses a confidential Microsoft Entra app (MSAL) and stores the t
 | `GRAPH_REDIRECT_URI` | Redirect URI registered on the app, and the callback this API serves. Locally: `http://localhost:8000/auth/microsoft/callback` |
 | `GRAPH_SCOPES` | Comma-separated scopes sent on the authorize redirect, the code exchange, and token refresh. The default is `https://graph.microsoft.com/User.Read`, `https://graph.microsoft.com/Mail.Read`, and `https://graph.microsoft.com/Mail.ReadWrite` |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key for the token columns |
+| `FRONTEND_URL` | Vite origin, with no path. The callback redirects to `{FRONTEND_URL}/inbox`. The default is `http://localhost:5173` |
 
 Create an app registration with a client secret and those delegated permissions, and allow the account type you set in `GRAPH_TENANT_ID`. Register `GRAPH_REDIRECT_URI` as that app's redirect URI. `consumers` only applies to personal Microsoft accounts.
 
-`docker compose up` starts the worker that runs the sync. Register and log in first. The start route requires the Bearer token, so send it with curl and open the `Location` header in a browser:
+`docker compose up` starts the worker that runs the sync. Register and log in first. The Vite app then calls start with the Bearer token and sends the browser to `authorization_url`. The token is not copied into that URL.
 
 ```bash
-curl -sD - -o /dev/null \
-  http://localhost:8000/auth/microsoft/start \
+curl -s http://localhost:8000/auth/microsoft/start \
   -H 'Authorization: Bearer <token>'
 ```
 
-The response is `302`. The start route stores `oauth_state:<state>` in Redis for 600 seconds, mapped to your user id. Sign in at the Microsoft URL. Microsoft redirects the browser to `GRAPH_REDIRECT_URI` with `code` and `state`, which hits `GET /auth/microsoft/callback`. The callback deletes the state as it reads it, so the state works once.
-
-A Microsoft `error` query parameter, or a request missing `code` or `state`, is `400` with detail `Microsoft authentication failed`. A `state` that is expired, already used, or not a user id is `400` with detail `Microsoft sign-in was not completed`. The same detail is returned when the token response has an error, or when it has no access token, no refresh token, no `oid`, or no email (`preferred_username`, otherwise `email`).
-
-The callback finds `connected_accounts` by provider `microsoft` and that `oid`. Connecting the same mailbox again as the same user updates the email, tenant id (`tid`), and tokens. If that `oid` already belongs to another user, the response is `409` with detail `This mailbox is already connected to a different account`. On success it saves the encrypted tokens and enqueues `sync_mailbox_delta` with the account id. The body is:
+The response is `200`:
 
 ```json
-{"connected": true, "email": "ana@outlook.com"}
+{"authorization_url": "https://login.microsoftonline.com/..."}
 ```
 
-After the worker logs `sync_mailbox_delta`, list messages. Results are that user's rows, ordered by `received_at` descending. `limit` is 1–100 and defaults to 50. `offset` defaults to 0. Each item has `id`, `subject`, `body_preview`, and `received_at`.
+The start route stores `oauth_state:<state>` in Redis for 600 seconds, mapped to your user id. Sign in at the Microsoft URL. Microsoft redirects the browser to `GRAPH_REDIRECT_URI` with `code` and `state`, which hits `GET /auth/microsoft/callback`. The callback deletes the state as it reads it, so the state works once. It always answers `302` to `{FRONTEND_URL}/inbox`.
+
+Success:
+
+```text
+{FRONTEND_URL}/inbox?connected=1&email=ana%40outlook.com
+```
+
+Failure uses `connected=0` and one of these `error` values. The provider's own text is logged on the server and is not put in the URL.
+
+| `error` | When |
+| ------- | ---- |
+| `microsoft_denied` | Microsoft sent an `error` query parameter (the user cancelled, or the authorize step failed) |
+| `invalid_state` | `code` or `state` is missing, or the state is expired, already used, or not a user id |
+| `token_exchange` | The code exchange failed, or the token response has no access token, refresh token, `expires_in`, `oid`, or email (`preferred_username`, otherwise `email`) |
+| `mailbox_taken` | That Microsoft `oid` is already connected to a different user |
+
+The callback finds `connected_accounts` by provider `microsoft` and that `oid`. Connecting the same mailbox again as the same user updates the email, tenant id (`tid`), and tokens. On success it saves the encrypted tokens and enqueues `sync_mailbox_delta` with the account id.
+
+`GET /users/me` then shows that mailbox. `POST /messages/sync` enqueues the same account again and returns `202` with `{"enqueued": true}`. With no mailbox the status is `404` and the detail is `No mailbox is connected.`
 
 ```bash
-curl 'http://localhost:8000/messages?limit=50&offset=0' \
+curl -X POST http://localhost:8000/messages/sync \
+  -H 'Authorization: Bearer <token>'
+```
+
+After the worker logs `sync_mailbox_delta`, list messages. The body is a JSON array of that user's rows. `limit` is 1–100 and defaults to 50. `offset` defaults to 0. `sort` is `received_at` (the default, newest first) or `priority` (highest `priority_score` first, null scores after every number, then newest first). `X-Total-Count` is the user's message count and ignores `limit` and `offset`.
+
+Each item has `id`, `subject`, `body_preview`, `from_name`, `from_email`, `received_at`, `is_read`, `conversation_id`, `priority_score`, `priority_band`, `priority_reasons`, and `suggested_form`. Until phase 6 stores them, sender, read state, conversation id, score, and band are null, and `priority_reasons` is `[]`. `suggested_form` is null until phase 10. `GET /messages/{id}` adds `body_text` and `draft`, both null until phase 7. Another user's id, or an id that does not exist, is `404` with detail `Message not found.`
+
+```bash
+curl -D - 'http://localhost:8000/messages?limit=50&offset=0&sort=received_at' \
   -H 'Authorization: Bearer <token>'
 ```
 
@@ -255,7 +282,7 @@ Watch the sync with `docker compose logs -f worker`.
 
 ## Tests
 
-The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, per-user isolation on templates and fill jobs, and encryption of `ConnectedAccount` tokens. Microsoft connect and `sync_mailbox_delta` are outside this suite.
+The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, per-user isolation on templates and fill jobs, encryption of `ConnectedAccount` tokens, and the Milestone F HTTP contract (profile mailbox, sync enqueue, message list and detail, and the Microsoft callback redirect). The worker's calls to Graph stay outside this suite.
 
 ```bash
 docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pytest"
@@ -264,3 +291,5 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 ## Not built yet
 
 Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`, and the worker leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). This phase leaves `graph_subscription_id` and `graph_subscription_expires_at` unset, so a webhook notification has no mailbox to load. Passwordless Microsoft sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json`, filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`), setting `priority_score`, and any LLM provider other than `stub`.
+
+The message JSON already has the later fields so the frontend contract does not change. `from_name`, `from_email`, `is_read`, `conversation_id`, and `priority_band` are null until phase 6 stores them. `priority_score` is the column phase 6 will write, so it is null today. `priority_reasons` is `[]` until phase 6. `suggested_form` is null until phase 10. `body_text` and `draft` are null until phase 7. `sort=priority` already orders by the stored score.

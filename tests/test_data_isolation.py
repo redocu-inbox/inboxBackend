@@ -63,6 +63,9 @@ def bob(register_user):
         ("get", "/forms/jobs/00000000-0000-0000-0000-000000000000", {}),
         ("get", "/users/me", {}),
         ("patch", "/users/me", {"json": {}}),
+        ("get", "/messages", {}),
+        ("get", "/messages/00000000-0000-0000-0000-000000000000", {}),
+        ("post", "/messages/sync", {}),
     ],
 )
 def test_user_routes_require_auth(client, method, path, kwargs):

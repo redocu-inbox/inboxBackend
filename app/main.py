@@ -46,6 +46,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Browsers hide this from the Vite app unless it is listed here.
+    expose_headers=["X-Total-Count"],
 )
 
 app.include_router(api_router)
