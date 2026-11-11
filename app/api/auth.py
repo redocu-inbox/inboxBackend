@@ -35,6 +35,7 @@ from app.services.auth.rate_limit import (
 from app.services.google.connect import connect_google_mailbox
 from app.services.google.http import fetch_mailbox_identity
 from app.services.google.oauth import (
+    GMAIL_READONLY_SCOPE,
     exchange_authorization_code,
     google_authorization_url,
     revoke_google_token,
@@ -402,10 +403,13 @@ async def google_callback(
     Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
     Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
     The error is one of google_denied, invalid_state, token_exchange,
-    mailbox_taken, or mailbox_conflict. Provider text, codes, and tokens are
-    not copied into the URL. Unexpected failures also redirect to token_exchange
-    unless the mailbox row was already committed, in which case the redirect is
-    connected=1 so a saved refresh token is not described as a failed exchange.
+    mailbox_taken, or mailbox_conflict. google_denied is also used when Google
+    returns a token whose scopes omit Gmail read access: the user can untick
+    Gmail on the consent screen, and that grant is revoked instead of saved.
+    Provider text, codes, and tokens are not copied into the URL. Unexpected
+    failures also redirect to token_exchange unless the mailbox row was already
+    committed, in which case the redirect is connected=1 so a saved refresh
+    token is not described as a failed exchange.
     """
     del error_description  # logged nowhere and never copied into the redirect
     persisted = False
@@ -428,6 +432,22 @@ async def google_callback(
         result = exchange_authorization_code(code)
         if result is None or "access_token" not in result:
             return _inbox_failure(_ERR_TOKEN, provider="Google")
+        # Google lists each granted scope as its own token. Unticking Gmail
+        # leaves openid and email, and the connect must not be saved as success.
+        scope = result.get("scope")
+        granted = scope.split() if isinstance(scope, str) else []
+        gmail_granted = any(
+            part == "gmail.readonly"
+            or part == GMAIL_READONLY_SCOPE
+            or part.endswith("/gmail.readonly")
+            for part in granted
+        )
+        if not gmail_granted:
+            refresh = result.get("refresh_token")
+            token = refresh if isinstance(refresh, str) and refresh else result.get("access_token")
+            if isinstance(token, str) and token:
+                revoke_google_token(token)
+            return _inbox_failure(_ERR_GOOGLE_DENIED, provider="Google")
         refresh_token = result.get("refresh_token")
         if not isinstance(refresh_token, str) or not refresh_token:
             return _inbox_failure(_ERR_TOKEN, provider="Google")

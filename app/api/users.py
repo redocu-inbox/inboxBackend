@@ -16,6 +16,14 @@ from app.services.mailboxes import SYNC_STATUSES
 router = APIRouter(prefix="/users", tags=["users"])
 
 
+class SyncStatusResponse(BaseModel):
+    """Worker lifecycle for one mailbox. last_successful_at is only a finished sync."""
+
+    status: Literal["idle", "pending", "running", "failed"]
+    last_successful_at: datetime | None = None
+    error_code: str | None = None
+
+
 class MailboxResponse(BaseModel):
     """The connected mailbox. Tokens, scopes, and the delta link stay on the server."""
 
@@ -24,12 +32,10 @@ class MailboxResponse(BaseModel):
     email: str
 
 
-class SyncStatusResponse(BaseModel):
-    """Worker lifecycle for the active mailbox. last_successful_at is only a finished sync."""
+class MailboxEntryResponse(MailboxResponse):
+    """One active mailbox and that mailbox's own sync status."""
 
-    status: Literal["idle", "pending", "running", "failed"]
-    last_successful_at: datetime | None = None
-    error_code: str | None = None
+    sync: SyncStatusResponse
 
 
 class UserResponse(BaseModel):
@@ -43,7 +49,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     mailbox: MailboxResponse | None = None
-    mailboxes: list[MailboxResponse] = Field(default_factory=list)
+    mailboxes: list[MailboxEntryResponse] = Field(default_factory=list)
     sync: SyncStatusResponse | None = None
 
 
@@ -53,18 +59,6 @@ class UpdateProfileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     display_name: str | None = Field(default=None, max_length=256)
-
-
-def latest_connected_account(session: Session, user_id: UUID) -> ConnectedAccount | None:
-    """The user's newest active mailbox. Disconnected rows are kept but hidden."""
-    return session.exec(
-        select(ConnectedAccount)
-        .where(
-            ConnectedAccount.user_id == user_id,
-            ConnectedAccount.disconnected_at.is_(None),
-        )
-        .order_by(ConnectedAccount.updated_at.desc(), ConnectedAccount.id.desc())
-    ).first()
 
 
 def active_mailboxes(session: Session, user_id: UUID) -> list[ConnectedAccount]:
@@ -111,21 +105,45 @@ def _combined_sync(accounts: list[ConnectedAccount]) -> SyncStatusResponse | Non
     )
 
 
+def _profile_mailbox(accounts: list[ConnectedAccount]) -> ConnectedAccount | None:
+    """The mailbox an existing client treats as Outlook.
+
+    Prefer the Microsoft row when one is connected. A newer Gmail row must not
+    take this field, or that client labels the Gmail address as Outlook and
+    Disconnect clears the Outlook tokens.
+    """
+    for account in accounts:
+        if account.provider == "microsoft":
+            return account
+    if not accounts:
+        return None
+    return accounts[0]
+
+
 def _mailbox(account: ConnectedAccount) -> MailboxResponse:
     return MailboxResponse(connected=True, provider=account.provider, email=account.email)
 
 
+def _mailbox_entry(account: ConnectedAccount) -> MailboxEntryResponse:
+    return MailboxEntryResponse(
+        connected=True,
+        provider=account.provider,
+        email=account.email,
+        sync=_sync_response(account),
+    )
+
+
 def _user_response(user: User, session: Session) -> UserResponse:
     accounts = active_mailboxes(session, user.id)
-    newest = latest_connected_account(session, user.id)
+    chosen = _profile_mailbox(accounts)
     return UserResponse(
         id=user.id,
         email=user.email,
         display_name=user.display_name,
         created_at=user.created_at,
         updated_at=user.updated_at,
-        mailbox=_mailbox(newest) if newest is not None else None,
-        mailboxes=[_mailbox(account) for account in accounts],
+        mailbox=_mailbox(chosen) if chosen is not None else None,
+        mailboxes=[_mailbox_entry(account) for account in accounts],
         sync=_combined_sync(accounts),
     )
 

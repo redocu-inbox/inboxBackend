@@ -10,7 +10,7 @@ from sqlmodel import Session
 
 from app.models.connected_account import ConnectedAccount
 from app.models.user import utcnow
-from app.services.google.oauth import exchange_refresh_token
+from app.services.google.oauth import GoogleTokenUnavailable, exchange_refresh_token
 from app.services.graph.tokens import MailboxNotWritable, TokenRefreshError, save_tokens
 
 
@@ -20,19 +20,24 @@ def refresh_google_access_token(
     *,
     generation: int | None = None,
 ) -> ConnectedAccount:
-    """Exchange the stored refresh token. `invalid_grant` becomes TokenRefreshError."""
+    """Exchange the stored refresh token.
+
+    A missing refresh token or Google's `invalid_grant` raises TokenRefreshError.
+    Any other token-endpoint failure raises GoogleTokenUnavailable and leaves
+    the stored grant in place.
+    """
     if not account.refresh_token:
         raise TokenRefreshError("no_refresh_token")
     result = exchange_refresh_token(account.refresh_token)
-    if result is None or "access_token" not in result:
-        raise TokenRefreshError("refresh_rejected")
+    if "access_token" not in result:
+        raise GoogleTokenUnavailable()
     refresh_token = result.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         refresh_token = account.refresh_token
     try:
         expires_in = int(result["expires_in"])
     except (KeyError, TypeError, ValueError):
-        raise TokenRefreshError("refresh_rejected") from None
+        raise GoogleTokenUnavailable() from None
     scope = result.get("scope")
     saved = save_tokens(
         session,

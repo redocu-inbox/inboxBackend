@@ -170,7 +170,7 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 
 When `token_expires_at` is missing or within five minutes, the job exchanges the stored refresh token and saves the new tokens only if the mailbox is still connected and the job's generation still matches. A failed refresh sets `sync_status` to `failed` and `sync.error_code` to `token_refresh_failed`. For Microsoft, the job then calls `GET https://graph.microsoft.com/v1.0/me/messages` with `$select=id,subject,bodyPreview,receivedDateTime,from,isRead,body`, `$top=25`, and `$orderby=receivedDateTime desc`, and follows `@odata.nextLink` only when it starts with `https://graph.microsoft.com/`, for at most four pages. HTML bodies are stored as plain text. A disconnect or a newer sync generation makes the job return without writing tokens or messages. `last_sync_at` changes only after that write commits. Graph errors set `sync_error_code` to `graph_unavailable` and leave `last_sync_at` as it was. The job does not raise after it has recorded that failure, so ARQ does not retry it into a newer generation.
 
-A `provider` of `google` never calls Graph. The job lists `users.messages` with `labelIds=INBOX` and `maxResults=25`, follows `nextPageToken` for at most four pages, then GETs each id with `format=full`. The Gmail id is stored in `graph_id`. `UNREAD` in `labelIds` means `is_read` is false. The snippet is `body_preview`. The plain part, or the HTML part with tags removed, is `body_text`. A 401 refreshes once. `invalid_grant` or a second 401 sets `token_refresh_failed`. Other Gmail errors set `gmail_unavailable`. The calls are read-only.
+A `provider` of `google` never calls Graph. The job lists `users.messages` with `labelIds=INBOX` and `maxResults=25`, follows `nextPageToken` for at most four pages, then GETs each id with `format=full`. The Gmail id is stored in `graph_id`. `UNREAD` in `labelIds` means `is_read` is false. The snippet is `body_preview`. The plain part, or the HTML part with tags removed, is `body_text`. A 401 refreshes once. `invalid_grant` or a second 401 sets `token_refresh_failed`. A timeout, a network error, or an HTTP 5xx from the token endpoint sets `gmail_unavailable`, so a Google outage does not ask the user to reconnect. Other Gmail errors also set `gmail_unavailable`. The calls are read-only.
 
 `LLM_PROVIDER=stub` (the default) returns the fixed string `[stub llm]`. Any other provider raises `NotImplementedError`.
 
@@ -237,7 +237,7 @@ Emails are stored in lowercase, so `Ana@x.com` and `ana@x.com` are one account. 
 {"connected": true, "provider": "microsoft", "email": "ana@outlook.com"}
 ```
 
-`mailbox` is the newest active mailbox, kept so an existing client still sees one object. `mailboxes` lists every active mailbox. With both providers connected it contains one `google` entry and one `microsoft` entry. Neither object includes tokens, scopes, or the delta link. `sync` is `null` when nothing is connected. Otherwise it is the busier mailbox: `failed`, then `running`, then `pending`, then `idle`. `last_successful_at` is the latest success across them.
+`mailbox` is the active Outlook mailbox when one is connected, and otherwise the active Gmail mailbox. It stays on Outlook while both are connected, so a client that labels `mailbox` as Outlook and disconnects it does not clear Gmail. `mailboxes` lists every active mailbox. With both providers connected it contains one `google` entry and one `microsoft` entry, and each entry includes that mailbox's own `sync`. Neither object includes tokens, scopes, or the delta link. The top-level `sync` is `null` when nothing is connected. Otherwise it is the busier mailbox: `failed`, then `running`, then `pending`, then `idle`. `last_successful_at` on that top-level object is the latest success across them.
 
 ```json
 {"status": "idle", "last_successful_at": null, "error_code": null}
@@ -426,7 +426,7 @@ The callback is `GET /auth/google/callback`. It deletes the one-time Redis state
 
 | `error` | When |
 | ------- | ---- |
-| `google_denied` | Google sent an `error` query parameter (the user cancelled, or consent was denied) |
+| `google_denied` | Google sent an `error` query parameter (the user cancelled, or consent was denied), or the token's scopes do not include `gmail.readonly`. The token is revoked and no mailbox is saved |
 | `invalid_state` | `code` or `state` is missing, the state is unusable, or Redis could not be read |
 | `token_exchange` | The code exchange failed, userinfo failed, the refresh token was missing, or an unexpected error happened before the row was committed |
 | `mailbox_taken` | That Google `sub` is already stored for a different app user |
@@ -442,7 +442,7 @@ Check a test user against `https://redocu.app` only after the Render service has
 2. Confirm the authorized redirect URI is exactly `https://redocu-api.onrender.com/auth/google/callback`.
 3. Sign in at `https://redocu.app` with an existing app account. Password login is still required. Gmail connect does not create the app user.
 4. Start connect. The browser should land on Google, show the read-only Gmail consent screen, and return to `https://redocu.app/inbox?connected=1&email=...`.
-5. `GET /users/me` shows `mailboxes` with `provider` `google`. `sync.status` moves to `idle` with `last_successful_at` set. If Outlook is also connected, `mailboxes` contains both.
+5. `GET /users/me` shows `mailboxes` with `provider` `google` and that entry's `sync`. `sync.status` moves to `idle` with `last_successful_at` set. If Outlook is also connected, `mailboxes` contains both and `mailbox` stays the Outlook account.
 6. `GET /messages` lists recent mail from every connected mailbox, newest first. Each item includes `provider` (`google` or `microsoft`). Open one and confirm `body_text` is plain text.
 7. Cancel consent once and confirm the inbox URL is `connected=0&error=google_denied`, with no Google error text in the query.
 8. Disconnect Gmail. Those messages leave the list. Outlook mail stays. Connecting the same Google account again shows the stored Gmail messages beside the Outlook mail.

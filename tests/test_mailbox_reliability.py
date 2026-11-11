@@ -19,6 +19,8 @@ from app.models.form_template import FormTemplate
 from app.models.message import Message
 from app.models.user import User
 from app.services.google.messages import GmailRequestError, gmail_message_fields
+from app.services.google.oauth import GoogleTokenUnavailable
+from app.services.graph.tokens import TokenRefreshError
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.html_text import to_plain_text
 from app.services.mailboxes import (
@@ -315,7 +317,10 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
         assert saved.refresh_token == "google-refresh-token"
         kept = saved.last_sync_at
 
-    monkeypatch.setattr("app.services.google.tokens.exchange_refresh_token", lambda refresh_token: None)
+    monkeypatch.setattr(
+        "app.services.google.tokens.exchange_refresh_token",
+        lambda refresh_token: (_ for _ in ()).throw(TokenRefreshError("invalid_grant")),
+    )
     monkeypatch.setattr(
         "app.worker.tasks.collect_gmail_messages",
         lambda token: (_ for _ in ()).throw(AssertionError("list after invalid_grant")),
@@ -365,6 +370,117 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
         assert saved.access_token == "new-access"
         assert saved.refresh_token == "google-refresh-token"
     assert calls["n"] == 2
+
+    monkeypatch.setattr(
+        "app.services.google.tokens.exchange_refresh_token",
+        lambda refresh_token: (_ for _ in ()).throw(GoogleTokenUnavailable()),
+    )
+    monkeypatch.setattr(
+        "app.worker.tasks.collect_gmail_messages",
+        lambda token: (_ for _ in ()).throw(AssertionError("list during google outage")),
+    )
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, account_id)
+        kept_sync = account.last_sync_at
+        account.token_expires_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        account.sync_generation = 5
+        account.sync_status = "pending"
+        session.add(account)
+        session.commit()
+    _run_sync(str(account_id), 5)
+    outage = client.get("/users/me", headers=headers).json()["sync"]
+    assert outage["status"] == "failed"
+    assert outage["error_code"] == "gmail_unavailable"
+    assert outage["last_successful_at"] == again["last_successful_at"]
+    with Session(engine) as session:
+        saved = session.get(ConnectedAccount, account_id)
+        assert saved.last_sync_at == kept_sync
+        assert saved.refresh_token == "google-refresh-token"
+
+
+def test_google_token_post_reconnects_only_for_invalid_grant(monkeypatch, caplog):
+    import logging
+    from email.message import EmailMessage
+    from io import BytesIO
+    from urllib.error import HTTPError, URLError
+
+    from app.services.google.oauth import _google_token_post
+
+    caplog.set_level(logging.WARNING)
+    secret = "refresh-token-secret"
+
+    class _Response:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+    def _http(code: int, body: bytes) -> HTTPError:
+        return HTTPError(
+            "https://oauth2.googleapis.com/token",
+            code,
+            "error",
+            EmailMessage(),
+            BytesIO(body),
+        )
+
+    def _open(error: Exception):
+        def _urlopen(request, timeout):
+            assert secret.encode() in request.data
+            raise error
+
+        return _urlopen
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        lambda request, timeout: _Response(b'{"access_token":"access","expires_in":3600}'),
+    )
+    assert _google_token_post({"refresh_token": secret})["access_token"] == "access"
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        _open(_http(400, b'{"error":"invalid_grant","error_description":"Token has been revoked."}')),
+    )
+    with pytest.raises(TokenRefreshError):
+        _google_token_post({"refresh_token": secret, "grant_type": "refresh_token"})
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        _open(_http(400, b'{"error":"invalid_client"}')),
+    )
+    with pytest.raises(GoogleTokenUnavailable):
+        _google_token_post({"refresh_token": secret, "grant_type": "refresh_token"})
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        _open(_http(503, b'{"error":"invalid_grant"}')),
+    )
+    with pytest.raises(GoogleTokenUnavailable):
+        _google_token_post({"refresh_token": secret, "grant_type": "refresh_token"})
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        _open(_http(500, b"upstream")),
+    )
+    with pytest.raises(GoogleTokenUnavailable):
+        _google_token_post({"refresh_token": secret, "grant_type": "refresh_token"})
+
+    monkeypatch.setattr(
+        "app.services.google.oauth.urlopen",
+        _open(URLError("timed out")),
+    )
+    with pytest.raises(GoogleTokenUnavailable):
+        _google_token_post({"refresh_token": secret, "grant_type": "refresh_token"})
+
+    assert secret not in caplog.text
+    assert "revoked" not in caplog.text
 
 
 def test_google_disconnect_revokes_and_hides_mail(client, register_user, monkeypatch, caplog):

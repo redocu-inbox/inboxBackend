@@ -241,6 +241,48 @@ def test_profile_hides_a_disconnected_mailbox_and_patch_keeps_the_active_one(cli
     assert patched.json()["mailbox"]["email"] == "new@outlook.com"
 
 
+def test_profile_mailbox_stays_outlook_when_gmail_was_updated_later(client, register_user):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    _add_account(
+        user_id,
+        email="ana@outlook.com",
+        updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    gmail_id = _add_account(
+        user_id,
+        email="ana@gmail.com",
+        provider="google",
+        updated_at=datetime(2024, 8, 1, tzinfo=timezone.utc),
+    )
+    with Session(engine) as session:
+        gmail = session.get(ConnectedAccount, UUID(gmail_id))
+        gmail.sync_status = "failed"
+        gmail.sync_error_code = "gmail_unavailable"
+        gmail.last_sync_at = datetime(2024, 7, 1, tzinfo=timezone.utc)
+        session.add(gmail)
+        session.commit()
+
+    me = client.get("/users/me", headers=headers).json()
+    assert me["mailbox"] == {
+        "connected": True,
+        "provider": "microsoft",
+        "email": "ana@outlook.com",
+    }
+    assert me["sync"]["status"] == "failed"
+    assert me["sync"]["error_code"] == "gmail_unavailable"
+    by_provider = {item["provider"]: item for item in me["mailboxes"]}
+    assert by_provider["microsoft"]["sync"] == {
+        "status": "idle",
+        "last_successful_at": None,
+        "error_code": None,
+    }
+    assert by_provider["google"]["email"] == "ana@gmail.com"
+    assert by_provider["google"]["sync"]["status"] == "failed"
+    assert by_provider["google"]["sync"]["error_code"] == "gmail_unavailable"
+    assert by_provider["google"]["sync"]["last_successful_at"] is not None
+
+
 def test_sync_requires_a_mailbox_and_enqueues_the_latest_account(client, register_user):
     headers = register_user("ana@example.com")
     missing = client.post("/messages/sync", headers=headers)
@@ -297,9 +339,25 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
         ("From Outlook", "microsoft"),
     ]
     me = client.get("/users/me", headers=headers).json()
+    assert me["mailbox"] == {
+        "connected": True,
+        "provider": "microsoft",
+        "email": "ana@outlook.com",
+    }
+    idle = {"status": "idle", "last_successful_at": None, "error_code": None}
     assert me["mailboxes"] == [
-        {"connected": True, "provider": "google", "email": "ana@gmail.com"},
-        {"connected": True, "provider": "microsoft", "email": "ana@outlook.com"},
+        {
+            "connected": True,
+            "provider": "google",
+            "email": "ana@gmail.com",
+            "sync": idle,
+        },
+        {
+            "connected": True,
+            "provider": "microsoft",
+            "email": "ana@outlook.com",
+            "sync": idle,
+        },
     ]
 
     response = client.post("/messages/sync", headers=headers)
@@ -589,7 +647,11 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
 
     monkeypatch.setattr(
         "app.api.auth.exchange_authorization_code",
-        lambda code: {"access_token": "google-access-token", "expires_in": 3600},
+        lambda code: {
+            "access_token": "google-access-token",
+            "expires_in": 3600,
+            "scope": "openid email https://www.googleapis.com/auth/gmail.readonly",
+        },
     )
     no_refresh = _google_callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert _query(no_refresh.headers["location"])["error"] == ["token_exchange"]
@@ -600,6 +662,30 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
     assert _query(no_identity.headers["location"])["error"] == ["token_exchange"]
     assert "google-access-token" not in no_identity.headers["location"]
     assert "google-refresh-token" not in no_identity.headers["location"]
+
+    revoked: list[str] = []
+    monkeypatch.setattr("app.api.auth.revoke_google_token", revoked.append)
+    monkeypatch.setattr(
+        "app.api.auth.exchange_authorization_code",
+        lambda code: {**_google_token, "scope": "openid email"},
+    )
+    monkeypatch.setattr(
+        "app.api.auth.fetch_mailbox_identity",
+        lambda access_token: GoogleMailboxIdentity("sub-ana", "ana@gmail.com"),
+    )
+    _patch_redis(monkeypatch, user_id.encode())
+    withheld = _google_callback(client, f"code=abc&state={_OAUTH_STATE}")
+    assert _query(withheld.headers["location"]) == {"connected": ["0"], "error": ["google_denied"]}
+    assert "openid" not in withheld.headers["location"]
+    assert "google-refresh-token" not in withheld.headers["location"]
+    assert revoked == ["google-refresh-token"]
+    with Session(engine) as session:
+        saved = session.exec(
+            select(ConnectedAccount).where(ConnectedAccount.user_id == UUID(user_id))
+        ).first()
+        assert saved is None
+    app.state.arq.enqueue_job.assert_not_awaited()
+    monkeypatch.setattr("app.api.auth.exchange_authorization_code", lambda code: _google_token)
 
     monkeypatch.setattr(
         "app.api.auth.fetch_mailbox_identity",
@@ -617,7 +703,10 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
     both = _google_callback(client, f"code=abc&state={_OAUTH_STATE}")
     assert _query(both.headers["location"]) == {"connected": ["1"], "email": ["ana@gmail.com"]}
     together = client.get("/users/me", headers=headers).json()
+    assert together["mailbox"]["provider"] == "microsoft"
+    assert together["mailbox"]["email"] == "ana@outlook.com"
     assert {item["provider"] for item in together["mailboxes"]} == {"google", "microsoft"}
+    assert revoked == ["google-refresh-token"]
     with Session(engine) as session:
         outlook = session.exec(
             select(ConnectedAccount).where(ConnectedAccount.provider_account_id == "oid-ana")

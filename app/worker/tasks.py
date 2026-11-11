@@ -21,7 +21,7 @@ from app.services.google.messages import (
     collect_gmail_messages,
     gmail_message_fields,
 )
-from app.services.google.tokens import refresh_google_access_token
+from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_access_token
 from app.services.graph.html_text import to_plain_text
 from app.services.graph.tokens import (
     MailboxNotWritable,
@@ -214,7 +214,9 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
     """List recent Gmail INBOX messages and store them. Never calls Microsoft Graph.
 
     A 401 refreshes once. `invalid_grant` and a second 401 set token_refresh_failed.
-    Other Gmail errors set gmail_unavailable. The job returns either way.
+    A token-endpoint timeout, network error, or HTTP 5xx sets gmail_unavailable
+    and does not ask the user to reconnect. Other Gmail errors set
+    gmail_unavailable. The job returns either way.
     """
     locked = _lock_account(session, account_id)
     if locked is None or locked.provider != "google" or _stale(locked, claimed):
@@ -260,6 +262,15 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             exc.status,
         )
         _mark_failed(session, account_id, claimed, code)
+        return
+    except GoogleTokenUnavailable as exc:
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            GMAIL_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, GMAIL_UNAVAILABLE)
         return
     except Exception as exc:
         logger.warning(
