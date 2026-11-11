@@ -15,6 +15,9 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | 5 | Outlook mailbox connect (`GET /auth/microsoft/start`, `GET /auth/microsoft/callback`), refresh of encrypted Graph tokens, sync of recent messages, and `GET /messages` |
 | F | Frontend connection: `authorization_url` from Microsoft start, callback redirect to `FRONTEND_URL`, `mailbox` on `GET /users/me`, `POST /messages/sync`, and the frozen message list and detail contract |
 | F2 | One active Outlook mailbox per user, callback failures always redirect, Graph sender/read/plain-text body, sync status, disconnect, and server-side logout |
+| 6 | Spec for priority scoring of synced mail. Contract: [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md) |
+
+Phase 6 is the spec above. It freezes the score, the band, and the reasons. The app still leaves `priority_score` unset until the implementation PRs land.
 
 ## Run it
 
@@ -398,4 +401,4 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ## Not built yet
 
-Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json`, filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`), setting `priority_score`, and any LLM provider other than `stub`. Disconnect does not revoke the Microsoft grant remotely. Priority, drafts, and sending mail are not implemented.
+Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json`, filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`), setting `priority_score` (spec: [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md)), and any LLM provider other than `stub`. Disconnect does not revoke the Microsoft grant remotely. Priority, drafts, and sending mail are not implemented.
