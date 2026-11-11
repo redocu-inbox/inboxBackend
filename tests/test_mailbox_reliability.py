@@ -18,10 +18,12 @@ from app.models.connected_account import ConnectedAccount
 from app.models.form_template import FormTemplate
 from app.models.message import Message
 from app.models.user import User
+from app.services.google.messages import GmailRequestError, gmail_message_fields
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.html_text import to_plain_text
 from app.services.mailboxes import (
     ACTIVE_MAILBOX_INDEX,
+    ONE_ACTIVE_MAILBOX_INDEX,
     SYNC_STALE_AFTER,
     deactivate_extra_microsoft_mailboxes,
 )
@@ -253,6 +255,197 @@ def _future():
 
 def _run_sync(account_id: str, generation: int) -> None:
     asyncio.run(sync_mailbox_delta({"job_id": "job-1"}, account_id, generation))
+
+
+def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monkeypatch):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    with Session(engine) as session:
+        account = ConnectedAccount(
+            user_id=UUID(user_id),
+            provider="google",
+            provider_account_id="sub-sync",
+            email="ana@gmail.com",
+            access_token="google-access-token",
+            refresh_token="google-refresh-token",
+            token_expires_at=_future(),
+            sync_generation=1,
+            sync_status="idle",
+        )
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    queued = client.post("/messages/sync", headers=headers)
+    assert queued.status_code == 202
+    assert queued.json() == {"enqueued": True, "sync_status": "pending"}
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("Google token was sent to Graph")
+
+    monkeypatch.setattr("app.worker.tasks._graph_get", _forbid)
+    monkeypatch.setattr("app.worker.tasks.refresh_access_token", _forbid)
+    monkeypatch.setattr(
+        "app.worker.tasks.collect_gmail_messages",
+        lambda token: [_gmail_item(message_id="gmail-1", unread=True), _gmail_item(message_id="gmail-2", unread=False)],
+    )
+    _run_sync(str(account_id), 2)
+    listed = client.get("/messages", headers=headers)
+    assert listed.status_code == 200
+    assert "<" not in listed.text
+    rows = listed.json()
+    assert {row["is_read"] for row in rows} == {True, False}
+    assert {row["from_email"] for row in rows} == {"ada@example.com"}
+    assert {row["from_name"] for row in rows} == {"Ada"}
+    assert {row["subject"] for row in rows} == {"Invoice 12"}
+    assert {row["body_preview"] for row in rows} == {"Hello there"}
+    unread = next(row for row in rows if row["is_read"] is False)
+    detail = client.get(f"/messages/{unread['id']}", headers=headers).json()
+    assert detail["body_text"] == "Hello"
+    assert detail["draft"] is None
+    me = client.get("/users/me", headers=headers).json()
+    assert me["mailbox"]["provider"] == "google"
+    assert me["sync"]["status"] == "idle"
+    assert me["sync"]["error_code"] is None
+    assert me["sync"]["last_successful_at"] is not None
+    with Session(engine) as session:
+        saved = session.get(ConnectedAccount, account_id)
+        assert saved is not None
+        assert saved.access_token == "google-access-token"
+        assert saved.refresh_token == "google-refresh-token"
+        kept = saved.last_sync_at
+
+    monkeypatch.setattr("app.services.google.tokens.exchange_refresh_token", lambda refresh_token: None)
+    monkeypatch.setattr(
+        "app.worker.tasks.collect_gmail_messages",
+        lambda token: (_ for _ in ()).throw(AssertionError("list after invalid_grant")),
+    )
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, account_id)
+        account.token_expires_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        account.sync_generation = 3
+        account.sync_status = "pending"
+        session.add(account)
+        session.commit()
+    _run_sync(str(account_id), 3)
+    failed = client.get("/users/me", headers=headers).json()["sync"]
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "token_refresh_failed"
+    assert failed["last_successful_at"] == me["sync"]["last_successful_at"]
+    with Session(engine) as session:
+        assert session.get(ConnectedAccount, account_id).last_sync_at == kept
+
+    calls = {"n": 0}
+
+    def _unauthorized_once(token):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise GmailRequestError(401)
+        assert token == "new-access"
+        return [_gmail_item(message_id="gmail-1", unread=False)]
+
+    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", _unauthorized_once)
+    monkeypatch.setattr(
+        "app.services.google.tokens.exchange_refresh_token",
+        lambda refresh_token: {"access_token": "new-access", "expires_in": 3600},
+    )
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, account_id)
+        account.token_expires_at = _future()
+        account.sync_generation = 4
+        account.sync_status = "pending"
+        session.add(account)
+        session.commit()
+    _run_sync(str(account_id), 4)
+    again = client.get("/users/me", headers=headers).json()["sync"]
+    assert again["status"] == "idle"
+    assert again["error_code"] is None
+    with Session(engine) as session:
+        saved = session.get(ConnectedAccount, account_id)
+        assert saved.access_token == "new-access"
+        assert saved.refresh_token == "google-refresh-token"
+    assert calls["n"] == 2
+
+
+def test_google_disconnect_revokes_and_hides_mail(client, register_user, monkeypatch, caplog):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    account_id = _add_account(user_id, email="ana@gmail.com", oid="sub-ana", provider="google")
+    message_id = _add_message(
+        user_id,
+        account_id,
+        graph_id="kept",
+        received_at=datetime(2024, 5, 1, tzinfo=timezone.utc),
+        priority_score=None,
+    )
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, UUID(account_id))
+        account.access_token = "google-access-token"
+        account.refresh_token = "google-refresh-token"
+        session.add(account)
+        session.commit()
+
+    seen: list[str] = []
+    monkeypatch.setattr("app.api.auth.revoke_google_token", seen.append)
+    assert client.post("/auth/microsoft/disconnect", headers=headers).status_code == 404
+    assert client.get("/users/me", headers=headers).json()["mailbox"]["email"] == "ana@gmail.com"
+
+    gone = client.post("/auth/google/disconnect", headers=headers)
+    assert gone.status_code == 200
+    assert gone.json() == {"disconnected": True}
+    assert seen == ["google-refresh-token"]
+    assert "google-refresh-token" not in caplog.text
+    assert "google-access-token" not in caplog.text
+    assert client.get("/users/me", headers=headers).json()["mailbox"] is None
+    assert client.get("/messages", headers=headers).json() == []
+    assert client.get(f"/messages/{message_id}", headers=headers).status_code == 404
+    with Session(engine) as session:
+        saved = session.get(ConnectedAccount, UUID(account_id))
+        assert saved.disconnected_at is not None
+        assert saved.access_token is None
+        assert saved.refresh_token is None
+        assert session.get(Message, UUID(message_id)) is not None
+    assert client.post("/auth/google/disconnect", headers=headers).status_code == 404
+    assert client.post("/messages/sync", headers=headers).status_code == 404
+
+
+def _gmail_item(*, message_id: str, unread: bool) -> dict:
+    import base64
+
+    def encode(value: str) -> str:
+        return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+
+    labels = ["INBOX", "UNREAD"] if unread else ["INBOX"]
+    return {
+        "id": message_id,
+        "internalDate": "1717243200000" if unread else "1717156800000",
+        "labelIds": labels,
+        "snippet": "Hello there",
+        "payload": {
+            "mimeType": "multipart/alternative",
+            "headers": [
+                {"name": "Subject", "value": "Invoice <b>12</b>"},
+                {"name": "From", "value": "Ada <script>x</script> <ada@example.com>"},
+            ],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": encode("Hello")}},
+                {"mimeType": "text/html", "body": {"data": encode(HTML_BODY)}},
+            ],
+        },
+    }
+
+
+def test_gmail_html_only_body_is_plain_text():
+    item = _gmail_item(message_id="gmail-html", unread=False)
+    item["payload"]["parts"] = [
+        part for part in item["payload"]["parts"] if part["mimeType"] == "text/html"
+    ]
+    fields = gmail_message_fields(item)
+    assert fields is not None
+    assert fields["body_text"] == "Hello"
+    assert "<" not in fields["body_text"]
+    assert fields["is_read"] is True
+    assert fields["from_email"] == "ada@example.com"
 
 
 def test_sync_success_failure_and_superseded_generation(client, register_user, monkeypatch):
@@ -540,6 +733,7 @@ def test_concurrent_connect_leaves_one_active_mailbox():
 def test_extra_mailbox_migration_preserves_tokens_and_messages():
     with engine.connect() as connection:
         transaction = connection.begin()
+        connection.execute(text(f"DROP INDEX IF EXISTS {ONE_ACTIVE_MAILBOX_INDEX}"))
         connection.execute(text(f"DROP INDEX IF EXISTS {ACTIVE_MAILBOX_INDEX}"))
         session = Session(bind=connection)
         user = User(email=f"{uuid4()}@example.com", hashed_password="x")

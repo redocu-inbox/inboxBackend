@@ -18,6 +18,7 @@ _MIN_SECRET_KEY_LENGTH = 32
 _LOCAL_DB_PASSWORD = "inbox"
 _ACCEPTED_SSLMODES = {"require", "verify-ca", "verify-full"}
 _GRAPH_CALLBACK_PATH = "/auth/microsoft/callback"
+_GOOGLE_CALLBACK_PATH = "/auth/google/callback"
 
 
 class Settings(BaseSettings):
@@ -53,6 +54,11 @@ class Settings(BaseSettings):
     graph_redirect_uri: str = ""
     # Shared secret Graph echoes on each webhook notification.
     graph_webhook_client_state: str = ""
+
+    # Google OAuth2 app used to connect a mailbox and list recent messages.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = ""
 
     graph_scopes: str = (
         "https://graph.microsoft.com/User.Read,"
@@ -136,7 +142,16 @@ class Settings(BaseSettings):
             raise ValueError("CORS_ORIGINS must include FRONTEND_URL when APP_ENV is production")
         _check_production_database(self.database_url)
         _check_production_redis(self.redis_url)
-        _check_production_redirect(self.graph_redirect_uri)
+        _check_production_redirect(
+            self.graph_redirect_uri,
+            setting_name="GRAPH_REDIRECT_URI",
+            expected_path=_GRAPH_CALLBACK_PATH,
+        )
+        _check_production_redirect(
+            self.google_redirect_uri,
+            setting_name="GOOGLE_REDIRECT_URI",
+            expected_path=_GOOGLE_CALLBACK_PATH,
+        )
         if len(self.graph_webhook_client_state) < 16:
             raise ValueError(
                 "GRAPH_WEBHOOK_CLIENT_STATE must be a random string of at least 16 characters "
@@ -213,14 +228,14 @@ def _check_production_redis(redis_url: str) -> None:
         raise ValueError("REDIS_URL must include a password when APP_ENV is production")
 
 
-def _check_production_redirect(redirect_uri: str) -> None:
+def _check_production_redirect(redirect_uri: str, *, setting_name: str, expected_path: str) -> None:
     parts = urlsplit(redirect_uri)
     if parts.scheme != "https" or not parts.hostname:
-        raise ValueError("GRAPH_REDIRECT_URI must be an https URL when APP_ENV is production")
+        raise ValueError(f"{setting_name} must be an https URL when APP_ENV is production")
     if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError("GRAPH_REDIRECT_URI must not include userinfo, a query, or a fragment")
-    if parts.path.rstrip("/") != _GRAPH_CALLBACK_PATH:
-        raise ValueError("GRAPH_REDIRECT_URI path must be /auth/microsoft/callback")
+        raise ValueError(f"{setting_name} must not include userinfo, a query, or a fragment")
+    if parts.path.rstrip("/") != expected_path:
+        raise ValueError(f"{setting_name} path must be {expected_path}")
 
 
 @lru_cache

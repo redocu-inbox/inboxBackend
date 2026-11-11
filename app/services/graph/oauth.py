@@ -8,4 +8,4 @@ def build_msal_app() -> msal.ConfidentialClientApplication:
         settings.graph_client_id,
         authority=settings.graph_authority,
         client_credential=settings.graph_client_secret,
-    ) 
+    )
