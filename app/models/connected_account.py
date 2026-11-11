@@ -10,7 +10,7 @@ from app.models.user import utcnow
 from app.security import EncryptedText
 
 class ConnectedAccount(SQLModel, table=True):
-    """Outlook / Microsft Graph credentials for one mailbox."""
+    """Outlook or Gmail credentials for one mailbox."""
 
     __tablename__ = "connected_accounts"
     __table_args__ = (

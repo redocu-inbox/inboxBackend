@@ -1,4 +1,4 @@
-"""Registration, login, logout, and Microsoft mailbox connect.
+"""Registration, login, logout, and mailbox connect.
 
 Register and login are plain `def` routes because password hashing is deliberately
 slow. FastAPI runs them in a thread pool, so hashing does not block the event loop.
@@ -32,9 +32,21 @@ from app.services.auth.rate_limit import (
     client_ip,
     enforce_password_reset_limit,
 )
+from app.services.google.connect import connect_google_mailbox
+from app.services.google.http import fetch_mailbox_identity
+from app.services.google.oauth import (
+    GMAIL_READONLY_SCOPE,
+    exchange_authorization_code,
+    google_authorization_url,
+    revoke_google_token,
+)
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.oauth import build_msal_app
-from app.services.mailboxes import disconnect_active_mailbox, mark_sync_enqueue_failed
+from app.services.mailboxes import (
+    disconnect_active_mailbox,
+    lock_active_mailbox,
+    mark_sync_enqueue_failed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +98,7 @@ class DisconnectResponse(BaseModel):
 
 # The frontend branches on these. Provider text is logged and stays out of the URL.
 _ERR_DENIED = "microsoft_denied"
+_ERR_GOOGLE_DENIED = "google_denied"
 _ERR_STATE = "invalid_state"
 _ERR_TOKEN = "token_exchange"
 _ERR_TAKEN = "mailbox_taken"
@@ -241,8 +254,8 @@ def _inbox_redirect(**query: str) -> RedirectResponse:
     return response
 
 
-def _inbox_failure(code: str) -> RedirectResponse:
-    logger.warning("Microsoft sign-in failed (%s)", code)
+def _inbox_failure(code: str, *, provider: str = "Microsoft") -> RedirectResponse:
+    logger.warning("%s sign-in failed (%s)", provider, code)
     return _inbox_redirect(connected="0", error=code)
 
 
@@ -345,13 +358,180 @@ def _exchange_code(code: str) -> dict | None:
     return result
 
 
+@router.get("/google/start", status_code=status.HTTP_200_OK)
+def google_start(user: User = Depends(get_current_user)) -> MicrosoftStartResponse:
+    """Return Google's authorize URL. The Bearer token is not copied into it."""
+    settings = get_settings()
+    if not settings.google_client_id or not settings.google_redirect_uri:
+        logger.warning("Google authorize URL is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gmail connect is temporarily unavailable.",
+        )
+    state = secrets.token_urlsafe(32)
+    try:
+        _store_oauth_state(state, user.id)
+    except Exception as exc:
+        logger.warning("oauth state store unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gmail connect is temporarily unavailable.",
+        ) from exc
+    try:
+        url = google_authorization_url(state)
+    except Exception as exc:
+        _delete_oauth_state(state)
+        logger.warning("Google authorize URL failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gmail connect is temporarily unavailable.",
+        ) from exc
+    return MicrosoftStartResponse(authorization_url=url)
+
+
+@router.get("/google/callback")
+async def google_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+    session: Session = Depends(get_session),
+) -> RedirectResponse:
+    """Finish Google login and send the browser back to the configured frontend.
+
+    Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
+    Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
+    The error is one of google_denied, invalid_state, token_exchange,
+    mailbox_taken, or mailbox_conflict. google_denied is also used when Google
+    returns a token whose scopes omit Gmail read access: the user can untick
+    Gmail on the consent screen, and that grant is revoked instead of saved.
+    Provider text, codes, and tokens are not copied into the URL. Unexpected
+    failures also redirect to token_exchange unless the mailbox row was already
+    committed, in which case the redirect is connected=1 so a saved refresh
+    token is not described as a failed exchange.
+    """
+    del error_description  # logged nowhere and never copied into the redirect
+    persisted = False
+    try:
+        if error:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_GOOGLE_DENIED, provider="Google")
+        if not code or not state:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_STATE, provider="Google")
+
+        user_id = _consume_oauth_user_id(state)
+        if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
+            return _inbox_failure(_ERR_STATE, provider="Google")
+        if session.get(User, user_id) is None:
+            return _inbox_failure(_ERR_STATE, provider="Google")
+
+        result = exchange_authorization_code(code)
+        if result is None or "access_token" not in result:
+            return _inbox_failure(_ERR_TOKEN, provider="Google")
+        # Google lists each granted scope as its own token. Unticking Gmail
+        # leaves openid and email, and the connect must not be saved as success.
+        scope = result.get("scope")
+        granted = scope.split() if isinstance(scope, str) else []
+        gmail_granted = any(
+            part == "gmail.readonly"
+            or part == GMAIL_READONLY_SCOPE
+            or part.endswith("/gmail.readonly")
+            for part in granted
+        )
+        if not gmail_granted:
+            refresh = result.get("refresh_token")
+            token = refresh if isinstance(refresh, str) and refresh else result.get("access_token")
+            if isinstance(token, str) and token:
+                revoke_google_token(token)
+            return _inbox_failure(_ERR_GOOGLE_DENIED, provider="Google")
+        refresh_token = result.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return _inbox_failure(_ERR_TOKEN, provider="Google")
+        try:
+            expires_in = int(result["expires_in"])
+        except (KeyError, TypeError, ValueError):
+            return _inbox_failure(_ERR_TOKEN, provider="Google")
+
+        identity = fetch_mailbox_identity(result["access_token"])
+        if identity is None:
+            return _inbox_failure(_ERR_TOKEN, provider="Google")
+        outcome = connect_google_mailbox(
+            session,
+            user_id=user_id,
+            provider_account_id=identity.provider_account_id,
+            email=identity.email,
+            access_token=result["access_token"],
+            refresh_token=refresh_token,
+            expires_at=utcnow() + timedelta(seconds=expires_in),
+            scopes=result.get("scope") if isinstance(result.get("scope"), str) else None,
+        )
+        if outcome.status is ConnectStatus.mailbox_taken:
+            return _inbox_failure(_ERR_TAKEN, provider="Google")
+        if outcome.status is ConnectStatus.mailbox_conflict:
+            return _inbox_failure(_ERR_CONFLICT, provider="Google")
+        if outcome.status is not ConnectStatus.connected or outcome.account_id is None:
+            return _inbox_failure(_ERR_TOKEN, provider="Google")
+        persisted = True
+        try:
+            await get_arq_enqueue(request, outcome.account_id, outcome.generation)
+        except Exception as exc:
+            logger.warning(
+                "sync enqueue failed account=%s error_type=%s",
+                outcome.account_id,
+                type(exc).__name__,
+            )
+            if outcome.generation is not None:
+                mark_sync_enqueue_failed(session, outcome.account_id, outcome.generation)
+        return _inbox_redirect(connected="1", email=outcome.email or identity.email)
+    except Exception as exc:
+        logger.warning("Google callback failed error_type=%s", type(exc).__name__)
+        if persisted:
+            return _inbox_redirect(connected="1")
+        return _inbox_failure(_ERR_TOKEN, provider="Google")
+
+
+@router.post("/google/disconnect")
+def google_disconnect(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> DisconnectResponse:
+    """Revoke the Google grant and clear the active Gmail mailbox.
+
+    Messages stay in the database and stay hidden. A Microsoft mailbox is left
+    alone. Revoke failures are logged without the token; the local tokens are
+    still deleted so this API cannot refresh access.
+    """
+    account = lock_active_mailbox(session, user.id, provider="google")
+    if account is None:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No mailbox is connected.",
+        )
+    token = account.refresh_token or account.access_token
+    copied = token if isinstance(token, str) and token else None
+    session.rollback()
+    if copied:
+        revoke_google_token(copied)
+    if not disconnect_active_mailbox(session, user.id, provider="google"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No mailbox is connected.",
+        )
+    return DisconnectResponse(disconnected=True)
+
+
 @router.post("/microsoft/disconnect")
 def microsoft_disconnect(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> DisconnectResponse:
-    """Clear the active mailbox's tokens and hide it. Messages stay in the database."""
-    if not disconnect_active_mailbox(session, user.id):
+    """Clear the active Outlook mailbox's tokens and hide it. Messages stay in the database."""
+    if not disconnect_active_mailbox(session, user.id, provider="microsoft"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No mailbox is connected.",

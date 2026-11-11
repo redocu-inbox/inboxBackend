@@ -16,6 +16,12 @@ from app.db import engine
 from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.user import utcnow
 from app.models.connected_account import ConnectedAccount
+from app.services.google.messages import (
+    GmailRequestError,
+    collect_gmail_messages,
+    gmail_message_fields,
+)
+from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_access_token
 from app.services.graph.html_text import to_plain_text
 from app.services.graph.tokens import (
     MailboxNotWritable,
@@ -23,7 +29,7 @@ from app.services.graph.tokens import (
     needs_refresh,
     refresh_access_token,
 )
-from app.services.mailboxes import GRAPH_UNAVAILABLE, TOKEN_REFRESH_FAILED
+from app.services.mailboxes import GMAIL_UNAVAILABLE, GRAPH_UNAVAILABLE, TOKEN_REFRESH_FAILED
 from app.models.message import Message
 
 _GRAPH_HOST = "https://graph.microsoft.com/"
@@ -88,9 +94,14 @@ def graph_message_fields(item: dict) -> dict | None:
     }
 
 
-def _upsert_message(session: Session, account: ConnectedAccount, item: dict) -> None:
-    """Insert a message or update it when this mailbox already stored that graph id."""
-    fields = graph_message_fields(item)
+def _upsert_message(
+    session: Session,
+    account: ConnectedAccount,
+    item: dict,
+    mapper=graph_message_fields,
+) -> None:
+    """Insert a message or update it when this mailbox already stored that provider id."""
+    fields = mapper(item)
     if fields is None:
         return
     existing = session.exec(
@@ -199,6 +210,105 @@ def _collect_messages(access_token: str) -> list[dict]:
     return items
 
 
+def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None, ctx: dict) -> None:
+    """List recent Gmail INBOX messages and store them. Never calls Microsoft Graph.
+
+    A 401 refreshes once. `invalid_grant` and a second 401 set token_refresh_failed.
+    A token-endpoint timeout, network error, or HTTP 5xx sets gmail_unavailable
+    and does not ask the user to reconnect. Other Gmail errors set
+    gmail_unavailable. The job returns either way.
+    """
+    locked = _lock_account(session, account_id)
+    if locked is None or locked.provider != "google" or _stale(locked, claimed):
+        session.rollback()
+        return
+    locked.sync_status = "running"
+    locked.sync_error_code = None
+    locked.sync_status_at = utcnow()
+    session.add(locked)
+    session.commit()
+    try:
+        if needs_refresh(locked):
+            locked = refresh_google_access_token(session, locked, generation=claimed)
+        if locked.access_token is None:
+            raise MailboxNotWritable()
+        try:
+            items = collect_gmail_messages(locked.access_token)
+        except GmailRequestError as exc:
+            if exc.status != 401:
+                raise
+            locked = refresh_google_access_token(session, locked, generation=claimed)
+            if locked.access_token is None:
+                raise MailboxNotWritable()
+            items = collect_gmail_messages(locked.access_token)
+    except MailboxNotWritable:
+        logger.info("sync_mailbox_delta stopped account=%s job_id=%s", account_id, ctx.get("job_id"))
+        return
+    except TokenRefreshError as exc:
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            TOKEN_REFRESH_FAILED,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, TOKEN_REFRESH_FAILED)
+        return
+    except GmailRequestError as exc:
+        code = TOKEN_REFRESH_FAILED if exc.status == 401 else GMAIL_UNAVAILABLE
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s status=%s",
+            account_id,
+            code,
+            exc.status,
+        )
+        _mark_failed(session, account_id, claimed, code)
+        return
+    except GoogleTokenUnavailable as exc:
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            GMAIL_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, GMAIL_UNAVAILABLE)
+        return
+    except Exception as exc:
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            GMAIL_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, GMAIL_UNAVAILABLE)
+        return
+
+    try:
+        locked = _lock_account(session, account_id)
+        if locked is None or locked.provider != "google" or _stale(locked, claimed):
+            session.rollback()
+            logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
+            return
+        for item in items:
+            _upsert_message(session, locked, item, gmail_message_fields)
+        locked.sync_status = "idle"
+        locked.sync_error_code = None
+        locked.last_sync_at = utcnow()
+        locked.sync_status_at = locked.last_sync_at
+        session.add(locked)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            GMAIL_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, GMAIL_UNAVAILABLE)
+        return
+    logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
+
+
 async def sync_mailbox_delta(
     ctx: dict,
     subscription_id: str,
@@ -209,6 +319,7 @@ async def sync_mailbox_delta(
     `generation` is the sync_generation captured when the job was queued. A
     disconnect or a newer sync bumps that counter and this job returns without
     writing. Webhook jobs omit it and still refuse a disconnected mailbox.
+    A Google mailbox is listed from Gmail INBOX and is not sent to Graph.
     Success is the only path that sets last_sync_at. Failures return normally
     so a retry cannot mark an already-failed or superseded generation idle.
     """
@@ -222,6 +333,16 @@ async def sync_mailbox_delta(
         account_id = account.id
         if claimed is None:
             claimed = int(account.sync_generation or 0)
+        if account.provider == "google":
+            _sync_google_mailbox(session, account_id, claimed, ctx)
+            return
+        if account.provider != "microsoft":
+            logger.info(
+                "sync_mailbox_delta skipped account=%s provider=%s",
+                account.id,
+                account.provider,
+            )
+            return
         locked = _lock_account(session, account_id)
         if locked is None or _stale(locked, claimed):
             session.rollback()

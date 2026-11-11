@@ -1,6 +1,6 @@
-"""Save one Microsoft mailbox for the user who started OAuth.
+"""Save one mailbox for the user who started OAuth.
 
-The Microsoft code is exchanged before this runs. This function either commits
+The provider's code is exchanged before this runs. This function either commits
 the new tokens or rolls back. It does not enqueue the worker.
 """
 
@@ -37,11 +37,13 @@ def _lock_user(session: Session, user_id: UUID) -> User | None:
     ).first()
 
 
-def _find_oid(session: Session, provider_account_id: str) -> ConnectedAccount | None:
+def _find_provider_account(
+    session: Session, provider: str, provider_account_id: str
+) -> ConnectedAccount | None:
     return session.exec(
         select(ConnectedAccount)
         .where(
-            ConnectedAccount.provider == "microsoft",
+            ConnectedAccount.provider == provider,
             ConnectedAccount.provider_account_id == provider_account_id,
         )
         .with_for_update()
@@ -49,12 +51,13 @@ def _find_oid(session: Session, provider_account_id: str) -> ConnectedAccount | 
     ).first()
 
 
-def _find_active(session: Session, user_id: UUID) -> ConnectedAccount | None:
+def _find_active(session: Session, user_id: UUID, provider: str) -> ConnectedAccount | None:
+    """The user's active mailbox for this provider. The other provider can stay connected."""
     return session.exec(
         select(ConnectedAccount)
         .where(
             ConnectedAccount.user_id == user_id,
-            ConnectedAccount.provider == "microsoft",
+            ConnectedAccount.provider == provider,
             ConnectedAccount.disconnected_at.is_(None),
         )
         .order_by(ConnectedAccount.updated_at.desc(), ConnectedAccount.id.desc())
@@ -63,9 +66,10 @@ def _find_active(session: Session, user_id: UUID) -> ConnectedAccount | None:
     ).first()
 
 
-def connect_microsoft_mailbox(
+def connect_mailbox(
     session: Session,
     *,
+    provider: str,
     user_id: UUID,
     provider_account_id: str,
     tenant_id: str | None,
@@ -76,12 +80,13 @@ def connect_microsoft_mailbox(
     scopes: str | None,
     _retry: bool = False,
 ) -> ConnectOutcome:
-    """Reconnect the same Microsoft account, or insert the first one.
+    """Reconnect the same mailbox, or insert one for this provider.
 
-    A different Microsoft account is rejected while one is still active.
-    An oid owned by another app user is rejected. Neither rejection changes
-    the stored tokens. A unique-index race is rolled back and classified
-    instead of being left half-saved.
+    Outlook and Gmail can both be active. A different account for this same
+    provider is rejected while one is still active. An account id owned by
+    another app user is rejected. Neither rejection changes the stored tokens.
+    A unique-index race is rolled back and classified instead of being left
+    half-saved.
     """
     if (
         not provider_account_id
@@ -97,8 +102,8 @@ def connect_microsoft_mailbox(
         if _lock_user(session, user_id) is None:
             session.rollback()
             return ConnectOutcome(ConnectStatus.not_saved)
-        existing = _find_oid(session, provider_account_id)
-        active = _find_active(session, user_id)
+        existing = _find_provider_account(session, provider, provider_account_id)
+        active = _find_active(session, user_id, provider)
         if existing is not None and existing.user_id != user_id:
             session.rollback()
             return ConnectOutcome(ConnectStatus.mailbox_taken)
@@ -109,7 +114,7 @@ def connect_microsoft_mailbox(
         if existing is None:
             existing = ConnectedAccount(
                 user_id=user_id,
-                provider="microsoft",
+                provider=provider,
                 provider_account_id=provider_account_id,
                 tenant_id=tenant_id,
                 email=email,
@@ -152,14 +157,14 @@ def connect_microsoft_mailbox(
             return ConnectOutcome(ConnectStatus.not_saved)
         existing = session.exec(
             select(ConnectedAccount).where(
-                ConnectedAccount.provider == "microsoft",
+                ConnectedAccount.provider == provider,
                 ConnectedAccount.provider_account_id == provider_account_id,
             )
         ).first()
         active = session.exec(
             select(ConnectedAccount).where(
                 ConnectedAccount.user_id == user_id,
-                ConnectedAccount.provider == "microsoft",
+                ConnectedAccount.provider == provider,
                 ConnectedAccount.disconnected_at.is_(None),
             )
         ).first()
@@ -167,8 +172,9 @@ def connect_microsoft_mailbox(
             return ConnectOutcome(ConnectStatus.mailbox_taken)
         if active is not None and (existing is None or active.id != existing.id):
             return ConnectOutcome(ConnectStatus.mailbox_conflict)
-        return connect_microsoft_mailbox(
+        return connect_mailbox(
             session,
+            provider=provider,
             user_id=user_id,
             provider_account_id=provider_account_id,
             tenant_id=tenant_id,
@@ -179,3 +185,32 @@ def connect_microsoft_mailbox(
             scopes=scopes,
             _retry=True,
         )
+
+
+def connect_microsoft_mailbox(
+    session: Session,
+    *,
+    user_id: UUID,
+    provider_account_id: str,
+    tenant_id: str | None,
+    email: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: datetime,
+    scopes: str | None,
+    _retry: bool = False,
+) -> ConnectOutcome:
+    """Save a Microsoft mailbox. `provider_account_id` is the Entra `oid`."""
+    return connect_mailbox(
+        session,
+        provider="microsoft",
+        user_id=user_id,
+        provider_account_id=provider_account_id,
+        tenant_id=tenant_id,
+        email=email,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+        scopes=scopes,
+        _retry=_retry,
+    )

@@ -1,8 +1,8 @@
 """Message list, detail, and a manual mailbox sync.
 
 The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
-body_text are filled from Graph when a sync stores them, and stay null when
-Graph omits them. body_text is plain text, never raw HTML. priority_score stays
+body_text are filled when a sync stores them, and stay null when the provider
+omits them. body_text is plain text, never raw HTML. priority_score stays
 null until a later phase writes it. priority_reasons is empty until then.
 suggested_form is null until a later phase. draft stays null.
 """
@@ -33,6 +33,7 @@ class MessageResponse(BaseModel):
     from_email: str | None = None
     received_at: datetime
     is_read: bool | None = None
+    provider: str | None = None
     conversation_id: str | None = None
     priority_score: float | None = None
     priority_band: str | None = None
@@ -51,7 +52,7 @@ class SyncResponse(BaseModel):
 
 
 def _visible_message_filter(user_id: UUID):
-    """Messages on this user's active mailbox. Disconnected mailboxes stay in the database."""
+    """Messages on this user's active mailboxes. Disconnected mailboxes stay in the database."""
     active_ids = select(ConnectedAccount.id).where(
         ConnectedAccount.user_id == user_id,
         ConnectedAccount.disconnected_at.is_(None),
@@ -59,7 +60,7 @@ def _visible_message_filter(user_id: UUID):
     return Message.user_id == user_id, Message.connected_account_id.in_(active_ids)
 
 
-def _message_response(row: Message) -> MessageResponse:
+def _message_response(row: Message, provider: str | None) -> MessageResponse:
     return MessageResponse(
         id=row.id,
         subject=row.subject,
@@ -68,6 +69,7 @@ def _message_response(row: Message) -> MessageResponse:
         from_email=row.from_email,
         received_at=row.received_at,
         is_read=row.is_read,
+        provider=provider,
         priority_score=row.priority_score,
     )
 
@@ -91,18 +93,19 @@ def list_messages(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> list[MessageResponse]:
-    """List this user's active-mailbox messages. X-Total-Count ignores limit and offset."""
+    """List this user's mail from every active mailbox. X-Total-Count ignores limit and offset."""
     visible = _visible_message_filter(user.id)
     total = session.scalar(select(func.count(Message.id)).where(*visible))
     response.headers["X-Total-Count"] = str(total or 0)
     rows = session.exec(
-        select(Message)
+        select(Message, ConnectedAccount.provider)
+        .join(ConnectedAccount, ConnectedAccount.id == Message.connected_account_id)
         .where(*visible)
         .order_by(*_order_by(sort))
         .offset(offset)
         .limit(limit)
     ).all()
-    return [_message_response(row) for row in rows]
+    return [_message_response(row, provider) for row, provider in rows]
 
 
 @router.get("/messages/{message_id}")
@@ -117,8 +120,20 @@ def read_message(
     account = session.get(ConnectedAccount, row.connected_account_id)
     if account is None or account.user_id != user.id or account.disconnected_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
-    item = _message_response(row)
+    item = _message_response(row, account.provider)
     return MessageDetailResponse(**item.model_dump(), body_text=row.body_text, draft=None)
+
+
+_SYNC_RANK = {"failed": 3, "running": 2, "pending": 1, "idle": 0}
+
+
+def _combined_sync_status(requested: list) -> Literal["idle", "pending", "running", "failed"]:
+    """The busiest mailbox wins, so one running sync is not hidden by an idle one."""
+    status = "idle"
+    for item in requested:
+        if _SYNC_RANK.get(item.sync_status, 0) > _SYNC_RANK[status]:
+            status = item.sync_status
+    return status
 
 
 @router.post("/messages/sync", status_code=status.HTTP_202_ACCEPTED)
@@ -127,30 +142,34 @@ async def sync_messages(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> SyncResponse:
-    """Enqueue sync_mailbox_delta for the active mailbox, or report the job already in flight.
+    """Enqueue sync_mailbox_delta for every active mailbox.
 
-    `enqueued` is true only when this call took a new generation. A 202 with
-    `enqueued` false means a pending or running job is still the current one.
-    Queuing does not set last_successful_at. A queue outage is 503 and the row
-    is failed, not idle.
+    Outlook and Gmail are both queued. `enqueued` is true when this call took
+    a new generation for at least one of them. A mailbox that is already
+    pending or running is left alone. Queuing does not set last_successful_at.
+    A queue outage is 503 and that mailbox is failed, not idle.
     """
     requested = request_mailbox_sync(session, user.id)
-    if requested is None:
+    if not requested:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No mailbox is connected.",
         )
-    if requested.enqueued:
+    enqueued = False
+    for item in requested:
+        if not item.enqueued:
+            continue
         try:
             await get_arq(request).enqueue_job(
                 "sync_mailbox_delta",
-                str(requested.account_id),
-                requested.generation,
+                str(item.account_id),
+                item.generation,
             )
         except Exception as exc:
-            mark_sync_enqueue_failed(session, requested.account_id, requested.generation)
+            mark_sync_enqueue_failed(session, item.account_id, item.generation)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Mailbox sync could not be queued.",
             ) from exc
-    return SyncResponse(enqueued=requested.enqueued, sync_status=requested.sync_status)
+        enqueued = True
+    return SyncResponse(enqueued=enqueued, sync_status=_combined_sync_status(requested))

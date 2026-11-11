@@ -68,6 +68,7 @@ def bob(register_user):
         ("post", "/messages/sync", {}),
         ("post", "/auth/logout", {}),
         ("post", "/auth/microsoft/disconnect", {}),
+        ("post", "/auth/google/disconnect", {}),
     ],
 )
 def test_user_routes_require_auth(client, method, path, kwargs):
