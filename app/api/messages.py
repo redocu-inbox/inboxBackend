@@ -1,4 +1,4 @@
-"""Message list, detail, and a manual mailbox sync.
+"""Message list, detail, reply drafts, and a manual mailbox sync.
 
 The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
 body_text are filled when a sync stores them, and stay null when the provider
@@ -7,9 +7,11 @@ priority_score, priority_band, priority_reasons, and the classification
 fields. A correction leaves that field as the user saved it. A null reasons
 column is [] in JSON. user_corrected is false until a correction.
 priority_scored_at is stored and is not returned. suggested_form is null
-until a later phase. draft stays null.
+until a later phase. detail.draft is the local reply draft, or null.
+The list has no draft key. No message route sends mail.
 """
 
+import logging
 from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -27,12 +29,35 @@ from app.models.classification_correction import (
 )
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
+from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import User, utcnow
+from app.services.graph.drafts import GraphDraftError, create_reply_draft, patch_reply_draft
+from app.services.graph.html_text import MAX_PLAIN_TEXT_CHARS
+from app.services.graph.tokens import (
+    MailboxNotWritable,
+    TokenRefreshError,
+    needs_refresh,
+    refresh_access_token,
+)
 from app.services.mailboxes import mark_sync_enqueue_failed, request_mailbox_sync
 from app.services.priority.apply import message_fields
 from app.services.priority.score import score
 
 router = APIRouter(tags=["messages"])
+logger = logging.getLogger(__name__)
+
+
+class ReplyDraftResponse(BaseModel):
+    """Frozen draft object. `created_at` stays on the table and is not returned."""
+
+    id: UUID
+    message_id: UUID
+    status: str
+    body: str | None = None
+    source: str | None = None
+    graph_draft_id: str | None = None
+    error: str | None = None
+    updated_at: datetime
 
 
 class MessageResponse(BaseModel):
@@ -62,7 +87,7 @@ class MessageResponse(BaseModel):
 
 class MessageDetailResponse(MessageResponse):
     body_text: str | None = None
-    draft: Any | None = None
+    draft: ReplyDraftResponse | None = None
 
 
 class SyncResponse(BaseModel):
@@ -231,9 +256,39 @@ def _visible_message(
     return row, account
 
 
-def _detail_response(row: Message, provider: str | None) -> MessageDetailResponse:
+def _draft_status(value: object) -> str:
+    if isinstance(value, ReplyDraftStatus):
+        return value.value
+    return str(value)
+
+
+def _draft_response(row: ReplyDraft) -> ReplyDraftResponse:
+    return ReplyDraftResponse(
+        id=row.id,
+        message_id=row.message_id,
+        status=_draft_status(row.status),
+        body=row.body,
+        source=row.source,
+        graph_draft_id=row.graph_draft_id,
+        error=row.error,
+        updated_at=row.updated_at,
+    )
+
+
+def _load_draft(session: Session, message_id: UUID) -> ReplyDraft | None:
+    return session.exec(select(ReplyDraft).where(ReplyDraft.message_id == message_id)).first()
+
+
+def _detail_response(
+    session: Session, row: Message, provider: str | None
+) -> MessageDetailResponse:
     item = _message_response(row, provider)
-    return MessageDetailResponse(**item.model_dump(), body_text=row.body_text, draft=None)
+    draft = _load_draft(session, row.id)
+    return MessageDetailResponse(
+        **item.model_dump(),
+        body_text=row.body_text,
+        draft=_draft_response(draft) if draft is not None else None,
+    )
 
 
 def _stored_text(row: Message, field: str) -> str | None:
@@ -252,7 +307,7 @@ def read_message(
     session: Session = Depends(get_session),
 ) -> MessageDetailResponse:
     row, account = _visible_message(session, user, message_id)
-    return _detail_response(row, account.provider)
+    return _detail_response(session, row, account.provider)
 
 
 @router.patch("/messages/{message_id}/classification")
@@ -282,7 +337,7 @@ def correct_classification(
             continue
         changes.append((field, old_value, new_value))
     if not changes:
-        return _detail_response(row, account.provider)
+        return _detail_response(session, row, account.provider)
 
     moment = utcnow()
     for field, old_value, new_value in changes:
@@ -315,7 +370,220 @@ def correct_classification(
     row.priority_scored_at = stamp
     session.add(row)
     session.commit()
-    return _detail_response(row, account.provider)
+    return _detail_response(session, row, account.provider)
+
+
+class ReplyDraftPatch(BaseModel):
+    """Replace the local reply text. Extra keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    body: str
+
+    @field_validator("body", mode="before")
+    @classmethod
+    def _body(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("invalid body")
+        text = value.strip()
+        if not text:
+            raise ValueError("empty body")
+        if len(text) > MAX_PLAIN_TEXT_CHARS:
+            raise ValueError("too long")
+        return text
+
+
+def _ready_draft(draft: ReplyDraft | None) -> bool:
+    if draft is None or _draft_status(draft.status) != ReplyDraftStatus.ready.value:
+        return False
+    return isinstance(draft.body, str) and bool(draft.body.strip())
+
+
+def _store_outlook_error(session: Session, draft: ReplyDraft, error: str) -> None:
+    """Keep status ready and keep the body. The stored error is a short code."""
+    current = session.get(ReplyDraft, draft.id)
+    if current is None:
+        return
+    current.error = error
+    current.status = ReplyDraftStatus.ready
+    current.updated_at = utcnow()
+    session.add(current)
+    session.commit()
+
+
+@router.post("/messages/{message_id}/draft")
+async def create_reply_draft_job(
+    message_id: UUID,
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReplyDraftResponse:
+    """Create or reset the local draft to pending and enqueue generation.
+
+    `error` and `graph_draft_id` are cleared. `body` is kept. This does not
+    call Graph.
+    """
+    row, _account = _visible_message(session, user, message_id)
+    draft = _load_draft(session, row.id)
+    now = utcnow()
+    if draft is None:
+        draft = ReplyDraft(
+            user_id=row.user_id,
+            message_id=row.id,
+            status=ReplyDraftStatus.pending,
+            created_at=now,
+            updated_at=now,
+        )
+    else:
+        draft.status = ReplyDraftStatus.pending
+        draft.error = None
+        draft.graph_draft_id = None
+        draft.updated_at = now
+    session.add(draft)
+    session.commit()
+    session.refresh(draft)
+    try:
+        await get_arq(request).enqueue_job("generate_reply_draft", str(row.id))
+    except Exception as exc:
+        draft.status = ReplyDraftStatus.failed
+        draft.error = "generation failed"
+        draft.updated_at = utcnow()
+        session.add(draft)
+        session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Reply draft could not be queued.",
+        ) from exc
+    return _draft_response(draft)
+
+
+@router.get("/messages/{message_id}/draft")
+def read_reply_draft(
+    message_id: UUID,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReplyDraftResponse:
+    _visible_message(session, user, message_id)
+    draft = _load_draft(session, message_id)
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    return _draft_response(draft)
+
+
+@router.patch("/messages/{message_id}/draft")
+def update_reply_draft(
+    message_id: UUID,
+    body: ReplyDraftPatch,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReplyDraftResponse:
+    """Save trimmed text. source is user and status is ready. Does not call Graph."""
+    _visible_message(session, user, message_id)
+    draft = _load_draft(session, message_id)
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    draft.body = body.body
+    draft.source = "user"
+    draft.status = ReplyDraftStatus.ready
+    draft.error = None
+    draft.updated_at = utcnow()
+    session.add(draft)
+    session.commit()
+    session.refresh(draft)
+    return _draft_response(draft)
+
+
+@router.delete("/messages/{message_id}/draft", status_code=status.HTTP_204_NO_CONTENT)
+def delete_reply_draft(
+    message_id: UUID,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    """Remove the local row only. Outlook is not changed."""
+    _visible_message(session, user, message_id)
+    draft = _load_draft(session, message_id)
+    if draft is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    session.delete(draft)
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/messages/{message_id}/draft/outlook")
+def push_outlook_draft(
+    message_id: UUID,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReplyDraftResponse:
+    """Save an unsent Outlook draft. createReply runs only when no Graph id is stored.
+
+    A later push PATCHes that same id. This route does not send mail.
+    """
+    row, account = _visible_message(session, user, message_id)
+    if account.provider != "microsoft":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Only an Outlook mailbox can save this draft.",
+        )
+    draft = _load_draft(session, row.id)
+    if not _ready_draft(draft) or draft is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
+    text = draft.body or ""
+    provider_message_id = row.graph_id
+    try:
+        if needs_refresh(account):
+            account = refresh_access_token(session, account)
+    except (TokenRefreshError, MailboxNotWritable) as exc:
+        logger.warning(
+            "outlook draft refresh failed message=%s error_type=%s",
+            row.id,
+            type(exc).__name__,
+        )
+        _store_outlook_error(session, draft, "token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook token could not be refreshed.",
+        ) from exc
+    token = account.access_token
+    if not token:
+        _store_outlook_error(session, draft, "token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook token could not be refreshed.",
+        )
+    # Refresh commits the session, so load the draft again before writing its id.
+    draft = session.get(ReplyDraft, draft.id)
+    if not _ready_draft(draft) or draft is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
+    try:
+        draft_id = draft.graph_draft_id
+        if not draft_id:
+            draft_id = create_reply_draft(token, provider_message_id)
+            current = session.get(ReplyDraft, draft.id)
+            if current is None:
+                raise GraphDraftError("missing_draft")
+            current.graph_draft_id = draft_id
+            current.updated_at = utcnow()
+            session.add(current)
+            session.commit()
+            draft = current
+        patch_reply_draft(token, draft_id, text)
+    except GraphDraftError:
+        _store_outlook_error(session, draft, "outlook draft failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook draft could not be saved.",
+        ) from None
+    saved = session.get(ReplyDraft, draft.id)
+    if saved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    saved.error = None
+    saved.status = ReplyDraftStatus.ready
+    saved.updated_at = utcnow()
+    session.add(saved)
+    session.commit()
+    session.refresh(saved)
+    return _draft_response(saved)
 
 
 _SYNC_RANK = {"failed": 3, "running": 2, "pending": 1, "idle": 0}

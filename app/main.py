@@ -45,7 +45,7 @@ app.add_middleware(
     allow_origins=settings.cors_origin_list,
     # Bearer tokens are sent on Authorization, not cookies.
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
     # Browsers hide this from the Vite app unless it is listed here.
     expose_headers=["X-Total-Count"],

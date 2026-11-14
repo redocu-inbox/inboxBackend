@@ -40,6 +40,18 @@ LIST_KEYS = {
     "suggested_form",
 }
 
+# Frozen reply-draft object. created_at stays on the table and is not a key.
+DRAFT_KEYS = {
+    "id",
+    "message_id",
+    "status",
+    "body",
+    "source",
+    "graph_draft_id",
+    "error",
+    "updated_at",
+}
+
 
 class _Redis:
     def __init__(self, payload: bytes | None = None):

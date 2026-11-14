@@ -362,6 +362,7 @@ def test_redocu_preflight_and_total_count_header(client, register_user):
         assert "GET" in allowed_methods
         assert "POST" in allowed_methods
         assert "PATCH" in allowed_methods
+        assert "DELETE" in allowed_methods
         assert "OPTIONS" in allowed_methods
         assert preflight.headers.get("access-control-allow-credentials") is None
         listed = client.get("/messages", headers={"Origin": "https://redocu.app"})

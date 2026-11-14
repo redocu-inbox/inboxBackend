@@ -90,14 +90,14 @@ app/
   api/health.py           GET /health
   api/auth.py             Register, login, and Microsoft mailbox connect
   api/users.py            GET and PATCH /users/me, including mailbox
-  api/messages.py         GET /messages, GET /messages/{id}, POST /messages/sync
+  api/messages.py         Message list, detail, local reply drafts, and sync
   api/graph.py            POST /webhooks/graph
   api/forms.py            Form template upload and fill jobs
   api/deps.py             Current user, database session, ARQ pool
   models/                 SQLModel tables
-  services/graph/         MSAL client, token save and refresh; delta client is still a seam
+  services/graph/         MSAL client, token save and refresh, unsent Outlook drafts; delta client is still a seam
   services/forms/         Template storage, fill jobs, PDF filler seam
-  services/llm/           LLM protocol; only the stub provider is implemented
+  services/llm/           LLM protocol; stub unless openai or anthropic has a key
   worker/                 ARQ settings and jobs
   storage/                Local filesystem storage, with a seam for S3/R2 later
 alembic/                  Schema migrations
@@ -107,13 +107,14 @@ tests/                    Auth, isolation, and token-encryption tests
 
 ## Data model
 
-Every row that belongs to a person hangs off `users.id`. Deleting a user cascades to their mailboxes, messages, templates, and fill jobs.
+Every row that belongs to a person hangs off `users.id`. Deleting a user cascades to their mailboxes, messages, reply drafts, templates, and fill jobs.
 
 | Table                | Holds |
 | -------------------- | ----- |
 | `users`              | Email, optional display name, Argon2 password hash |
 | `connected_accounts` | One active Outlook mailbox and one active Gmail mailbox: encrypted tokens, and Graph fields when the provider is Microsoft |
 | `messages`           | A synced message (`graph_id`, subject, preview, received time, priority score, band, reasons, and classification fields). Sync fills those with the rule classifier and scorer |
+| `reply_drafts`       | One local reply per message: status, body, source, Outlook draft id, and error. Deleting the message or the user deletes the row |
 | `form_templates`     | An uploaded PDF: storage key, tags, and a `schema_json` field map (still empty) |
 | `form_fill_jobs`     | One fill attempt: status, extracted values, confidence, error, filled-file path |
 
@@ -121,7 +122,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 
 Microsoft and Google tokens on `ConnectedAccount` are encrypted by the column type (`EncryptedText`), so code reads and writes plaintext as usual. This needs `TOKEN_ENCRYPTION_KEY`; see `.env.example`. Losing that key means every mailbox has to reconnect. It is separate from `SECRET_KEY`.
 
-Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset until a later phase. The message sync stores `graph_id`, subject, preview, received time, sender name, sender email, read state, and plain-text body, then classifies and scores that row. `conversation_id` and `suggested_form` stay null. List and detail return `priority_score`, `priority_band`, `priority_reasons`, `category`, `category_source`, `category_confidence`, `project_name`, `project_number`, `due_date`, `responsible_party`, `reference_number`, and `user_corrected`. `user_corrected` stays false until a user correction. A corrected field is left as the user saved it on the next sync. `priority_scored_at` is stored and is not on the response. Detail adds `body_text` and `draft`. `draft` stays null.
+Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. `delta_link`, `graph_subscription_id`, and `graph_subscription_expires_at` stay unset until a later phase. The message sync stores `graph_id`, subject, preview, received time, sender name, sender email, read state, and plain-text body, then classifies and scores that row. `conversation_id` and `suggested_form` stay null. List and detail return `priority_score`, `priority_band`, `priority_reasons`, `category`, `category_source`, `category_confidence`, `project_name`, `project_number`, `due_date`, `responsible_party`, `reference_number`, and `user_corrected`. `user_corrected` stays false until a user correction. A corrected field is left as the user saved it on the next sync. `priority_scored_at` is stored and is not on the response. Detail adds `body_text` and `draft`. `draft` is null until a local reply draft exists. The draft object is `id`, `message_id`, `status`, `body`, `source`, `graph_draft_id`, `error`, and `updated_at`. `created_at` is stored on the row and is not returned. The list has no `draft` key.
 
 ## Routes
 
@@ -142,7 +143,12 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /users/me`              | yes  | Read your profile, including `mailbox` and `sync` |
 | `PATCH /users/me`            | yes  | Update `display_name`. The response includes `mailbox` and `sync` too |
 | `GET /messages`              | yes  | List messages for the active mailbox. `X-Total-Count` is that count |
-| `GET /messages/{id}`         | yes  | One active-mailbox message, or `404` with detail `Message not found.` |
+| `GET /messages/{id}`         | yes  | One active-mailbox message, or `404` with detail `Message not found.` Detail includes `draft` or `null` |
+| `POST /messages/{id}/draft`  | yes  | Create or reset the local draft to `pending`, keep `body`, clear `error` and `graph_draft_id`, and enqueue `generate_reply_draft` |
+| `GET /messages/{id}/draft`   | yes  | The draft object, or `404` with detail `Draft not found.` |
+| `PATCH /messages/{id}/draft` | yes  | Save trimmed text with `source` `user` and `status` `ready` |
+| `DELETE /messages/{id}/draft` | yes | `204`. Removes only the local row. Does not change Outlook |
+| `POST /messages/{id}/draft/outlook` | yes | Save an unsent Outlook draft. Does not send mail |
 | `PATCH /messages/{id}/classification` | yes | Correct the category or an extracted field, log the change, and re-score. Another user's message is `404` |
 | `POST /messages/sync`        | yes  | `202` with `enqueued` and `sync_status`, `404` when no mailbox is connected, `503` when the queue rejects the job |
 | `POST /webhooks/graph`       | no   | Graph subscription handshake, or enqueue `sync_mailbox_delta` |
@@ -167,6 +173,7 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | `match_form_template`       | `POST /forms/jobs` | Sets the job to `running`, then logs a TODO. It does not call the LLM |
 | `run_form_fill`             | nothing yet | Logs a TODO. `PdfFormFiller.fill` is not implemented |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
+| `generate_reply_draft`      | `POST /messages/{id}/draft` | Writes the local reply body. The stub stores a fixed sentence. A configured provider stores the model text. It does not call Graph |
 | `sync_connected_mailboxes` | cron every 5 minutes by default | Syncs every connected Outlook and Gmail mailbox through `sync_mailbox_delta`. Skips a mailbox that is already pending or running. One account's token or provider error does not stop the others |
 
 `sync_mailbox_delta` takes the account or subscription id, and an optional generation integer. It loads the `connected_accounts` row whose `graph_subscription_id` equals the first string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id and the generation they just stored. The webhook passes only a Graph subscription id. With `graph_subscription_id` empty, that lookup misses, the job logs that no account was found, and it returns. A disconnected mailbox or a generation that is no longer current returns without calling Graph.
@@ -183,7 +190,7 @@ When the worker starts, it runs that job for every connected mailbox, Outlook an
 
 `SCORING_TIMEZONE` defaults to `America/New_York`. Today, tomorrow, weekdays, and due or overdue use that zone. An unknown value falls back to `America/New_York`. None of these settings are required.
 
-`LLM_PROVIDER=stub` (the default) returns the fixed string `[stub llm]`. Any other provider raises `NotImplementedError`.
+`LLM_PROVIDER=stub` (the default), an unknown provider, or `openai` / `anthropic` with an empty key returns `StubLLM`. `complete` still returns the fixed string `[stub llm]`. `openai` with a non-empty `OPENAI_API_KEY`, or `anthropic` with a non-empty `ANTHROPIC_API_KEY`, returns that provider. `LLM_MODEL` is used when it is set. A missing model key stays on the stub.
 
 ## Why SQLModel
 
@@ -227,6 +234,7 @@ The chain is:
 7. `f5a2c8d14e60` — one active Gmail mailbox and one active Outlook mailbox per user
 8. `c7e5a2b94d10` — priority band, reasons, scored-at, and classification columns on `messages`. No server defaults, so existing rows stay null
 9. `d9a7c4e16f32` — `message_classification_corrections`, the log of user corrections
+10. `d28d17cb4c64` — `reply_drafts`, one local reply per message
 
 `b7d3e9a41c20` does not delete messages or tokens. If a user already has more than one Microsoft row, the one with the latest `updated_at` (then the greatest `id`) stays active. The others get `disconnected_at` set and stay in the database with their tokens and mail. The API hides those rows until that same Microsoft account is connected again. An explicit disconnect is different: it clears tokens and the delta link, and it keeps the messages. `e4c1a9b82d30` added one active row per user. `f5a2c8d14e60` drops that limit and keeps one active Outlook mailbox and one active Gmail mailbox. Mail from both is listed together.
 
@@ -361,7 +369,7 @@ curl -X POST http://localhost:8000/messages/sync \
 
 After the worker logs `sync_mailbox_delta`, list messages. The body is a JSON array of that user's rows. `limit` is 1–100 and defaults to 50. `offset` defaults to 0. `sort` is `received_at` (the default, newest first) or `priority` (highest `priority_score` first, null scores after every number, then newest first). `X-Total-Count` is the user's message count and ignores `limit` and `offset`.
 
-Each item has `id`, `subject`, `body_preview`, `from_name`, `from_email`, `received_at`, `is_read`, `provider`, `conversation_id`, `priority_score`, `priority_band`, `priority_reasons`, and `suggested_form`. `provider` is `microsoft` or `google`. Messages from every active mailbox are in this one list, newest first. After a sync, `from_name`, `from_email`, and `is_read` come from that provider. Missing values stay `null` (`is_read` is not assumed false). `conversation_id` is still always `null`. `suggested_form` stays `null`. After a sync, `priority_score`, `priority_band`, `priority_reasons`, `category`, `category_source`, `category_confidence`, `project_name`, `project_number`, `due_date`, `responsible_party`, and `reference_number` come from the rule pass. `user_corrected` is false until a correction. A row that has not been scored still has a null score, a null band, and `priority_reasons` `[]`, and `sort=priority` puts that row after every number. `priority_scored_at` is not in this JSON. `PATCH /messages/{id}/classification` accepts `category`, `project_name`, `project_number`, `due_date`, `responsible_party`, and `reference_number`. Omitted keys stay as stored. An unknown key, an unknown category, or a due date that is not `YYYY-MM-DD` is `422`. The response is the message detail. `GET /messages/{id}` adds `body_text` (plain text, or `null`) and `draft` (`null`). `body_text` is not on the list. Tags, script, and style are removed before storage, and the stored strings do not contain `<` or `>`. Empty text is `null`, so the client keeps showing `body_preview`. Text is capped at 100000 characters. Another user's id, a disconnected mailbox's id, or an unknown id is `404` with detail `Message not found.` A non-UUID is `422`.
+Each item has `id`, `subject`, `body_preview`, `from_name`, `from_email`, `received_at`, `is_read`, `provider`, `conversation_id`, `priority_score`, `priority_band`, `priority_reasons`, and `suggested_form`. `provider` is `microsoft` or `google`. Messages from every active mailbox are in this one list, newest first. After a sync, `from_name`, `from_email`, and `is_read` come from that provider. Missing values stay `null` (`is_read` is not assumed false). `conversation_id` is still always `null`. `suggested_form` stays `null`. After a sync, `priority_score`, `priority_band`, `priority_reasons`, `category`, `category_source`, `category_confidence`, `project_name`, `project_number`, `due_date`, `responsible_party`, and `reference_number` come from the rule pass. `user_corrected` is false until a correction. A row that has not been scored still has a null score, a null band, and `priority_reasons` `[]`, and `sort=priority` puts that row after every number. `priority_scored_at` is not in this JSON. `PATCH /messages/{id}/classification` accepts `category`, `project_name`, `project_number`, `due_date`, `responsible_party`, and `reference_number`. Omitted keys stay as stored. An unknown key, an unknown category, or a due date that is not `YYYY-MM-DD` is `422`. The response is the message detail. `GET /messages/{id}` adds `body_text` (plain text, or `null`) and `draft` (`null` until a local reply exists). `body_text` is not on the list. Tags, script, and style are removed before storage, and the stored strings do not contain `<` or `>`. Empty text is `null`, so the client keeps showing `body_preview`. Text is capped at 100000 characters. Another user's id, a disconnected mailbox's id, or an unknown id is `404` with detail `Message not found.` A non-UUID is `422`.
 
 Timestamps are UTC ISO-8601. Whole seconds look like `2024-06-01T00:00:00Z`. Values with microseconds look like `2026-11-07T20:43:08.343229Z`. A stored score of 50 is the JSON number `50.0`.
 
@@ -371,6 +379,16 @@ curl -D - 'http://localhost:8000/messages?limit=50&offset=0&sort=received_at' \
 ```
 
 Watch the sync with `docker compose logs -f worker`.
+
+### Reply drafts
+
+`POST /messages/{id}/draft` creates one local draft, or resets the existing row to `pending`. It clears `error` and `graph_draft_id`, keeps `body`, and enqueues `generate_reply_draft`. The response is `200` and the draft object: `id`, `message_id`, `status`, `body`, `source`, `graph_draft_id`, `error`, and `updated_at`. `GET /messages/{id}/draft` returns that object, or `404` with detail `Draft not found.` `PATCH /messages/{id}/draft` takes `{"body": "..."}`, stores the trimmed text, sets `source` to `user` and `status` to `ready`. `DELETE /messages/{id}/draft` is `204` and removes only the local row. It does not change the message and it does not change Outlook.
+
+`POST /messages/{id}/draft/outlook` writes an unsent Outlook draft. The mailbox must be Microsoft, or the response is `422` with detail `Only an Outlook mailbox can save this draft.` The local draft must be `ready` with a non-empty body, or the response is `409` with detail `Draft is not ready.` When `graph_draft_id` is empty the route calls Graph `createReply`, saves that id, then PATCHes `{"body": {"contentType": "Text", "content": <local body>}}`. A later push skips `createReply` and PATCHes the same id. Success is `200`. `status` stays `ready` and `error` is cleared. A Graph failure is `502` with detail `Outlook draft could not be saved.` `status` stays `ready`. If `createReply` already returned an id, that id is kept. A token refresh failure is `502` and the local status stays `ready`. No route sends mail, and no request path includes `/send`.
+
+Another user's message id is `404` with detail `Message not found.`
+
+`generate_reply_draft` copies the subject, body, and preview inside a database session, then calls the LLM after that session closes. On the stub, including a missing model key, the stored body is `Thanks for your message. I will review it and reply shortly.` A configured provider stores the model text. Success sets `status` to `ready` and `source` to `llm`. `StubLLM.complete` still returns `[stub llm]`. A failed run sets `status` to `failed` and `error` to `generation failed`, and it keeps the existing body. If the queue rejects the job, the response is `503` with detail `Reply draft could not be queued.` The row is `failed`, the error is `generation failed`, and the body is kept.
 
 ## Production
 
@@ -400,7 +418,7 @@ Entra: Web platform, not SPA. Redirect URI exactly `GRAPH_REDIRECT_URI`. The SPA
 
 The API process does not terminate TLS and does not redirect HTTP to HTTPS. Whatever is in front of Uvicorn has to do that. `GRAPH_REDIRECT_URI` is that public `https://<API_ORIGIN>/auth/microsoft/callback`. The app does not build it from the `Host` header or from `X-Forwarded-Proto`. This repo does not choose that proxy, and it does not record a verified Entra registration.
 
-CORS allows `GET`, `POST`, `PATCH`, and `OPTIONS`. No route in this repository uses `PUT`, `DELETE`, or `HEAD`. Allowed request headers are `Authorization`, `Content-Type`, and `Accept`. `X-Total-Count` is exposed. `allow_credentials` is off because the API does not set a session cookie. The bearer token is a header. `CORS_ORIGINS` is a comma-separated list of exact origins, with no `*` and no trailing slash. Production for this product is `https://redocu.app`.
+CORS allows `GET`, `POST`, `PATCH`, `DELETE`, and `OPTIONS`. `DELETE /messages/{id}/draft` removes only the local reply draft. No route uses `PUT` or `HEAD`. No route sends mail. Allowed request headers are `Authorization`, `Content-Type`, and `Accept`. `X-Total-Count` is exposed. `allow_credentials` is off because the API does not set a session cookie. The bearer token is a header. `CORS_ORIGINS` is a comma-separated list of exact origins, with no `*` and no trailing slash. Production for this product is `https://redocu.app`.
 
 Deploy:
 
@@ -471,4 +489,4 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ## Not built yet
 
-Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json` and filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`). Any LLM provider other than `stub` is not implemented. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Drafts and sending or modifying mail are not implemented. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.
+Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json` and filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`). `openai` and `anthropic` run only when that provider's API key is set. A missing key stays on the stub. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Sending mail is not implemented. The Outlook draft route creates or updates an unsent draft and does not call send. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.
