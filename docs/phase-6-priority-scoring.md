@@ -325,7 +325,7 @@ Due date. On the plain subject, then the plain body slice, then the plain body p
 - `M/D/YY` or `MM/DD/YY`. Years 00 through 69 are 2000 through 2069. Years 70 through 99 are 1970 through 1999.
 - `Month D, YYYY` and `Month D YYYY`. Month is the English name or its three-letter abbreviation.
 
-An impossible date such as February 31 is skipped, and the search continues. A weekday such as `Friday` is not a date. No cue, or no valid date, leaves `due_date` null.
+An impossible date such as February 31 is skipped, and the search continues. A weekday, `today`, or `tomorrow` is a date only when `received_at` is present. It is resolved from that calendar day: `today` is the received day, `tomorrow` is the next day, and `Friday` is the same day when the message arrived on Friday, otherwise the next Friday. `by 5pm today` uses the same rule. Without `received_at`, those words are not a date. No cue, or no valid date, leaves `due_date` null.
 
 Responsible party. Search `from_name` and the local part of `from_email` (the text before `@`), with dots and underscores treated as spaces. Use the scorer's normalization. Do not search the domain or the body. The first phrase in this order wins, and the stored value is the canonical string:
 
@@ -420,7 +420,7 @@ Category and due-date weights are new. They fire from the stored columns, not fr
 
 | Code | Label | Weight | Fires when |
 | ---- | ----- | ------ | ---------- |
-| `due_overdue` | Overdue | 18 | Due-date rule above |
+| `due_overdue` | Overdue | 25 | Due-date rule above |
 | `due_soon` | Due within 3 days | 14 | Due-date rule above |
 | `category_safety` | Safety notice | 12 | `category` is `safety` |
 | `category_rfi` | RFI | 10 | `category` is `rfi` |
@@ -487,7 +487,20 @@ Duplicates: the same provider id on one mailbox is one row. A second upsert repl
 
 Messy provider items that lack an id or a parseable received time are dropped by the mapper and never reach the classifier. An address with no `@`, or with whitespace, is stored as a null `from_email`.
 
-`due by Friday` selects no due date. `keyword_deadline` can still fire from `due by`. Two category groups in one message keep the earlier group in the precedence list and set confidence `0.5`.
+`due by Friday` is the Friday of `received_at` when that column is present, and it is not a date when `received_at` is missing. `keyword_deadline` can still fire from `due by`. Two category groups in one message keep the earlier group in the precedence list and set confidence `0.5`.
+
+Shared signals, in addition to the construction keywords. Category points stay. The API still returns every reason. The full list is not cut to the top two or three.
+
+| Code | Label | Weight | Fires when |
+| ---- | ----- | ------ | ---------- |
+| `asks_you` | Asks something of you | 25 | `please send`, `can you confirm`, `please confirm`, `sign and return`, `please reply`, `please advise`, `let me know`, `could you`, `would you`, `action required`, or a `?` in the subject |
+| `repeat_ask` | Repeat ask | 15 | `final notice`, `second request`, `third request`, `following up`, `follow up`, or `second notice` |
+| `happening_soon` | Happening today or tomorrow | 15 | `meeting`, `showing`, `pickup`, or `inspection`, and a date in the message that is the scoring clock's date or the next day |
+| `act_on_attachment` | Attachment to act on | 8 | `sign and return`, `please sign`, `document to sign`, `form to sign`, `for your signature`, or `attached for signature` |
+| `bulk_automated` | Bulk or automated | -40 | The sender local part is `no-reply`, `noreply`, `do-not-reply`, or `mailer-daemon` |
+| `bulk_automated` | Bulk or automated | -20 | `unsubscribe`, `newsletter`, `view in browser`, `you are receiving this`, `your receipt`, `this is an automated`, or `do not reply`, and the -40 sender rule did not fire |
+
+A negative weight can pull the sum down. The stored score is still clamped to 0 through 100. `waiting on your reply`, CC-only, and "someone you have replied to" are not signals yet: this sync does not store thread direction, recipients, or sent mail. The VIP tuple is still the known-sender list, and it still ships empty.
 
 A user correction to `meeting_notes` removes the category reason and leaves keyword reasons in place, because those still match the text. The score can stay high after that correction. That is the contract until the founders change it. It is also an open question below.
 
@@ -525,7 +538,7 @@ Also cover:
 - Body keyword only past character 8000 does not fire. The same keyword in the subject does.
 - Leftover HTML `<b>RFI</b>` fires `keyword_rfi` and does not invent a keyword from the tag name.
 - A passed-in `category` of `rfi` and a null due date adds `category_rfi` 10 and does not add a due-date reason.
-- A passed-in `due_date` of `2026-11-11` adds `due_soon` 14. `2026-11-08` adds `due_overdue` 18. `2026-11-14` adds `due_within_7_days` 8. `2026-12-01` adds none.
+- A passed-in `due_date` of `2026-11-11` adds `due_soon` 14. `2026-11-08` adds `due_overdue` 25. `2026-11-14` adds `due_within_7_days` 8. `2026-12-01` adds none.
 - `meeting_notes` and `other` add no category reason.
 
 ### Classifier
@@ -560,11 +573,11 @@ The worker classifies, then scores. On the original texts, with no correction:
 
 | Case | Score | Band | Reasons added on top of the null-category row |
 | ---- | ----- | ---- | --------------------------------------------- |
-| Change order text | 84.0 | `high` | `category_change_order` 10. Due date stays null (`Friday`). Reference `CO 18` |
+| Change order text | 92.0 | `high` | `category_change_order` 10. `due by Friday` on Monday `2026-11-09` is `2026-11-13`, so `due_within_7_days` 8 is also present. Reference `CO 18` |
 | RFI text (`RFI 12`, sketch body) | 52.0 | `medium` | `category_rfi` 10. Reference `RFI 12` |
 | Old invoice text | 18.0 | `low` | `category_invoice` 6. Reference `Invoice 441` |
 | Submittal this week | 28.0 | `low` | `category_submittal` 8. Reference null |
-| Cap text | 100.0 | `high` | Category is `safety` at confidence `0.5` (safety, change order, RFI, submittal, and invoice all match). Add `category_safety` 12. `respond by Friday` does not set a due date. Reason order inserts `category_safety` 12 before `keyword_payment` 12 and `recent` 12 |
+| Cap text | 100.0 | `high` | Category is `safety` at confidence `0.5` (safety, change order, RFI, submittal, and invoice all match). Add `category_safety` 12. `respond by Friday` on Monday `2026-11-09` sets due date `2026-11-13`. Reason order inserts `category_safety` 12 before `keyword_payment` 12 and `recent` 12 |
 
 An RFI with a far due date scores lower than the same RFI with a near due date. Read both as unread, `received_at` `2026-11-09T16:00:00Z`, subject `RFI 042 door hardware`:
 
@@ -575,7 +588,7 @@ An RFI with a far due date scores lower than the same RFI with a near due date. 
 
 Both also have `keyword_rfi` 22, `keyword_deadline` 16, `category_rfi` 10, `recent` 12, and `unread` 8. The near date is the only difference. Order for the near date: `keyword_rfi` 22, `keyword_deadline` 16, `due_soon` 14, `recent` 12, `category_rfi` 10, `unread` 8.
 
-Old read invoice, subject `Invoice 100`, body `Due by 2026-10-01.`, `received_at` `2026-10-01T12:00:00Z`: score 52.0, band `medium`, reasons `due_overdue` 18, `keyword_deadline` 16, `keyword_payment` 12, `category_invoice` 6.
+Old read invoice, subject `Invoice 100`, body `Due by 2026-10-01.`, `received_at` `2026-10-01T12:00:00Z`: score 59.0, band `medium`, reasons `due_overdue` 25, `keyword_deadline` 16, `keyword_payment` 12, `category_invoice` 6.
 
 Also cover:
 
@@ -700,7 +713,7 @@ The contract above is what James implements. These are the points the founders s
 1. Is the category list final: `submittal`, `rfi`, `change_order`, `invoice` (including pay applications), `meeting_notes`, `safety`, `schedule`, `other`? Should a pay application be its own category? Should no rule match be stored as `other` instead of null?
 2. What should the frontend show, for Colby? Category, due date, reference number, confidence, and a corrected marker are all on list and detail in this contract. This spec does not add a category filter. It does not say which of those fields the list renders.
 3. Category points add to keyword points. A user who corrects an RFI to `meeting_notes` drops the category reason and keeps `keyword_rfi` if the text still says RFI. Should a correction replace the overlapping keyword reason instead?
-4. Are the due-date windows and weights right: overdue 18, within 3 days 14, within 7 days 8? `due by Friday` does not become a date in this phase. Should a weekday resolve against `received_at`?
+4. Due-date windows are overdue 25, within 3 days 14, and within 7 days 8. A weekday is resolved from `received_at`. Confirm those weights after a live mailbox.
 5. `responsible_party` is a role on the From line. Should the rule also take a person's name from the body?
 6. A correction locks only the fields the user sent. The next sync may refresh the others. Should any correction lock the whole classification?
 7. The mailbox owner is the only person who can correct a message. Is a shared reviewer in scope later?

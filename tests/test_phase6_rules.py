@@ -214,7 +214,7 @@ def test_scorer_edges():
     _, _, soon, _ = _score(due_date=date(2026, 11, 11))
     assert soon == _reasons(("due_soon", "Due within 3 days", 14))
     _, _, overdue, _ = _score(due_date=date(2026, 11, 8))
-    assert overdue == _reasons(("due_overdue", "Overdue", 18))
+    assert overdue == _reasons(("due_overdue", "Overdue", 25))
     _, _, week, _ = _score(due_date=date(2026, 11, 14))
     assert week == _reasons(("due_within_7_days", "Due within 7 days", 8))
     _, _, later, _ = _score(due_date=date(2026, 12, 1))
@@ -335,9 +335,9 @@ def test_worker_pipeline_adds_category_and_due_date_to_the_score():
     assert change.category == "change_order"
     assert change.category_confidence == 1.0
     assert change.category_source == "rule"
-    assert change.due_date is None
+    assert change.due_date == date(2026, 11, 13)
     assert change.reference_number == "CO 18"
-    assert change.priority_score == 84.0
+    assert change.priority_score == 92.0
     assert change.priority_band == "high"
     assert [item["code"] for item in change.priority_reasons] == [
         "keyword_change_order",
@@ -345,6 +345,7 @@ def test_worker_pipeline_adds_category_and_due_date_to_the_score():
         "keyword_urgent",
         "recent",
         "category_change_order",
+        "due_within_7_days",
         "unread",
     ]
 
@@ -388,7 +389,7 @@ def test_worker_pipeline_adds_category_and_due_date_to_the_score():
     )
     assert cap.category == "safety"
     assert cap.category_confidence == 0.5
-    assert cap.due_date is None
+    assert cap.due_date == date(2026, 11, 13)
     assert cap.priority_score == 100.0
     assert cap.priority_band == "high"
     codes = [item["code"] for item in cap.priority_reasons]
@@ -426,14 +427,83 @@ def test_worker_pipeline_adds_category_and_due_date_to_the_score():
         is_read=True,
         received_at=OLD,
     )
-    assert old_invoice.priority_score == 52.0
+    assert old_invoice.priority_score == 59.0
     assert old_invoice.priority_band == "medium"
     assert old_invoice.priority_reasons == _reasons(
-        ("due_overdue", "Overdue", 18),
+        ("due_overdue", "Overdue", 25),
         ("keyword_deadline", "Deadline", 16),
         ("keyword_payment", "Payment", 12),
         ("category_invoice", "Invoice", 6),
     )
+
+
+def test_shared_inbox_signals_and_weekday_deadlines():
+    friday = classify(
+        {
+            "subject": "RFI 12 due by Friday",
+            "received_at": RECENT,
+        }
+    )
+    assert friday["due_date"] == date(2026, 11, 13)
+    assert friday["reference_number"] == "RFI 12"
+    today = classify(
+        {
+            "subject": "Please confirm by 5pm today",
+            "received_at": RECENT,
+        }
+    )
+    assert today["due_date"] == date(2026, 11, 9)
+
+    value, band, reasons, _ = _score(
+        subject="Can you confirm the hardware?",
+        is_read=False,
+        received_at=RECENT,
+    )
+    assert value == 45.0
+    assert band == "medium"
+    assert reasons == _reasons(
+        ("asks_you", "Asks something of you", 25),
+        ("recent", "Received in the last 2 days", 12),
+        ("unread", "Unread", 8),
+    )
+
+    _, _, reasons, _ = _score(subject="Final notice: second request", is_read=True)
+    assert ("repeat_ask", "Repeat ask", 15) in [
+        (item["code"], item["label"], item["weight"]) for item in reasons
+    ]
+
+    value, _, reasons, _ = _score(
+        subject="Inspection tomorrow at the dock",
+        is_read=True,
+        received_at=datetime(2026, 11, 8, 16, 0, tzinfo=timezone.utc),
+    )
+    assert any(item["code"] == "happening_soon" and item["weight"] == 15 for item in reasons)
+    assert value >= 15
+
+    _, _, reasons, _ = _score(subject="Sign and return the waiver", is_read=True)
+    codes = {item["code"] for item in reasons}
+    assert "asks_you" in codes
+    assert "act_on_attachment" in codes
+
+    value, band, reasons, _ = _score(
+        subject="November newsletter",
+        body_text="Unsubscribe at the link below.",
+        from_email="news@vendor.example",
+        is_read=False,
+        received_at=RECENT,
+    )
+    assert value == 0.0
+    assert band == "low"
+    assert any(item["code"] == "bulk_automated" and item["weight"] == -20 for item in reasons)
+
+    value, _, reasons, _ = _score(
+        subject="Your invoice",
+        from_email="no-reply@billing.example",
+        is_read=True,
+        received_at=OLD,
+    )
+    assert value == 0.0
+    assert any(item["code"] == "bulk_automated" and item["weight"] == -40 for item in reasons)
 
 
 def test_rescore_is_registered_and_not_on_the_cron():

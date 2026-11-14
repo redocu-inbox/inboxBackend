@@ -7,6 +7,7 @@ Production uses the empty VIP tuple until real domains are added after a live ma
 from datetime import date, datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
+from app.services.priority.classify import mentioned_dates
 from app.services.priority.text import any_phrase, body_slice, compile_phrase, normalize, role_text
 
 # Keyword, recency, and sender weights. Category and due-date weights are separate.
@@ -23,7 +24,14 @@ UNREAD = ("unread", "Unread", 8)
 SENDER_PROJECT_ROLE = ("sender_project_role", "Project role", 8)
 THIS_WEEK = ("this_week", "Received this week", 6)
 
-DUE_OVERDUE = ("due_overdue", "Overdue", 18)
+ASKS_YOU = ("asks_you", "Asks something of you", 25)
+REPEAT_ASK = ("repeat_ask", "Repeat ask", 15)
+HAPPENING_SOON = ("happening_soon", "Happening today or tomorrow", 15)
+ACT_ON_ATTACHMENT = ("act_on_attachment", "Attachment to act on", 8)
+BULK_AUTOMATED = ("bulk_automated", "Bulk or automated", -20)
+BULK_NO_REPLY = ("bulk_automated", "Bulk or automated", -40)
+
+DUE_OVERDUE = ("due_overdue", "Overdue", 25)
 DUE_SOON = ("due_soon", "Due within 3 days", 14)
 DUE_WITHIN_7_DAYS = ("due_within_7_days", "Due within 7 days", 8)
 
@@ -76,6 +84,54 @@ _KEYWORD_RULES = (
             compile_phrase("invoice"),
         ),
     ),
+)
+
+_ASK_PHRASES = (
+    compile_phrase("please send"),
+    compile_phrase("can you confirm"),
+    compile_phrase("please confirm"),
+    compile_phrase("sign and return"),
+    compile_phrase("please reply"),
+    compile_phrase("please advise"),
+    compile_phrase("let me know"),
+    compile_phrase("could you"),
+    compile_phrase("would you"),
+    compile_phrase("action required"),
+)
+
+_REPEAT_PHRASES = (
+    compile_phrase("final notice"),
+    compile_phrase("second request"),
+    compile_phrase("third request"),
+    compile_phrase("following up"),
+    compile_phrase("follow up"),
+    compile_phrase("second notice"),
+)
+
+_EVENT_PHRASES = (
+    compile_phrase("meeting"),
+    compile_phrase("showing"),
+    compile_phrase("pickup"),
+    compile_phrase("inspection"),
+)
+
+_ATTACHMENT_PHRASES = (
+    compile_phrase("sign and return"),
+    compile_phrase("please sign"),
+    compile_phrase("document to sign"),
+    compile_phrase("form to sign"),
+    compile_phrase("for your signature"),
+    compile_phrase("attached for signature"),
+)
+
+_BULK_PHRASES = (
+    compile_phrase("unsubscribe"),
+    compile_phrase("newsletter"),
+    compile_phrase("view in browser"),
+    compile_phrase("you are receiving this"),
+    compile_phrase("your receipt"),
+    compile_phrase("this is an automated"),
+    compile_phrase("do not reply"),
 )
 
 _ROLE_PHRASES = (
@@ -134,6 +190,18 @@ def score(
     if any_phrase(_ROLE_PHRASES, role_parts):
         reasons.append(SENDER_PROJECT_ROLE)
 
+    if any_phrase(_ASK_PHRASES, keyword_parts) or _subject_asks(fields.get("subject")):
+        reasons.append(ASKS_YOU)
+    if any_phrase(_REPEAT_PHRASES, keyword_parts):
+        reasons.append(REPEAT_ASK)
+    if any_phrase(_ATTACHMENT_PHRASES, keyword_parts):
+        reasons.append(ACT_ON_ATTACHMENT)
+    if _happening_soon(fields, keyword_parts, moment):
+        reasons.append(HAPPENING_SOON)
+    bulk = _bulk_reason(fields, keyword_parts)
+    if bulk is not None:
+        reasons.append(bulk)
+
     category = fields.get("category")
     if isinstance(category, str) and category in CATEGORY_REASONS:
         reasons.append(CATEGORY_REASONS[category])
@@ -159,6 +227,35 @@ def score(
         band = "low"
     payload = [{"code": code, "label": label, "weight": weight} for code, label, weight in reasons]
     return clamped, band, payload, now
+
+
+def _subject_asks(value: object) -> bool:
+    return isinstance(value, str) and "?" in value
+
+
+def _happening_soon(
+    fields: Mapping[str, object],
+    keyword_parts: tuple[str, str, str],
+    moment: datetime | None,
+) -> bool:
+    if moment is None or not any_phrase(_EVENT_PHRASES, keyword_parts):
+        return False
+    today = moment.date()
+    tomorrow = today + timedelta(days=1)
+    return any(item == today or item == tomorrow for item in mentioned_dates(fields))
+
+
+def _bulk_reason(
+    fields: Mapping[str, object],
+    keyword_parts: tuple[str, str, str],
+) -> tuple[str, str, int] | None:
+    local = _local_part(fields.get("from_email")).lower()
+    compact = local.replace(".", "").replace("_", "").replace("-", "")
+    if "noreply" in compact or "donotreply" in compact or "mailerdaemon" in compact:
+        return BULK_NO_REPLY
+    if any_phrase(_BULK_PHRASES, keyword_parts):
+        return BULK_AUTOMATED
+    return None
 
 
 def _as_utc(value: object) -> datetime | None:

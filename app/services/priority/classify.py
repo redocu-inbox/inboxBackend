@@ -5,7 +5,7 @@ write the database, or call an LLM. The worker stores `category_source`.
 """
 
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Mapping
 
 from app.services.priority.text import (
@@ -148,6 +148,26 @@ _MONTHS = {
     "dec": 12,
 }
 
+_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+_RELATIVE_WORD = (
+    r"(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+)
+_RELATIVE_AT = re.compile(
+    rf"(?i)^(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
+)
+_BY_RELATIVE = re.compile(
+    rf"(?i)(?<![A-Za-z])by\s+(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
+)
+
 _ROLES = (
     (compile_phrase("project manager"), "Project manager"),
     (compile_phrase("superintendent"), "Superintendent"),
@@ -175,12 +195,13 @@ def classify(fields: Mapping[str, object]) -> dict[str, object]:
         category = matched[0]
         confidence = 0.5
     plain = _plain_surfaces(fields)
+    received = _received_date(fields.get("received_at"))
     return {
         "category": category,
         "category_confidence": confidence,
         "project_name": _project_name(plain),
         "project_number": _project_number(plain),
-        "due_date": _due_date(plain),
+        "due_date": _due_date(plain, received),
         "responsible_party": _responsible_party(fields),
         "reference_number": _reference(category, plain),
     }
@@ -245,15 +266,34 @@ def _project_name(surfaces: tuple[str, str, str]) -> str | None:
     return None
 
 
-def _due_date(surfaces: tuple[str, str, str]) -> date | None:
+def mentioned_dates(fields: Mapping[str, object]) -> list[date]:
+    """Calendar dates and relative days in the message, anchored to received_at."""
+    received = _received_date(fields.get("received_at"))
+    found: list[date] = []
+    for text in _plain_surfaces(fields):
+        if not text:
+            continue
+        calendar = _first_date(text, None)
+        if calendar is not None:
+            found.append(calendar)
+        if received is None:
+            continue
+        for match in re.finditer(rf"(?i)(?<![A-Za-z])({_RELATIVE_WORD})\b", text):
+            resolved = _relative_day(match.group(1), received)
+            if resolved is not None:
+                found.append(resolved)
+    return found
+
+
+def _due_date(surfaces: tuple[str, str, str], received: date | None) -> date | None:
     for text in surfaces:
-        found = _first_date(text)
+        found = _first_date(text, received)
         if found is not None:
             return found
     return None
 
 
-def _first_date(text: str) -> date | None:
+def _first_date(text: str, received: date | None) -> date | None:
     if not text:
         return None
     found: list[tuple[int, date]] = []
@@ -261,9 +301,14 @@ def _first_date(text: str) -> date | None:
         pattern = re.compile(rf"(?i)(?<![A-Za-z]){re.escape(cue)}(?![A-Za-z])")
         for match in pattern.finditer(text):
             index = _skip_separators(text, match.end())
-            parsed = _parse_date_at(text, index)
+            parsed = _parse_date_at(text, index, received)
             if parsed is not None:
                 found.append((match.start(), parsed))
+    if received is not None:
+        for match in _BY_RELATIVE.finditer(text):
+            resolved = _relative_day(match.group(1), received)
+            if resolved is not None:
+                found.append((match.start(), resolved))
     if not found:
         return None
     found.sort(key=lambda item: item[0])
@@ -277,7 +322,7 @@ def _skip_separators(text: str, index: int) -> int:
     return index
 
 
-def _parse_date_at(text: str, index: int) -> date | None:
+def _parse_date_at(text: str, index: int, received: date | None) -> date | None:
     chunk = text[index:]
     iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", chunk)
     if iso:
@@ -291,12 +336,43 @@ def _parse_date_at(text: str, index: int) -> date | None:
         year = 2000 + year if year <= 69 else 1900 + year
         return _valid(year, int(slash2.group(1)), int(slash2.group(2)))
     month = re.match(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", chunk)
-    if month is None:
+    if month is not None:
+        month_num = _MONTHS.get(month.group(1).lower())
+        if month_num is not None:
+            return _valid(int(month.group(3)), month_num, int(month.group(2)))
+    return _relative_at(chunk, received)
+
+
+def _relative_at(chunk: str, received: date | None) -> date | None:
+    if received is None:
         return None
-    month_num = _MONTHS.get(month.group(1).lower())
-    if month_num is None:
+    match = _RELATIVE_AT.match(chunk)
+    if match is None:
         return None
-    return _valid(int(month.group(3)), month_num, int(month.group(2)))
+    return _relative_day(match.group(1), received)
+
+
+def _relative_day(word: str, received: date) -> date | None:
+    name = word.lower()
+    if name == "today":
+        return received
+    if name == "tomorrow":
+        return received + timedelta(days=1)
+    weekday = _WEEKDAYS.get(name)
+    if weekday is None:
+        return None
+    delta = (weekday - received.weekday()) % 7
+    return received + timedelta(days=delta)
+
+
+def _received_date(value: object) -> date | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).date()
+    if isinstance(value, date):
+        return value
+    return None
 
 
 def _valid(year: int, month: int, day: int) -> date | None:
