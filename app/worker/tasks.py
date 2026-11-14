@@ -30,6 +30,7 @@ from app.services.graph.tokens import (
     refresh_access_token,
 )
 from app.services.mailboxes import GMAIL_UNAVAILABLE, GRAPH_UNAVAILABLE, TOKEN_REFRESH_FAILED
+from app.services.priority.apply import classify_and_score
 from app.models.message import Message
 
 _GRAPH_HOST = "https://graph.microsoft.com/"
@@ -99,11 +100,11 @@ def _upsert_message(
     account: ConnectedAccount,
     item: dict,
     mapper=graph_message_fields,
-) -> None:
+) -> Message | None:
     """Insert a message or update it when this mailbox already stored that provider id."""
     fields = mapper(item)
     if fields is None:
-        return
+        return None
     existing = session.exec(
         select(Message).where(
             Message.connected_account_id == account.id,
@@ -123,6 +124,13 @@ def _upsert_message(
             setattr(existing, key, value)
         existing.updated_at = utcnow()
     session.add(existing)
+    return existing
+
+
+def _classify_saved(row: Message | None) -> None:
+    """Classify and score one upserted row. Failures stay on that row."""
+    if row is not None:
+        classify_and_score(row)
 
 
 logger = logging.getLogger(__name__)
@@ -289,7 +297,7 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
         for item in items:
-            _upsert_message(session, locked, item, gmail_message_fields)
+            _classify_saved(_upsert_message(session, locked, item, gmail_message_fields))
         locked.sync_status = "idle"
         locked.sync_error_code = None
         locked.last_sync_at = utcnow()
@@ -391,7 +399,7 @@ async def sync_mailbox_delta(
                 )
                 return
             for item in items:
-                _upsert_message(session, locked, item)
+                _classify_saved(_upsert_message(session, locked, item))
             locked.sync_status = "idle"
             locked.sync_error_code = None
             locked.last_sync_at = utcnow()
@@ -409,6 +417,32 @@ async def sync_mailbox_delta(
             _mark_failed(session, account_id, claimed, GRAPH_UNAVAILABLE)
             return
     logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
+
+
+async def rescore_mailbox_priority(ctx: dict, account_id: str) -> None:
+    """Classify and score mail already stored for one mailbox.
+
+    Not scheduled, and not enqueued by sync, connect, or the webhook. A missing
+    or disconnected mailbox is left alone. This job does not call Graph or Gmail
+    and does not change sync status.
+    """
+    del ctx
+    try:
+        account_uuid = UUID(account_id)
+    except ValueError:
+        return
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, account_uuid)
+        if account is None or account.disconnected_at is not None:
+            return
+        rows = session.exec(
+            select(Message).where(Message.connected_account_id == account.id)
+        ).all()
+        for row in rows:
+            if classify_and_score(row):
+                row.updated_at = utcnow()
+                session.add(row)
+        session.commit()
 
 
 async def match_form_template(ctx: dict, job_id: str) -> None:

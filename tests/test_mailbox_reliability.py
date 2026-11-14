@@ -603,6 +603,17 @@ def test_sync_success_failure_and_superseded_generation(client, register_user, m
     assert item["from_email"] == "ada@example.com"
     assert item["is_read"] is False
     assert item["body_preview"] == "Hello there"
+    assert item["priority_score"] == 26.0
+    assert item["priority_band"] == "low"
+    assert item["priority_reasons"] == [
+        {"code": "keyword_payment", "label": "Payment", "weight": 12},
+        {"code": "unread", "label": "Unread", "weight": 8},
+        {"code": "category_invoice", "label": "Invoice", "weight": 6},
+    ]
+    assert item["category"] == "invoice"
+    assert item["category_source"] == "rule"
+    assert item["category_confidence"] == 1.0
+    assert item["reference_number"] == "Invoice 12"
     assert "<" not in listed.text
     detail = client.get(f"/messages/{item['id']}", headers=headers).json()
     assert detail["body_text"] == "Hello"

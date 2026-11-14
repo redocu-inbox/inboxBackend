@@ -2,11 +2,11 @@
 
 The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
 body_text are filled when a sync stores them, and stay null when the provider
-omits them. body_text is plain text, never raw HTML. priority_score,
-priority_band, priority_reasons, and the classification fields stay null
-until a later phase writes them. A null reasons column is [] in JSON.
-user_corrected is false until a correction. priority_scored_at is stored and
-is not returned. suggested_form is null until a later phase. draft stays null.
+omits them. body_text is plain text, never raw HTML. Sync writes
+priority_score, priority_band, priority_reasons, and the classification
+fields. A null reasons column is [] in JSON. user_corrected is false until a
+correction. priority_scored_at is stored and is not returned. suggested_form
+is null until a later phase. draft stays null.
 """
 
 from datetime import date, datetime
