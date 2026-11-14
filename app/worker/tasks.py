@@ -30,7 +30,7 @@ from app.services.graph.tokens import (
     refresh_access_token,
 )
 from app.services.mailboxes import GMAIL_UNAVAILABLE, GRAPH_UNAVAILABLE, TOKEN_REFRESH_FAILED
-from app.services.priority.apply import classify_and_score
+from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
 
 _GRAPH_HOST = "https://graph.microsoft.com/"
@@ -127,10 +127,12 @@ def _upsert_message(
     return existing
 
 
-def _classify_saved(row: Message | None) -> None:
-    """Classify and score one upserted row. Failures stay on that row."""
-    if row is not None:
-        classify_and_score(row)
+def _classify_saved(session: Session, row: Message | None) -> None:
+    """Classify and score one upserted row. Corrected fields stay as stored."""
+    if row is None:
+        return
+    held = locked_fields(session, [row.id]).get(row.id, set())
+    classify_and_score(row, locked=held)
 
 
 logger = logging.getLogger(__name__)
@@ -297,7 +299,7 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
         for item in items:
-            _classify_saved(_upsert_message(session, locked, item, gmail_message_fields))
+            _classify_saved(session, _upsert_message(session, locked, item, gmail_message_fields))
         locked.sync_status = "idle"
         locked.sync_error_code = None
         locked.last_sync_at = utcnow()
@@ -399,7 +401,7 @@ async def sync_mailbox_delta(
                 )
                 return
             for item in items:
-                _classify_saved(_upsert_message(session, locked, item))
+                _classify_saved(session, _upsert_message(session, locked, item))
             locked.sync_status = "idle"
             locked.sync_error_code = None
             locked.last_sync_at = utcnow()
@@ -438,8 +440,9 @@ async def rescore_mailbox_priority(ctx: dict, account_id: str) -> None:
         rows = session.exec(
             select(Message).where(Message.connected_account_id == account.id)
         ).all()
+        held = locked_fields(session, [row.id for row in rows])
         for row in rows:
-            if classify_and_score(row):
+            if classify_and_score(row, locked=held.get(row.id, set())):
                 row.updated_at = utcnow()
                 session.add(row)
         session.commit()
