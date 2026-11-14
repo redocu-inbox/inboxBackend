@@ -30,7 +30,12 @@ from app.services.graph.tokens import (
     needs_refresh,
     refresh_access_token,
 )
-from app.services.mailboxes import GMAIL_UNAVAILABLE, GRAPH_UNAVAILABLE, TOKEN_REFRESH_FAILED
+from app.services.mailboxes import (
+    GMAIL_UNAVAILABLE,
+    GRAPH_UNAVAILABLE,
+    TOKEN_REFRESH_FAILED,
+    sync_in_flight,
+)
 from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
 
@@ -544,3 +549,90 @@ async def run_form_fill(ctx: dict, job_id: str) -> None:
 async def renew_graph_subscriptions(ctx: dict) -> None:
     """TODO: renew subscriptions that expire within a day."""
     logger.info("TODO renew_graph_subscriptions job_id=%s", ctx.get("job_id"))
+
+
+def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
+    """Mark connected mailboxes pending unless a sync is already in flight.
+
+    Returns the (account id, generation) pairs to sync, and how many mailboxes
+    were left alone. A pending or running sync inside the stale window is left
+    alone so this cron does not start a second run. Failed and idle mailboxes
+    are claimed. Disconnected rows are not loaded.
+    """
+    due: list[tuple[UUID, int]] = []
+    skipped = 0
+    with Session(engine) as session:
+        accounts = list(
+            session.exec(
+                select(ConnectedAccount)
+                .where(ConnectedAccount.disconnected_at.is_(None))
+                .where(ConnectedAccount.provider.in_(("microsoft", "google")))
+                .order_by(ConnectedAccount.id)
+                .with_for_update()
+            ).all()
+        )
+        now = utcnow()
+        changed = False
+        for account in accounts:
+            if not account.access_token or not account.refresh_token:
+                skipped += 1
+                continue
+            if sync_in_flight(account, now=now):
+                skipped += 1
+                continue
+            account.sync_generation = int(account.sync_generation or 0) + 1
+            account.sync_status = "pending"
+            account.sync_error_code = None
+            account.sync_status_at = now
+            account.updated_at = now
+            session.add(account)
+            changed = True
+            due.append((account.id, int(account.sync_generation)))
+        if changed:
+            session.commit()
+        else:
+            session.rollback()
+    return due, skipped
+
+
+async def sync_connected_mailboxes(ctx: dict) -> dict[str, int]:
+    """Sync every connected Outlook and Gmail mailbox.
+
+    Calls the same `sync_mailbox_delta` path as a manual sync, including its
+    row lock and generation check. A mailbox that is already pending or running
+    is skipped. A token refresh failure or a provider error, including HTTP 403,
+    stays on that account and the loop continues. The free Render service sleeps
+    after inactivity, so this cron runs only while that process is awake.
+    """
+    if not get_settings().periodic_mailbox_sync:
+        logger.info("periodic mailbox sync skipped")
+        return {"ran": 0, "skipped": 0, "errors": 0}
+    try:
+        due, skipped = _claim_periodic_syncs()
+    except Exception as exc:
+        logger.warning(
+            "periodic mailbox sync failed error_type=%s",
+            type(exc).__name__,
+        )
+        return {"ran": 0, "skipped": 0, "errors": 1}
+    ran = 0
+    errors = 0
+    for account_id, generation in due:
+        try:
+            await sync_mailbox_delta(ctx, str(account_id), generation)
+        except Exception as exc:
+            errors += 1
+            logger.warning(
+                "periodic mailbox sync failed account=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            continue
+        ran += 1
+    logger.info(
+        "periodic mailbox sync finished ran=%s skipped=%s errors=%s",
+        ran,
+        skipped,
+        errors,
+    )
+    return {"ran": ran, "skipped": skipped, "errors": errors}

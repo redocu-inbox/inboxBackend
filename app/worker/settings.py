@@ -22,10 +22,32 @@ from app.worker.tasks import (
     rescore_mailbox_priority,
     run_form_fill,
     send_password_reset,
+    sync_connected_mailboxes,
     sync_mailbox_delta,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def mailbox_sync_minutes(interval: int) -> set[int]:
+    """Minute marks for the periodic sync. 60 means once an hour, at minute 0."""
+    valid = isinstance(interval, int) and not isinstance(interval, bool)
+    step = interval if valid and 1 <= interval <= 60 else 5
+    return set(range(0, 60, step))
+
+
+def _cron_jobs() -> list:
+    settings = get_settings()
+    jobs = [cron(renew_graph_subscriptions, hour={0, 12}, minute=0)]
+    if settings.periodic_mailbox_sync:
+        jobs.append(
+            cron(
+                sync_connected_mailboxes,
+                minute=mailbox_sync_minutes(settings.mailbox_sync_interval_minutes),
+                unique=True,
+            )
+        )
+    return jobs
 
 
 async def startup(ctx: dict) -> None:
@@ -56,7 +78,7 @@ class WorkerSettings:
         run_form_fill,
         renew_graph_subscriptions,
     ]
-    cron_jobs = [cron(renew_graph_subscriptions, hour={0, 12}, minute=0)]
+    cron_jobs = _cron_jobs()
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     on_startup = startup
     on_shutdown = shutdown

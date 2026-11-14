@@ -459,10 +459,10 @@ def test_shared_inbox_signals_and_weekday_deadlines():
         is_read=False,
         received_at=RECENT,
     )
-    assert value == 45.0
+    assert value == 40.0
     assert band == "medium"
     assert reasons == _reasons(
-        ("asks_you", "Asks something of you", 25),
+        ("asks_you", "Asks something of you", 20),
         ("recent", "Received in the last 2 days", 12),
         ("unread", "Unread", 8),
     )
@@ -509,9 +509,9 @@ def test_shared_inbox_signals_and_weekday_deadlines():
 def test_rescore_is_registered_and_not_on_the_cron():
     assert rescore_mailbox_priority in WorkerSettings.functions
     assert rescore_connected_mailboxes not in WorkerSettings.functions
-    assert len(WorkerSettings.cron_jobs) == 1
-    job = WorkerSettings.cron_jobs[0]
-    assert getattr(job.coroutine, "__name__", "") == "renew_graph_subscriptions"
+    names = [getattr(job.coroutine, "__name__", "") for job in WorkerSettings.cron_jobs]
+    assert names == ["renew_graph_subscriptions", "sync_connected_mailboxes"]
+    assert WorkerSettings.cron_jobs[1].minute == set(range(0, 60, 5))
     assert WorkerSettings.on_startup is startup
 
 
