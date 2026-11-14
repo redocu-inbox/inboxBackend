@@ -163,15 +163,6 @@ def test_stored_priority_and_classification_round_trip(client, register_user):
     assert body["category"] == "rfi"
     assert "priority_scored_at" not in body
 
-    missing = client.patch(
-        f"/messages/{scored}/classification",
-        headers=ana,
-        json={"category": "meeting_notes"},
-    )
-    assert missing.status_code == 404
-    paths = client.get("/openapi.json").json()["paths"]
-    assert "/messages/{message_id}/classification" not in paths
-
 
 def test_classification_checks_reject_values_outside_the_contract(client, register_user):
     ana = register_user("ana@example.com")
@@ -230,6 +221,13 @@ def test_downgrade_drops_new_columns_and_keeps_priority_score(client, register_u
                 text("SELECT indexname FROM pg_indexes WHERE tablename = 'messages'")
             ).scalars().all()
             assert "ix_messages_priority_score" in indexes
+            tables = connection.execute(
+                text(
+                    "SELECT tablename FROM pg_tables "
+                    "WHERE tablename = 'message_classification_corrections'"
+                )
+            ).all()
+            assert tables == []
     finally:
         command.upgrade(config, "head")
         engine.dispose()
