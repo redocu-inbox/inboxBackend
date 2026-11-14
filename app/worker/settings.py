@@ -15,6 +15,7 @@ from arq.connections import RedisSettings
 from app.config import get_settings
 from app.logging_config import setup_logging
 from app.worker.tasks import (
+    generate_reply_draft,
     heartbeat,
     match_form_template,
     renew_graph_subscriptions,
@@ -71,6 +72,7 @@ async def shutdown(ctx: dict) -> None:
 class WorkerSettings:
     functions = [
         heartbeat,
+        generate_reply_draft,
         sync_mailbox_delta,
         rescore_mailbox_priority,
         send_password_reset,

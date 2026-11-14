@@ -15,8 +15,12 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import engine
 from app.models.form_fill_job import FormFillJob, FormFillStatus
+from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import utcnow
 from app.models.connected_account import ConnectedAccount
+from app.services.llm.factory import get_llm
+from app.services.llm.stub import StubLLM
+from app.services.reply_drafts.generation import build_reply_prompts, final_reply_body
 from app.services.google.messages import (
     GmailRequestError,
     collect_gmail_messages,
@@ -636,3 +640,95 @@ async def sync_connected_mailboxes(ctx: dict) -> dict[str, int]:
         errors,
     )
     return {"ran": ran, "skipped": skipped, "errors": errors}
+
+
+def _reply_status(value: object) -> str:
+    if isinstance(value, ReplyDraftStatus):
+        return value.value
+    return str(value)
+
+
+def _pending_reply_fields(message_id: str) -> tuple[str | None, str | None, str | None] | None:
+    """Copy the prompt strings while the session is open. None when nothing is pending."""
+    try:
+        parsed = UUID(message_id)
+    except ValueError:
+        logger.warning("generate_reply_draft skipped invalid id")
+        return None
+    with Session(engine) as session:
+        draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
+        if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
+            return None
+        message = session.get(Message, parsed)
+        if message is None:
+            return None
+        return message.subject, message.body_text, message.body_preview
+
+
+def _fail_reply_draft(message_id: str) -> None:
+    """Mark a still-pending draft failed. The stored body is left as it is."""
+    try:
+        parsed = UUID(message_id)
+    except ValueError:
+        return
+    with Session(engine) as session:
+        draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
+        if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
+            return
+        draft.status = ReplyDraftStatus.failed
+        draft.error = "generation failed"
+        draft.updated_at = utcnow()
+        session.add(draft)
+        session.commit()
+
+
+def _save_reply_draft(message_id: str, body: str) -> None:
+    """Store a generated reply only while the row is still pending."""
+    try:
+        parsed = UUID(message_id)
+    except ValueError:
+        return
+    with Session(engine) as session:
+        draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
+        if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
+            return
+        draft.body = body
+        draft.status = ReplyDraftStatus.ready
+        draft.source = "llm"
+        draft.error = None
+        draft.updated_at = utcnow()
+        session.add(draft)
+        session.commit()
+
+
+async def generate_reply_draft(ctx: dict, message_id: str) -> None:
+    """Write a local reply body. Does not call Graph and does not send mail.
+
+    Prompt fields are copied inside the session. `get_llm` runs after that
+    session closes. A failure sets `error` to `generation failed` and keeps
+    the body already stored, including a regenerate that POST left pending.
+    """
+    fields = _pending_reply_fields(message_id)
+    if fields is None:
+        return
+    subject, body_text, body_preview = fields
+    try:
+        llm = get_llm()
+        system, prompt = build_reply_prompts(
+            subject=subject,
+            body_text=body_text,
+            body_preview=body_preview,
+        )
+        model_text = await llm.complete(system=system, user=prompt)
+        provider = "stub" if isinstance(llm, StubLLM) else get_settings().llm_provider
+        reply = final_reply_body(provider, model_text)
+    except Exception as exc:
+        logger.warning(
+            "generate_reply_draft failed message=%s error_type=%s job_id=%s",
+            message_id,
+            type(exc).__name__,
+            ctx.get("job_id"),
+        )
+        _fail_reply_draft(message_id)
+        return
+    _save_reply_draft(message_id, reply)
