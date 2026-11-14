@@ -29,12 +29,17 @@ THIS_WEEK = datetime(2026, 11, 4, 18, 0, tzinfo=timezone.utc)
 
 @pytest.fixture
 def app_logs(caplog):
-    """Capture app.* logs. setup_logging stops them from reaching the root logger."""
+    """Capture app.* logs.
+
+    Alembic's logging config disables loggers that already exist, and
+    setup_logging keeps app logs off the root logger. Pytest still attaches
+    its capture handler to that logger.
+    """
+    for name, obj in logging.root.manager.loggerDict.items():
+        if isinstance(obj, logging.Logger) and (name == "app" or name.startswith("app.")):
+            obj.disabled = False
     caplog.set_level(logging.INFO)
-    app_logger = logging.getLogger("app")
-    app_logger.addHandler(caplog.handler)
     yield caplog
-    app_logger.removeHandler(caplog.handler)
 
 
 @pytest.fixture(autouse=True)
