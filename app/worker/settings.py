@@ -18,6 +18,7 @@ from app.worker.tasks import (
     heartbeat,
     match_form_template,
     renew_graph_subscriptions,
+    rescore_mailbox_priority,
     run_form_fill,
     send_password_reset,
     sync_mailbox_delta,
@@ -39,6 +40,7 @@ class WorkerSettings:
     functions = [
         heartbeat,
         sync_mailbox_delta,
+        rescore_mailbox_priority,
         send_password_reset,
         match_form_template,
         run_form_fill,
