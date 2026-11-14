@@ -18,6 +18,7 @@ from app.worker.tasks import (
     heartbeat,
     match_form_template,
     renew_graph_subscriptions,
+    rescore_connected_mailboxes,
     rescore_mailbox_priority,
     run_form_fill,
     send_password_reset,
@@ -30,6 +31,15 @@ logger = logging.getLogger(__name__)
 async def startup(ctx: dict) -> None:
     setup_logging(get_settings().log_level)
     logger.info("ARQ worker started")
+    # Direct call, not enqueue: on_startup runs before this worker polls, and
+    # the summary line has to include how many stored messages were rescored.
+    try:
+        await rescore_connected_mailboxes(ctx)
+    except Exception as exc:
+        logger.warning(
+            "priority rescore on startup failed error_type=%s",
+            type(exc).__name__,
+        )
 
 
 async def shutdown(ctx: dict) -> None:

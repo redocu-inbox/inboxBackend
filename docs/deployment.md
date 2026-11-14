@@ -90,6 +90,16 @@ The command honors `PORT` (default `8000`). Unless `RUN_MIGRATIONS=0`, it runs t
 
 Run one copy. A second copy would migrate under the same lock, which is safe, and would also run a second worker, which you do not want on a single small database.
 
+When that worker starts, it rescores stored mail for every connected mailbox (Outlook and Gmail). Disconnected mailboxes are left alone. The pass does not call Graph or Gmail, write the mailbox, or call an LLM. `RESCORE_ON_STARTUP` defaults to on. Set it to `0` to skip. A failure is logged and the worker still starts.
+
+After a deploy, the worker log has one summary line:
+
+```text
+priority rescore on startup finished accounts=<n> messages=<n>
+```
+
+`accounts` is connected mailboxes that finished. `messages` is stored messages on those mailboxes, including messages that already had a score. A skipped run logs `priority rescore on startup skipped`.
+
 ## Free-demo candidate, not a production deployment
 
 A no-card combination that matches the current processes, with the limits that come with those free tiers:

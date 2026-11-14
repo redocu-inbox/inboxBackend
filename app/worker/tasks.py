@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from sqlmodel import Session, select
 
+from app.config import get_settings
 from app.db import engine
 from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.user import utcnow
@@ -421,22 +422,25 @@ async def sync_mailbox_delta(
     logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
 
 
-async def rescore_mailbox_priority(ctx: dict, account_id: str) -> None:
+async def rescore_mailbox_priority(ctx: dict, account_id: str) -> int | None:
     """Classify and score mail already stored for one mailbox.
 
-    Not scheduled, and not enqueued by sync, connect, or the webhook. A missing
-    or disconnected mailbox is left alone. This job does not call Graph or Gmail
+    Returns how many stored messages were walked, or None when the id is not a
+    UUID or the mailbox is missing or disconnected. Worker startup calls this
+    for every connected mailbox unless RESCORE_ON_STARTUP=0. It is not on the
+    cron, and sync, connect, and the webhook do not enqueue it. A corrected
+    field stays as the user saved it. This job does not call Graph or Gmail
     and does not change sync status.
     """
     del ctx
     try:
         account_uuid = UUID(account_id)
     except ValueError:
-        return
+        return None
     with Session(engine) as session:
         account = session.get(ConnectedAccount, account_uuid)
         if account is None or account.disconnected_at is not None:
-            return
+            return None
         rows = session.exec(
             select(Message).where(Message.connected_account_id == account.id)
         ).all()
@@ -446,6 +450,62 @@ async def rescore_mailbox_priority(ctx: dict, account_id: str) -> None:
                 row.updated_at = utcnow()
                 session.add(row)
         session.commit()
+        return len(rows)
+
+
+def _connected_mailbox_ids() -> list[UUID]:
+    """Ids of mailboxes that are still connected. Tokens are not loaded."""
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ConnectedAccount.id)
+            .where(ConnectedAccount.disconnected_at.is_(None))
+            .order_by(ConnectedAccount.id)
+        ).all()
+    return list(rows)
+
+
+async def rescore_connected_mailboxes(ctx: dict | None = None) -> tuple[int, int]:
+    """Rescore every connected mailbox. Log and continue when one of them fails.
+
+    Called from worker startup. The work is the same `rescore_mailbox_priority`
+    job, run here so one log line can report accounts and stored messages.
+    Enqueueing would return before those jobs finished, and this process is
+    not polling yet. A disconnected mailbox is omitted. This does not call
+    Graph, Gmail, or an LLM, and it does not write mailbox sync columns.
+    """
+    if not get_settings().rescore_on_startup:
+        logger.info("priority rescore on startup skipped")
+        return 0, 0
+    try:
+        account_ids = _connected_mailbox_ids()
+    except Exception as exc:
+        logger.warning(
+            "priority rescore on startup failed error_type=%s",
+            type(exc).__name__,
+        )
+        return 0, 0
+    accounts = 0
+    messages = 0
+    for account_id in account_ids:
+        try:
+            counted = await rescore_mailbox_priority(ctx or {}, str(account_id))
+        except Exception as exc:
+            logger.warning(
+                "priority rescore on startup failed account=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            continue
+        if counted is None:
+            continue
+        accounts += 1
+        messages += counted
+    logger.info(
+        "priority rescore on startup finished accounts=%s messages=%s",
+        accounts,
+        messages,
+    )
+    return accounts, messages
 
 
 async def match_form_template(ctx: dict, job_id: str) -> None:
