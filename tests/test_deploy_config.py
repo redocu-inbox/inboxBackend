@@ -92,6 +92,17 @@ def test_production_settings_reject_unsafe_defaults(overrides):
         _production(**overrides)
 
 
+def test_rescore_on_startup_defaults_to_on_and_accepts_zero(monkeypatch):
+    monkeypatch.delenv("RESCORE_ON_STARTUP", raising=False)
+    assert Settings(_env_file=None, app_env="development").rescore_on_startup is True
+    assert _production().rescore_on_startup is True
+    monkeypatch.setenv("RESCORE_ON_STARTUP", "0")
+    assert Settings(_env_file=None, app_env="development").rescore_on_startup is False
+    assert _production().rescore_on_startup is False
+    monkeypatch.setenv("RESCORE_ON_STARTUP", "1")
+    assert Settings(_env_file=None, app_env="development").rescore_on_startup is True
+
+
 def test_development_still_allows_local_defaults():
     Settings(
         _env_file=None,

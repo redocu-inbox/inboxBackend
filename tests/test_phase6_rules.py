@@ -1,20 +1,23 @@
 """Phase 6 PR 3: rule scorer, rule classifier, and the worker that runs both."""
 
 import asyncio
+import logging
 from datetime import date, datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
 from sqlmodel import Session, func, select
 
+from app.config import get_settings
 from app.db import engine
+from app.models.classification_correction import MessageClassificationCorrection
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
 from app.services.priority.apply import classify_and_score
 from app.services.priority.classify import classify
 from app.services.priority.score import score
-from app.worker.settings import WorkerSettings
-from app.worker.tasks import rescore_mailbox_priority, sync_mailbox_delta
+from app.worker.settings import WorkerSettings, startup
+from app.worker.tasks import rescore_connected_mailboxes, rescore_mailbox_priority, sync_mailbox_delta
 from tests.test_frontend_connect import _user_id
 from tests.test_mailbox_reliability import GRAPH_ITEM, _future, _gmail_item, _run_sync
 
@@ -22,6 +25,16 @@ FIXED = datetime(2026, 11, 9, 18, 0, tzinfo=timezone.utc)
 OLD = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 RECENT = datetime(2026, 11, 9, 16, 0, tzinfo=timezone.utc)
 THIS_WEEK = datetime(2026, 11, 4, 18, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def app_logs(caplog):
+    """Capture app.* logs. setup_logging stops them from reaching the root logger."""
+    caplog.set_level(logging.INFO)
+    app_logger = logging.getLogger("app")
+    app_logger.addHandler(caplog.handler)
+    yield caplog
+    app_logger.removeHandler(caplog.handler)
 
 
 @pytest.fixture(autouse=True)
@@ -420,9 +433,11 @@ def test_worker_pipeline_adds_category_and_due_date_to_the_score():
 
 def test_rescore_is_registered_and_not_on_the_cron():
     assert rescore_mailbox_priority in WorkerSettings.functions
+    assert rescore_connected_mailboxes not in WorkerSettings.functions
     assert len(WorkerSettings.cron_jobs) == 1
     job = WorkerSettings.cron_jobs[0]
     assert getattr(job.coroutine, "__name__", "") == "renew_graph_subscriptions"
+    assert WorkerSettings.on_startup is startup
 
 
 def _account(user_id: str, *, provider: str = "microsoft", disconnected: bool = False) -> ConnectedAccount:
@@ -591,9 +606,10 @@ def test_rescore_updates_one_mailbox_and_skips_a_disconnected_one(client, regist
         )
         session.commit()
 
-    asyncio.run(rescore_mailbox_priority({"job_id": "backfill"}, str(live_id)))
-    asyncio.run(rescore_mailbox_priority({"job_id": "missing"}, str(uuid4())))
-    asyncio.run(rescore_mailbox_priority({"job_id": "disconnected"}, str(gone_id)))
+    assert asyncio.run(rescore_mailbox_priority({"job_id": "backfill"}, str(live_id))) == 1
+    assert asyncio.run(rescore_mailbox_priority({"job_id": "missing"}, str(uuid4()))) is None
+    assert asyncio.run(rescore_mailbox_priority({"job_id": "bad-id"}, "not-a-uuid")) is None
+    assert asyncio.run(rescore_mailbox_priority({"job_id": "disconnected"}, str(gone_id))) is None
     with Session(engine) as session:
         live_row = session.exec(
             select(Message).where(Message.connected_account_id == live_id)
@@ -613,3 +629,233 @@ def test_rescore_updates_one_mailbox_and_skips_a_disconnected_one(client, regist
         assert account.last_sync_at == OLD
         assert account.sync_generation == 4
         assert client.get("/messages", headers=headers).status_code == 200
+
+
+def _unscored(user_id: str, account_id: UUID, graph_id: str, subject: str) -> Message:
+    return Message(
+        user_id=UUID(user_id),
+        connected_account_id=account_id,
+        graph_id=graph_id,
+        subject=subject,
+        received_at=OLD,
+        is_read=True,
+    )
+
+
+def test_startup_rescored_connected_outlook_and_gmail(client, register_user, app_logs):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    other_id = _user_id(client, register_user("ben@example.com"))
+    secret = "token-should-not-be-logged"
+    with Session(engine) as session:
+        outlook = _account(user_id)
+        outlook.access_token = secret
+        outlook.sync_status = "idle"
+        outlook.last_sync_at = OLD
+        outlook.sync_generation = 4
+        gmail = _account(user_id, provider="google")
+        gmail.sync_status = "idle"
+        gmail.last_sync_at = OLD
+        gmail.sync_generation = 2
+        gone = _account(user_id, provider="google", disconnected=True)
+        gone.sync_status = "failed"
+        gone.sync_error_code = "gmail_unavailable"
+        empty = _account(other_id)
+        empty.sync_status = "pending"
+        session.add(outlook)
+        session.add(gmail)
+        session.add(gone)
+        session.add(empty)
+        session.commit()
+        outlook_id = outlook.id
+        gmail_id = gmail.id
+        gone_id = gone.id
+        empty_id = empty.id
+        session.add(_unscored(user_id, outlook_id, "outlook-old", "Invoice 441"))
+        session.add(_unscored(user_id, gmail_id, "gmail-old", "RFI 12 door hardware"))
+        session.add(_unscored(user_id, gone_id, "gone-old", "Invoice 441"))
+        session.commit()
+        before = session.exec(select(func.count()).select_from(Message)).one()
+
+    assert asyncio.run(rescore_connected_mailboxes({"job_id": "startup"})) == (3, 2)
+    assert "priority rescore on startup finished accounts=3 messages=2" in app_logs.text
+    assert secret not in app_logs.text
+    assert "Invoice 441" not in app_logs.text
+
+    with Session(engine) as session:
+        outlook_row = session.exec(
+            select(Message).where(Message.connected_account_id == outlook_id)
+        ).one()
+        gmail_row = session.exec(
+            select(Message).where(Message.connected_account_id == gmail_id)
+        ).one()
+        gone_row = session.exec(
+            select(Message).where(Message.connected_account_id == gone_id)
+        ).one()
+        outlook_account = session.get(ConnectedAccount, outlook_id)
+        gmail_account = session.get(ConnectedAccount, gmail_id)
+        gone_account = session.get(ConnectedAccount, gone_id)
+        empty_account = session.get(ConnectedAccount, empty_id)
+        assert outlook_row.category == "invoice"
+        assert outlook_row.priority_score == 18.0
+        assert outlook_row.priority_band == "low"
+        assert gmail_row.category == "rfi"
+        assert gmail_row.priority_score == 32.0
+        assert gone_row.category is None
+        assert gone_row.priority_score is None
+        assert outlook_account.sync_status == "idle"
+        assert outlook_account.last_sync_at == OLD
+        assert outlook_account.sync_generation == 4
+        assert outlook_account.access_token == secret
+        assert gmail_account.sync_status == "idle"
+        assert gmail_account.sync_generation == 2
+        assert gone_account.sync_status == "failed"
+        assert gone_account.sync_error_code == "gmail_unavailable"
+        assert gone_account.disconnected_at is not None
+        assert empty_account.sync_status == "pending"
+        assert session.exec(select(func.count()).select_from(Message)).one() == before
+
+    again = asyncio.run(rescore_connected_mailboxes({}))
+    assert again == (3, 2)
+    with Session(engine) as session:
+        outlook_row = session.exec(
+            select(Message).where(Message.connected_account_id == outlook_id)
+        ).one()
+        assert outlook_row.priority_score == 18.0
+        assert session.exec(select(func.count()).select_from(Message)).one() == before
+
+
+def test_startup_rescore_keeps_a_user_corrected_field(client, register_user):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    with Session(engine) as session:
+        account = _account(user_id, provider="google")
+        account.sync_status = "idle"
+        account.sync_generation = 3
+        session.add(account)
+        session.commit()
+        account_id = account.id
+        row = _unscored(user_id, account_id, "gmail-corrected", "Invoice 441")
+        row.category = "meeting_notes"
+        row.category_source = "user"
+        row.category_confidence = 1.0
+        row.user_corrected = True
+        session.add(row)
+        session.commit()
+        message_id = row.id
+        session.add(
+            MessageClassificationCorrection(
+                message_id=message_id,
+                user_id=UUID(user_id),
+                field="category",
+                original_value="invoice",
+                corrected_value="meeting_notes",
+                created_at=OLD,
+            )
+        )
+        session.commit()
+
+    assert asyncio.run(rescore_connected_mailboxes({})) == (1, 1)
+    with Session(engine) as session:
+        saved = session.get(Message, message_id)
+        mailbox = session.get(ConnectedAccount, account_id)
+        assert saved.category == "meeting_notes"
+        assert saved.category_source == "user"
+        assert saved.category_confidence == 1.0
+        assert saved.user_corrected is True
+        assert saved.priority_score == 12.0
+        assert mailbox.sync_status == "idle"
+        assert mailbox.sync_generation == 3
+
+
+def test_startup_rescore_continues_after_one_mailbox_fails(client, register_user, monkeypatch, app_logs):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    with Session(engine) as session:
+        outlook = _account(user_id)
+        outlook.sync_status = "idle"
+        gmail = _account(user_id, provider="google")
+        gmail.sync_status = "idle"
+        session.add(outlook)
+        session.add(gmail)
+        session.commit()
+        outlook_id = outlook.id
+        gmail_id = gmail.id
+        session.add(_unscored(user_id, outlook_id, "outlook-old", "Invoice 441"))
+        session.add(_unscored(user_id, gmail_id, "gmail-old", "RFI 12 door hardware"))
+        session.commit()
+
+    original = rescore_mailbox_priority
+
+    async def flaky(ctx, account_id):
+        if account_id == str(outlook_id):
+            raise RuntimeError("rescore failed")
+        return await original(ctx, account_id)
+
+    monkeypatch.setattr("app.worker.tasks.rescore_mailbox_priority", flaky)
+    assert asyncio.run(rescore_connected_mailboxes({})) == (1, 1)
+    assert (
+        f"priority rescore on startup failed account={outlook_id} error_type=RuntimeError"
+        in app_logs.text
+    )
+    assert "priority rescore on startup finished accounts=1 messages=1" in app_logs.text
+    assert "rescore failed" not in app_logs.text
+    with Session(engine) as session:
+        outlook_row = session.exec(
+            select(Message).where(Message.connected_account_id == outlook_id)
+        ).one()
+        gmail_row = session.exec(
+            select(Message).where(Message.connected_account_id == gmail_id)
+        ).one()
+        assert outlook_row.priority_score is None
+        assert gmail_row.category == "rfi"
+        assert gmail_row.priority_score == 32.0
+        assert session.get(ConnectedAccount, outlook_id).sync_status == "idle"
+
+
+def test_startup_rescore_logs_and_returns_when_listing_fails(monkeypatch, app_logs):
+    def boom(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.worker.tasks.Session", boom)
+    assert asyncio.run(rescore_connected_mailboxes({})) == (0, 0)
+    assert "priority rescore on startup failed error_type=RuntimeError" in app_logs.text
+    assert "priority rescore on startup finished" not in app_logs.text
+    assert "db down" not in app_logs.text
+
+
+def test_rescore_on_startup_can_be_turned_off(client, register_user, monkeypatch, app_logs):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    with Session(engine) as session:
+        account = _account(user_id)
+        session.add(account)
+        session.commit()
+        account_id = account.id
+        session.add(_unscored(user_id, account_id, "outlook-old", "Invoice 441"))
+        session.commit()
+
+    monkeypatch.setattr(get_settings(), "rescore_on_startup", False)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("disabled rescore must not open a session")
+
+    monkeypatch.setattr("app.worker.tasks.Session", boom)
+    assert asyncio.run(rescore_connected_mailboxes({})) == (0, 0)
+    assert "priority rescore on startup skipped" in app_logs.text
+    with Session(engine) as session:
+        row = session.exec(select(Message)).one()
+        assert row.priority_score is None
+        assert row.category is None
+
+
+def test_worker_startup_keeps_running_when_rescore_raises(monkeypatch, app_logs):
+    monkeypatch.setattr("app.worker.settings.setup_logging", lambda level: None)
+
+    async def boom(ctx):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.worker.settings.rescore_connected_mailboxes", boom)
+    asyncio.run(startup({}))
+    assert "priority rescore on startup failed error_type=RuntimeError" in app_logs.text
+    assert "db down" not in app_logs.text

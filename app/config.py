@@ -30,6 +30,9 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
+    # The worker rescores stored mail for every connected mailbox on startup.
+    # Set RESCORE_ON_STARTUP=0 to skip. The pass does not call Graph, Gmail, or an LLM.
+    rescore_on_startup: bool = True
     # Signs login JWTs. Changing it logs everyone out.
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 60
