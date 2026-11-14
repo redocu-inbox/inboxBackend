@@ -1,13 +1,16 @@
 """Deterministic construction-mail classifier.
 
-Reads stored subject, preview, body, and From line. It does not take a clock,
-write the database, or call an LLM. The worker stores `category_source`.
+Reads stored subject, preview, body, and From line. It does not take a scoring
+clock, write the database, or call an LLM. Relative days use the received
+timestamp's calendar date in the scoring timezone. The worker stores
+`category_source`.
 """
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Mapping
 
+from app.services.priority.clock import scoring_date
 from app.services.priority.text import (
     any_phrase,
     body_slice,
@@ -67,7 +70,12 @@ _CATEGORY_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 _NUMBER = r"([0-9]{1,12}[A-Za-z]?)"
 
 def _numbered(cue: str) -> re.Pattern[str]:
-    return re.compile(rf"(?i)(?<![A-Za-z])(?:{cue})\s*#?\s*{_NUMBER}(?![A-Za-z0-9])")
+    """Number after a cue: `RFI 12`, `RFI #042`, `RFI-052`, or `RFI No. 52`."""
+    return re.compile(
+        rf"(?i)(?<![A-Za-z])(?:{cue})"
+        rf"(?:\s*#\s*|\s*-\s*|\s+no\.?\s*|\s+number\s*[:#\-]?\s*|\s+)"
+        rf"{_NUMBER}(?![A-Za-z0-9])"
+    )
 
 
 _REFERENCE_CUES: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
@@ -86,40 +94,44 @@ _REFERENCE_CUES: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
     ),
 }
 
+_PROJECT_VALUE = r"([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
+
+
+def _project_cue(prefix: str) -> re.Pattern[str]:
+    """Label, optional colon or hyphen, then the number. The space is optional."""
+    return re.compile(
+        rf"(?i)(?<![A-Za-z]){prefix}\s*[:\-]?\s*{_PROJECT_VALUE}"
+    )
+
+
 _PROJECT_CUES = (
-    re.compile(
-        r"(?i)(?<![A-Za-z])project\s+number\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(
-        r"(?i)(?<![A-Za-z])project\s+no\.\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(
-        r"(?i)(?<![A-Za-z])project\s+no(?![A-Za-z.])\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(
-        r"(?i)(?<![A-Za-z])project\s+#\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(
-        r"(?i)(?<![A-Za-z])job\s+number\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(r"(?i)(?<![A-Za-z])job\s+no\.\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"),
-    re.compile(
-        r"(?i)(?<![A-Za-z])job\s+no(?![A-Za-z.])\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"
-    ),
-    re.compile(r"(?i)(?<![A-Za-z])job\s+#\s*[:\-]?\s+([A-Za-z0-9][A-Za-z0-9./_-]{1,31})"),
+    _project_cue(r"project\s+number"),
+    _project_cue(r"project\s+no\."),
+    _project_cue(r"project\s+no(?![A-Za-z.])"),
+    _project_cue(r"project\s+#"),
+    _project_cue(r"job\s+number"),
+    _project_cue(r"job\s+no\."),
+    _project_cue(r"job\s+no(?![A-Za-z.])"),
+    _project_cue(r"job\s+#"),
 )
 
 _PROJECT_NAME = re.compile(r"(?i)(?<![A-Za-z])project\s+name\s*[:\-]\s*(.*)$")
 
 _DATE_CUES = (
     "response needed by",
+    "response due",
     "due date",
     "due by",
     "due on",
     "respond by",
     "needed by",
     "deadline",
+    "due",
 )
+
+# A yearless month/day more than this many days before the received date rolls forward.
+_YEAR_LOOKBACK_DAYS = 30
+_YEAR_LOOKAHEAD_DAYS = 366
 
 _MONTHS = {
     "january": 1,
@@ -162,11 +174,36 @@ _RELATIVE_WORD = (
     r"(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
 )
 _RELATIVE_AT = re.compile(
-    rf"(?i)^(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
+    rf"(?i)^(?:(last|next)\s+)?(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
 )
-_BY_RELATIVE = re.compile(
-    rf"(?i)(?<![A-Za-z])by\s+(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
+# "by Friday" is a due date only after a deadline word. "drop by today" is not.
+_DEADLINE_WORD = (
+    r"due|deadline|respond|response|needed|need|required|submit|return|"
+    r"complete|confirm|reply|advise|send"
 )
+_DEADLINE_BY = re.compile(
+    rf"(?i)(?<![A-Za-z])(?:{_DEADLINE_WORD})\s+by\s+"
+    rf"(?:(last|next)\s+)?(?:\d{{1,2}}(?::\d{{2}})?\s*(?:am|pm)?\s+)?({_RELATIVE_WORD})\b"
+)
+_DUE_WORD = re.compile(r"(?i)(?<![A-Za-z])due(?![A-Za-z])(?!\s+to\b)")
+_COMPILED_DATE_CUES = tuple(
+    (cue, _DUE_WORD if cue == "due" else re.compile(rf"(?i)(?<![A-Za-z]){re.escape(cue)}(?![A-Za-z])"))
+    for cue in _DATE_CUES
+)
+_EVENT_WORD = re.compile(
+    r"(?i)(?<![A-Za-z])(meetings?|showings?|pickups?|inspections?)\b"
+)
+_NEAR_DATE = re.compile(
+    rf"(?i)(?:(?<![A-Za-z])((?:last|next)\s+{_RELATIVE_WORD}|{_RELATIVE_WORD})\b)"
+    rf"|(?:(?<!\d)(\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?)(?!/))"
+    rf"|(?:(?<![A-Za-z])((?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    rf"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    rf"nov(?:ember)?|dec(?:ember)?)\s+\d{{1,2}}(?:,\s*\d{{4}})?)\b)"
+)
+_DEADLINE_BETWEEN = re.compile(
+    r"(?i)(?<![A-Za-z])(?:due|deadline|respond|response)(?![A-Za-z])"
+)
+_EVENT_WINDOW = 48
 
 _ROLES = (
     (compile_phrase("project manager"), "Project manager"),
@@ -278,11 +315,57 @@ def mentioned_dates(fields: Mapping[str, object]) -> list[date]:
             found.append(calendar)
         if received is None:
             continue
-        for match in re.finditer(rf"(?i)(?<![A-Za-z])({_RELATIVE_WORD})\b", text):
-            resolved = _relative_day(match.group(1), received)
+        for match in re.finditer(
+            rf"(?i)(?<![A-Za-z])(?:(last|next)\s+)?({_RELATIVE_WORD})\b",
+            text,
+        ):
+            resolved = _relative_from_match(match.group(1), match.group(2), received)
             if resolved is not None:
                 found.append(resolved)
     return found
+
+
+def event_dates(fields: Mapping[str, object], *, meeting: bool = True) -> list[date]:
+    """Dates that sit next to a meeting, showing, pickup, or inspection.
+
+    `meeting=False` ignores the word meeting, which is how minutes are kept
+    out of the happening-soon signal while an inspection in the same mail can
+    still count. A deadline word between the event and the date does not count.
+    """
+    received = _received_date(fields.get("received_at"))
+    found: list[date] = []
+    for text in _plain_surfaces(fields):
+        if not text:
+            continue
+        events = [
+            match
+            for match in _EVENT_WORD.finditer(text)
+            if meeting or not match.group(1).lower().startswith("meeting")
+        ]
+        if not events:
+            continue
+        for token in _NEAR_DATE.finditer(text):
+            resolved = _date_from_token(token.group(0), received)
+            if resolved is None:
+                continue
+            for event in events:
+                if not _spans_close(event.start(), event.end(), token.start(), token.end()):
+                    continue
+                left = min(event.end(), token.end())
+                right = max(event.start(), token.start())
+                if right > left and _DEADLINE_BETWEEN.search(text[left:right]):
+                    continue
+                found.append(resolved)
+                break
+    return found
+
+
+def _spans_close(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
+    if left_end <= right_start:
+        return right_start - left_end <= _EVENT_WINDOW
+    if right_end <= left_start:
+        return left_start - right_end <= _EVENT_WINDOW
+    return True
 
 
 def _due_date(surfaces: tuple[str, str, str], received: date | None) -> date | None:
@@ -297,16 +380,15 @@ def _first_date(text: str, received: date | None) -> date | None:
     if not text:
         return None
     found: list[tuple[int, date]] = []
-    for cue in _DATE_CUES:
-        pattern = re.compile(rf"(?i)(?<![A-Za-z]){re.escape(cue)}(?![A-Za-z])")
+    for _cue, pattern in _COMPILED_DATE_CUES:
         for match in pattern.finditer(text):
             index = _skip_separators(text, match.end())
             parsed = _parse_date_at(text, index, received)
             if parsed is not None:
                 found.append((match.start(), parsed))
     if received is not None:
-        for match in _BY_RELATIVE.finditer(text):
-            resolved = _relative_day(match.group(1), received)
+        for match in _DEADLINE_BY.finditer(text):
+            resolved = _relative_from_match(match.group(1), match.group(2), received)
             if resolved is not None:
                 found.append((match.start(), resolved))
     if not found:
@@ -324,23 +406,82 @@ def _skip_separators(text: str, index: int) -> int:
 
 def _parse_date_at(text: str, index: int, received: date | None) -> date | None:
     chunk = text[index:]
-    iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", chunk)
+    absolute = _parse_absolute(chunk, received)
+    if absolute is not None:
+        return absolute
+    lead = re.match(
+        rf"(?i)^(?:(last|next)\s+)?({_RELATIVE_WORD})\b[\s,:-]+",
+        chunk,
+    )
+    if lead is not None:
+        absolute = _parse_absolute(chunk[lead.end() :], received)
+        if absolute is not None:
+            return absolute
+        if received is not None:
+            return _relative_from_match(lead.group(1), lead.group(2), received)
+    return _relative_at(chunk, received)
+
+
+def _parse_absolute(chunk: str, received: date | None) -> date | None:
+    iso = re.match(r"(\d{4})-(\d{2})-(\d{2})\b", chunk)
     if iso:
         return _valid(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-    slash4 = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", chunk)
+    slash4 = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})\b", chunk)
     if slash4:
         return _valid(int(slash4.group(3)), int(slash4.group(1)), int(slash4.group(2)))
-    slash2 = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2})", chunk)
+    slash2 = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2})\b", chunk)
     if slash2:
         year = int(slash2.group(3))
         year = 2000 + year if year <= 69 else 1900 + year
         return _valid(year, int(slash2.group(1)), int(slash2.group(2)))
-    month = re.match(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", chunk)
+    month = re.match(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\b", chunk)
     if month is not None:
         month_num = _MONTHS.get(month.group(1).lower())
         if month_num is not None:
             return _valid(int(month.group(3)), month_num, int(month.group(2)))
-    return _relative_at(chunk, received)
+    month_only = re.match(r"([A-Za-z]+)\s+(\d{1,2})\b(?!\s*,?\s*\d)", chunk)
+    if month_only is not None:
+        month_num = _MONTHS.get(month_only.group(1).lower())
+        if month_num is not None:
+            return _infer_year(month_num, int(month_only.group(2)), received)
+    slash_md = re.match(r"(\d{1,2})/(\d{1,2})(?!/)", chunk)
+    if slash_md:
+        return _infer_year(int(slash_md.group(1)), int(slash_md.group(2)), received)
+    return None
+
+
+def _infer_year(month: int, day: int, received: date | None) -> date | None:
+    """Nearest month/day to `received`, allowing a short overdue window.
+
+    A date with no year is the occurrence within 30 days before the received
+    date or 366 days after it. `1/5` received on December 30 is next year.
+    `12/30` received on January 3 stays in the year that just ended.
+    """
+    if received is None:
+        return None
+    candidates: list[date] = []
+    for year in (received.year - 1, received.year, received.year + 1):
+        parsed = _valid(year, month, day)
+        if parsed is not None:
+            candidates.append(parsed)
+    pool = [
+        item
+        for item in candidates
+        if -_YEAR_LOOKBACK_DAYS <= (item - received).days <= _YEAR_LOOKAHEAD_DAYS
+    ]
+    if not pool:
+        return None
+    pool.sort(key=lambda item: (abs((item - received).days), 0 if item >= received else 1))
+    return pool[0]
+
+
+def _date_from_token(token: str, received: date | None) -> date | None:
+    relative = re.match(rf"(?i)^(?:(last|next)\s+)?({_RELATIVE_WORD})$", token.strip())
+    if relative:
+        if received is None:
+            return None
+        return _relative_from_match(relative.group(1), relative.group(2), received)
+    return _parse_absolute(token.strip(), received)
 
 
 def _relative_at(chunk: str, received: date | None) -> date | None:
@@ -349,30 +490,42 @@ def _relative_at(chunk: str, received: date | None) -> date | None:
     match = _RELATIVE_AT.match(chunk)
     if match is None:
         return None
-    return _relative_day(match.group(1), received)
+    return _relative_from_match(match.group(1), match.group(2), received)
 
 
-def _relative_day(word: str, received: date) -> date | None:
+def _relative_from_match(kind: str | None, word: str, received: date) -> date | None:
+    label = (kind or "").lower()
+    if label == "last":
+        direction = "back"
+    elif label == "next":
+        direction = "next"
+    else:
+        direction = "forward"
+    return _relative_day(word, received, direction=direction)
+
+
+def _relative_day(word: str, received: date, *, direction: str = "forward") -> date | None:
     name = word.lower()
     if name == "today":
-        return received
+        return None if direction == "back" else received
     if name == "tomorrow":
-        return received + timedelta(days=1)
+        return None if direction == "back" else received + timedelta(days=1)
     weekday = _WEEKDAYS.get(name)
     if weekday is None:
         return None
+    if direction == "back":
+        delta = (received.weekday() - weekday) % 7
+        if delta == 0:
+            delta = 7
+        return received - timedelta(days=delta)
     delta = (weekday - received.weekday()) % 7
+    if direction == "next" and delta == 0:
+        delta = 7
     return received + timedelta(days=delta)
 
 
 def _received_date(value: object) -> date | None:
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).date()
-    if isinstance(value, date):
-        return value
-    return None
+    return scoring_date(value)
 
 
 def _valid(year: int, month: int, day: int) -> date | None:

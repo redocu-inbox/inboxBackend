@@ -106,5 +106,6 @@ def _fields(message: Any) -> dict[str, object]:
         "received_at": getattr(message, "received_at", None),
         "category": getattr(message, "category", None),
         "due_date": getattr(message, "due_date", None),
+        "reference_number": getattr(message, "reference_number", None),
     }
     return values

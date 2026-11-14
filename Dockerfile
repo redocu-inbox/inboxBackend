@@ -7,6 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
+# tzdata is in requirements.txt. This image is python:3.12-slim, which does not
+# ship zoneinfo, and scoring resolves today/tomorrow in America/New_York.
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .

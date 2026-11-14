@@ -487,18 +487,24 @@ Duplicates: the same provider id on one mailbox is one row. A second upsert repl
 
 Messy provider items that lack an id or a parseable received time are dropped by the mapper and never reach the classifier. An address with no `@`, or with whitespace, is stored as a null `from_email`.
 
-`due by Friday` is the Friday of `received_at` when that column is present, and it is not a date when `received_at` is missing. `keyword_deadline` can still fire from `due by`. Two category groups in one message keep the earlier group in the precedence list and set confidence `0.5`.
+Relative days use the calendar date of `received_at` in `SCORING_TIMEZONE` (default `America/New_York`). A naive timestamp is UTC, then converted into that zone. `due by Friday` is that zone's Friday, including a Friday evening that is already Saturday in UTC, and it is not a date when `received_at` is missing. `last Friday` is the previous Friday. `next Friday` on a Friday is seven days ahead. A bare `by today`, including `drop by today`, is not a due date. `by <day>` counts only after a deadline word such as due, deadline, respond, response, needed, required, confirm, reply, submit, or return. `keyword_deadline` fires from `due by`, `response needed`, and `response due`. A month and day with no year, including `11/16` and `November 16`, is the nearest date from 30 days before the received date through 366 days after it. `1/5` received on December 30 is next year. `12/30` received on January 3 stays in the year that just ended. `Response Due Monday 11/16` keeps the numeric date. Project numbers match `Project #24-118` and `Project number:24-118` with no space after the mark. Reference numbers match `RFI-052` and `RFI No. 52`. Two category groups in one message keep the earlier group in the precedence list and set confidence `0.5`. Due and overdue compare the stored due date with the scoring zone's date of `now`, not the UTC date.
 
 Shared signals, in addition to the construction keywords. Category points stay. The API still returns every reason. The full list is not cut to the top two or three.
 
 | Code | Label | Weight | Fires when |
 | ---- | ----- | ------ | ---------- |
-| `asks_you` | Asks something of you | 25 | `please send`, `can you confirm`, `please confirm`, `sign and return`, `please reply`, `please advise`, `let me know`, `could you`, `would you`, `action required`, or a `?` in the subject |
-| `repeat_ask` | Repeat ask | 15 | `final notice`, `second request`, `third request`, `following up`, `follow up`, or `second notice` |
-| `happening_soon` | Happening today or tomorrow | 15 | `meeting`, `showing`, `pickup`, or `inspection`, and a date in the message that is the scoring clock's date or the next day |
+| `asks_you` | Asks something of you | 20 | `please send`, `can you confirm`, `please confirm`, `sign and return`, `please reply`, `please advise`, `action required`, or a `?` in the subject. Not `let me know`, `could you`, or `would you`. A signature or a quoted reply is ignored |
+| `repeat_ask` | Repeat ask | 15 | `final notice`, `second request`, `third request`, `following up`, or `second notice`. Not a bare `follow up`. The same signature and quote cut applies |
+| `happening_soon` | Happening today or tomorrow | 15 | `meeting`, `showing`, `pickup`, or `inspection` within 48 characters of a date that is today or tomorrow in the scoring zone. Meeting minutes do not count the word meeting. A deadline word between the event and the date does not count |
 | `act_on_attachment` | Attachment to act on | 8 | `sign and return`, `please sign`, `document to sign`, `form to sign`, `for your signature`, or `attached for signature` |
-| `bulk_automated` | Bulk or automated | -40 | The sender local part is `no-reply`, `noreply`, `do-not-reply`, or `mailer-daemon` |
-| `bulk_automated` | Bulk or automated | -20 | `unsubscribe`, `newsletter`, `view in browser`, `you are receiving this`, `your receipt`, `this is an automated`, or `do not reply`, and the -40 sender rule did not fire |
+| `bulk_automated` | Bulk or automated | -40 | The sender local part is `no-reply`, `noreply`, `do-not-reply`, or `mailer-daemon`, and the construction exception below does not apply |
+| `bulk_automated` | Bulk or automated | -20 | `unsubscribe`, `newsletter`, `view in browser`, `you are receiving this`, `your receipt`, `this is an automated`, or `do not reply`, the -40 sender rule did not fire, and the construction exception below does not apply |
+
+`asks_you` is 20 so an RFI or change-order keyword (22) stays above a direct ask. A direct ask plus recent plus unread is 40, the medium line. Safety is also 20. Text after a sign-off line (`thanks`, `thank you`, `regards`, `best regards`, `sincerely`, `cheers`, `best`), a `--` delimiter, `Sent from my iPhone`, `Get Outlook for`, `-----Original Message-----`, `On ... wrote:`, or a line that starts with `>` is ignored for `asks_you` and `repeat_ask`.
+
+Neither bulk penalty fires when the message is an RFI, change order, submittal, or safety item. That is a category in that set, a reference that starts with `RFI`, `CO`, `PCO`, or `Submittal`, or one of those phrases in the text. It also does not fire when the sender domain is `procore.com`, `autodesk.com`, `plangrid.com`, `buildertrend.com`, `bluebeam.com`, `aconex.com`, or `oraclecloud.com`, including a subdomain. Those are the construction platforms that send real notices from no-reply addresses. An invoice from any other no-reply address still takes the penalty.
+
+`SCORING_TIMEZONE` is optional. The default is `America/New_York`. An unknown value uses that same default. The Docker image installs `tzdata` because `python:3.12-slim` has no system zoneinfo.
 
 A negative weight can pull the sum down. The stored score is still clamped to 0 through 100. `waiting on your reply`, CC-only, and "someone you have replied to" are not signals yet: this sync does not store thread direction, recipients, or sent mail. The VIP tuple is still the known-sender list, and it still ships empty.
 

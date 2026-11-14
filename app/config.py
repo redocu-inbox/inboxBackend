@@ -9,7 +9,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine.url import make_url
 
@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     # The worker rescores stored mail for every connected mailbox on startup.
     # Set RESCORE_ON_STARTUP=0 to skip. The pass does not call Graph, Gmail, or an LLM.
     rescore_on_startup: bool = True
+    # Civil dates for "today", weekdays, and due/overdue. Default is US Eastern.
+    scoring_timezone: str = "America/New_York"
+    # Periodic incremental sync of every connected Outlook and Gmail mailbox.
+    # Set PERIODIC_MAILBOX_SYNC=0 to skip. The free Render service sleeps when
+    # idle, so the cron runs only while that process is awake.
+    periodic_mailbox_sync: bool = True
+    # Minutes between syncs. 1 through 60. Anything else uses 5.
+    mailbox_sync_interval_minutes: int = 5
     # Signs login JWTs. Changing it logs everyone out.
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 60
@@ -87,6 +95,17 @@ class Settings(BaseSettings):
     forwarded_for_hops: int = 0
     password_reset_limit: int = 5
     password_reset_window_seconds: int = 3600
+
+    @field_validator("mailbox_sync_interval_minutes", mode="before")
+    @classmethod
+    def _sync_interval(cls, value: object) -> int:
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 5
+        if 1 <= number <= 60:
+            return number
+        return 5
 
     @model_validator(mode="after")
     def _check_secrets(self) -> "Settings":

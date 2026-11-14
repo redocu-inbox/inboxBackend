@@ -92,6 +92,25 @@ def test_production_settings_reject_unsafe_defaults(overrides):
         _production(**overrides)
 
 
+def test_scoring_and_periodic_sync_defaults(monkeypatch):
+    monkeypatch.delenv("SCORING_TIMEZONE", raising=False)
+    monkeypatch.delenv("PERIODIC_MAILBOX_SYNC", raising=False)
+    monkeypatch.delenv("MAILBOX_SYNC_INTERVAL_MINUTES", raising=False)
+    settings = Settings(_env_file=None, app_env="development")
+    assert settings.scoring_timezone == "America/New_York"
+    assert settings.periodic_mailbox_sync is True
+    assert settings.mailbox_sync_interval_minutes == 5
+    monkeypatch.setenv("PERIODIC_MAILBOX_SYNC", "0")
+    monkeypatch.setenv("MAILBOX_SYNC_INTERVAL_MINUTES", "0")
+    monkeypatch.setenv("SCORING_TIMEZONE", "America/Chicago")
+    overridden = Settings(_env_file=None, app_env="development")
+    assert overridden.periodic_mailbox_sync is False
+    assert overridden.mailbox_sync_interval_minutes == 5
+    assert overridden.scoring_timezone == "America/Chicago"
+    monkeypatch.setenv("MAILBOX_SYNC_INTERVAL_MINUTES", "15")
+    assert Settings(_env_file=None, app_env="development").mailbox_sync_interval_minutes == 15
+
+
 def test_rescore_on_startup_defaults_to_on_and_accepts_zero(monkeypatch):
     monkeypatch.delenv("RESCORE_ON_STARTUP", raising=False)
     assert Settings(_env_file=None, app_env="development").rescore_on_startup is True

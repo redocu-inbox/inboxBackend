@@ -4,10 +4,12 @@ No network and no LLM. Tests pass `now` and, when they need it, a VIP domain tup
 Production uses the empty VIP tuple until real domains are added after a live mailbox test.
 """
 
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
-from app.services.priority.classify import mentioned_dates
+from app.services.priority.classify import event_dates
+from app.services.priority.clock import scoring_date
 from app.services.priority.text import any_phrase, body_slice, compile_phrase, normalize, role_text
 
 # Keyword, recency, and sender weights. Category and due-date weights are separate.
@@ -24,7 +26,9 @@ UNREAD = ("unread", "Unread", 8)
 SENDER_PROJECT_ROLE = ("sender_project_role", "Project role", 8)
 THIS_WEEK = ("this_week", "Received this week", 6)
 
-ASKS_YOU = ("asks_you", "Asks something of you", 25)
+# 20 keeps a direct ask plus recent plus unread at the medium line (40).
+# RFI and change order are 22, so those keywords still rank above the ask.
+ASKS_YOU = ("asks_you", "Asks something of you", 20)
 REPEAT_ASK = ("repeat_ask", "Repeat ask", 15)
 HAPPENING_SOON = ("happening_soon", "Happening today or tomorrow", 15)
 ACT_ON_ATTACHMENT = ("act_on_attachment", "Attachment to act on", 8)
@@ -66,6 +70,7 @@ _KEYWORD_RULES = (
             compile_phrase("due date"),
             compile_phrase("respond by"),
             compile_phrase("response needed"),
+            compile_phrase("response due"),
         ),
     ),
     (
@@ -86,6 +91,7 @@ _KEYWORD_RULES = (
     ),
 )
 
+# "let me know", "could you", and "would you" are closings, not asks.
 _ASK_PHRASES = (
     compile_phrase("please send"),
     compile_phrase("can you confirm"),
@@ -93,26 +99,16 @@ _ASK_PHRASES = (
     compile_phrase("sign and return"),
     compile_phrase("please reply"),
     compile_phrase("please advise"),
-    compile_phrase("let me know"),
-    compile_phrase("could you"),
-    compile_phrase("would you"),
     compile_phrase("action required"),
 )
 
+# "follow up" matches thank-you notes. "following up" is the repeat.
 _REPEAT_PHRASES = (
     compile_phrase("final notice"),
     compile_phrase("second request"),
     compile_phrase("third request"),
     compile_phrase("following up"),
-    compile_phrase("follow up"),
     compile_phrase("second notice"),
-)
-
-_EVENT_PHRASES = (
-    compile_phrase("meeting"),
-    compile_phrase("showing"),
-    compile_phrase("pickup"),
-    compile_phrase("inspection"),
 )
 
 _ATTACHMENT_PHRASES = (
@@ -132,6 +128,54 @@ _BULK_PHRASES = (
     compile_phrase("your receipt"),
     compile_phrase("this is an automated"),
     compile_phrase("do not reply"),
+)
+
+_MINUTES_PHRASES = (
+    compile_phrase("meeting minutes"),
+    compile_phrase("meeting notes"),
+    compile_phrase("minutes of the meeting"),
+    compile_phrase("minutes of meeting"),
+)
+
+_CONSTRUCTION_CATEGORIES = frozenset({"rfi", "change_order", "submittal", "safety"})
+_CONSTRUCTION_REFERENCE = re.compile(r"(?i)^(RFI|CO|PCO|Submittal)\b")
+_CONSTRUCTION_PHRASES = (
+    compile_phrase("rfi"),
+    compile_phrase("change order"),
+    compile_phrase("potential change order"),
+    compile_phrase("pco"),
+    compile_phrase("submittal"),
+    compile_phrase("stop work"),
+    compile_phrase("osha"),
+    compile_phrase("near miss"),
+)
+
+# Notifications from these domains are project mail even when the address is no-reply.
+_PLATFORM_DOMAINS = (
+    "procore.com",
+    "autodesk.com",
+    "plangrid.com",
+    "buildertrend.com",
+    "bluebeam.com",
+    "aconex.com",
+    "oraclecloud.com",
+)
+
+_SIGNOFF_LINE = re.compile(
+    r"(?i)^(?:thanks|thank you|many thanks|regards|best regards|kind regards|"
+    r"warm regards|sincerely|cheers|best|all the best)\s*,?\s*$"
+)
+_BOILERPLATE_LINE = re.compile(
+    r"(?i)^(?:"
+    r"--\s*$|"
+    r"--\s|"
+    r"_{5,}\s*$|"
+    r"-{5,}.*original message.*$|"
+    r"sent from my (?:iphone|ipad|android|samsung|mobile).*$|"
+    r"get outlook for .*$|"
+    r"on .+wrote:\s*$|"
+    r">.*"
+    r")$"
 )
 
 _ROLE_PHRASES = (
@@ -190,9 +234,10 @@ def score(
     if any_phrase(_ROLE_PHRASES, role_parts):
         reasons.append(SENDER_PROJECT_ROLE)
 
-    if any_phrase(_ASK_PHRASES, keyword_parts) or _subject_asks(fields.get("subject")):
+    ask_parts = _ask_parts(fields)
+    if any_phrase(_ASK_PHRASES, ask_parts) or _subject_asks(fields.get("subject")):
         reasons.append(ASKS_YOU)
-    if any_phrase(_REPEAT_PHRASES, keyword_parts):
+    if any_phrase(_REPEAT_PHRASES, ask_parts):
         reasons.append(REPEAT_ASK)
     if any_phrase(_ATTACHMENT_PHRASES, keyword_parts):
         reasons.append(ACT_ON_ATTACHMENT)
@@ -207,8 +252,8 @@ def score(
         reasons.append(CATEGORY_REASONS[category])
 
     due = _as_date(fields.get("due_date"))
-    if due is not None and moment is not None:
-        today = moment.date()
+    today = scoring_date(moment)
+    if due is not None and today is not None:
         if due < today:
             reasons.append(DUE_OVERDUE)
         elif due <= today + timedelta(days=3):
@@ -233,22 +278,49 @@ def _subject_asks(value: object) -> bool:
     return isinstance(value, str) and "?" in value
 
 
+def _ask_parts(fields: Mapping[str, object]) -> tuple[str, str, str]:
+    """Subject plus body text with the signature and quoted reply cut off."""
+    return (
+        normalize(fields.get("subject")),
+        normalize(_without_boilerplate(fields.get("body_preview"))),
+        normalize(_without_boilerplate(fields.get("body_text"))),
+    )
+
+
+def _without_boilerplate(value: object) -> str:
+    text = body_slice(value)
+    if not text:
+        return ""
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _SIGNOFF_LINE.match(stripped) or _BOILERPLATE_LINE.match(stripped):
+            break
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _happening_soon(
     fields: Mapping[str, object],
     keyword_parts: tuple[str, str, str],
     moment: datetime | None,
 ) -> bool:
-    if moment is None or not any_phrase(_EVENT_PHRASES, keyword_parts):
+    today = scoring_date(moment)
+    if today is None:
         return False
-    today = moment.date()
-    tomorrow = today + timedelta(days=1)
-    return any(item == today or item == tomorrow for item in mentioned_dates(fields))
+    window = {today, today + timedelta(days=1)}
+    minutes = fields.get("category") == "meeting_notes" or any_phrase(
+        _MINUTES_PHRASES, keyword_parts
+    )
+    return any(item in window for item in event_dates(fields, meeting=not minutes))
 
 
 def _bulk_reason(
     fields: Mapping[str, object],
     keyword_parts: tuple[str, str, str],
 ) -> tuple[str, str, int] | None:
+    if _construction_mail(fields, keyword_parts) or _platform_sender(fields.get("from_email")):
+        return None
     local = _local_part(fields.get("from_email")).lower()
     compact = local.replace(".", "").replace("_", "").replace("-", "")
     if "noreply" in compact or "donotreply" in compact or "mailerdaemon" in compact:
@@ -256,6 +328,26 @@ def _bulk_reason(
     if any_phrase(_BULK_PHRASES, keyword_parts):
         return BULK_AUTOMATED
     return None
+
+
+def _construction_mail(
+    fields: Mapping[str, object],
+    keyword_parts: tuple[str, str, str],
+) -> bool:
+    category = fields.get("category")
+    if isinstance(category, str) and category in _CONSTRUCTION_CATEGORIES:
+        return True
+    reference = fields.get("reference_number")
+    if isinstance(reference, str) and _CONSTRUCTION_REFERENCE.match(reference.strip()):
+        return True
+    return any_phrase(_CONSTRUCTION_PHRASES, keyword_parts)
+
+
+def _platform_sender(value: object) -> bool:
+    domain = _domain(value)
+    if not domain:
+        return False
+    return any(domain == item or domain.endswith("." + item) for item in _PLATFORM_DOMAINS)
 
 
 def _as_utc(value: object) -> datetime | None:
@@ -268,7 +360,7 @@ def _as_utc(value: object) -> datetime | None:
 
 def _as_date(value: object) -> date | None:
     if isinstance(value, datetime):
-        return _as_utc(value).date() if _as_utc(value) is not None else None
+        return scoring_date(value)
     if isinstance(value, date):
         return value
     if isinstance(value, str):

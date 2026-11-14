@@ -1,6 +1,6 @@
 # Inbox API
 
-Backend for an AI-powered inbox. Through phase 5 this repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Accounts can register and log in, connect an Outlook or Gmail mailbox, and sync recent messages. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and a Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams. Gmail access is read-only.
+Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Through phase 6, accounts can register and log in, connect an Outlook or Gmail mailbox, sync recent messages, and read a rule-based category and priority score. The worker also syncs each connected mailbox on a timer while the process is awake. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and a Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams. Gmail access is read-only.
 
 You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or another Docker engine with Compose v2). You do not need a local Python install to run the stack.
 
@@ -68,7 +68,7 @@ docker compose down
 | Service    | Role                                                                 | Port on your machine |
 | ---------- | -------------------------------------------------------------------- | -------------------- |
 | `api`      | FastAPI, auto-reloads when you save a file                           | 8000                 |
-| `worker`   | ARQ process for mailbox sync, form matching, form fill, and subscription renewal | none                 |
+| `worker`   | ARQ process for mailbox sync, the periodic inbox sync, form matching, form fill, and subscription renewal | none                 |
 | `postgres` | PostgreSQL 16 with the pgvector extension                            | 5433                 |
 | `redis`    | ARQ queue and the mailbox-connect state                              | 6380                 |
 
@@ -167,6 +167,7 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | `match_form_template`       | `POST /forms/jobs` | Sets the job to `running`, then logs a TODO. It does not call the LLM |
 | `run_form_fill`             | nothing yet | Logs a TODO. `PdfFormFiller.fill` is not implemented |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
+| `sync_connected_mailboxes` | cron every 5 minutes by default | Syncs every connected Outlook and Gmail mailbox through `sync_mailbox_delta`. Skips a mailbox that is already pending or running. One account's token or provider error does not stop the others |
 
 `sync_mailbox_delta` takes the account or subscription id, and an optional generation integer. It loads the `connected_accounts` row whose `graph_subscription_id` equals the first string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id and the generation they just stored. The webhook passes only a Graph subscription id. With `graph_subscription_id` empty, that lookup misses, the job logs that no account was found, and it returns. A disconnected mailbox or a generation that is no longer current returns without calling Graph.
 
@@ -177,6 +178,10 @@ A `provider` of `google` never calls Graph. The job lists `users.messages` with 
 After each successful upsert, in that same transaction, the job runs the rule classifier and then the rule scorer. Categories stay in this database. The job does not label or move mail, and it does not call `get_llm()`. A field that already has a row in `message_classification_corrections` is left as the user saved it. A classifier or scorer exception is logged as the exception type and the message id. The message text still commits, and a successful provider sync still goes idle. `rescore_mailbox_priority` takes a connected-account id string. Nothing in the API enqueues it, and it is not on the cron. A missing or disconnected mailbox is skipped. It uses the same correction lock.
 
 When the worker starts, it runs that job for every connected mailbox, Outlook and Gmail alike, unless `RESCORE_ON_STARTUP=0`. The default is on. The pass reads stored rows only. It does not call Graph, Gmail, or an LLM, and it does not change sync status. One mailbox failing is logged as the exception type and that account id, and the worker still starts. The summary line is `priority rescore on startup finished accounts=<n> messages=<n>`. `accounts` is connected mailboxes that finished. `messages` is stored rows on those mailboxes, including rows that already had a score. With the flag off, the line is `priority rescore on startup skipped`.
+
+`sync_connected_mailboxes` is the periodic sync. `PERIODIC_MAILBOX_SYNC` defaults to on. Set it to `0` to skip. `MAILBOX_SYNC_INTERVAL_MINUTES` defaults to 5 and accepts 1 through 60; any other value uses 5. The job reuses `sync_mailbox_delta`, including that job's row lock and generation check, so a mailbox already pending or running is not started again. A stale pending or running row (older than 10 minutes) is claimed. A token refresh failure or a provider error, including HTTP 403, is stored on that account and the loop continues. The pass lists the same recent page the manual sync lists. It does not send mail. On the free Render plan the API and the worker share one service that sleeps after inactivity, so this cron runs only while that service is awake. A sleeping service does not sync until the next request wakes it.
+
+`SCORING_TIMEZONE` defaults to `America/New_York`. Today, tomorrow, weekdays, and due or overdue use that zone. An unknown value falls back to `America/New_York`. None of these settings are required.
 
 `LLM_PROVIDER=stub` (the default) returns the fixed string `[stub llm]`. Any other provider raises `NotImplementedError`.
 

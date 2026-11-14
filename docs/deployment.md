@@ -11,7 +11,7 @@ The public API hostname is not in this repository. Write it as `<API_ORIGIN>` (s
 | Piece | Why | Durable? |
 | --- | --- | --- |
 | API process | Uvicorn serving `app.main:app` on HTTP inside the container. TLS is terminated in front of it. | The process can restart. Login JWTs are signed with `SECRET_KEY` and checked against Postgres. |
-| Worker process | `arq app.worker.settings.WorkerSettings`. Sync, form jobs, and the 00:00 and 12:00 subscription cron run here. | Same code image as the API. It must see the same database, Redis, and file directory. |
+| Worker process | `arq app.worker.settings.WorkerSettings`. Sync, form jobs, a mailbox sync every 5 minutes, and the 00:00 and 12:00 subscription cron run here. On the free plan this process shares the web service, which sleeps after inactivity, so the 5-minute cron runs only while the service is awake. | Same code image as the API. It must see the same database, Redis, and file directory. |
 | Postgres | Users, mail rows, encrypted Microsoft tokens, revoked JWT ids. The first migration runs `CREATE EXTENSION vector`. Health stays degraded until that extension exists. | Required for anything you need after a restart. |
 | Redis | OAuth `state` (10 minutes) and the ARQ queue. | Not required for login or logout. Required to start Outlook connect and to run a sync. |
 | File directory | `STORAGE_LOCAL_PATH`, default `/app/storage`. PDF templates are written here. | Only if the disk survives restarts. |
