@@ -2,12 +2,14 @@
 
 The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
 body_text are filled when a sync stores them, and stay null when the provider
-omits them. body_text is plain text, never raw HTML. priority_score stays
-null until a later phase writes it. priority_reasons is empty until then.
-suggested_form is null until a later phase. draft stays null.
+omits them. body_text is plain text, never raw HTML. priority_score,
+priority_band, priority_reasons, and the classification fields stay null
+until a later phase writes them. A null reasons column is [] in JSON.
+user_corrected is false until a correction. priority_scored_at is stored and
+is not returned. suggested_form is null until a later phase. draft stays null.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -38,6 +40,15 @@ class MessageResponse(BaseModel):
     priority_score: float | None = None
     priority_band: str | None = None
     priority_reasons: list[Any] = Field(default_factory=list)
+    category: str | None = None
+    category_source: str | None = None
+    category_confidence: float | None = None
+    project_name: str | None = None
+    project_number: str | None = None
+    due_date: str | None = None
+    responsible_party: str | None = None
+    reference_number: str | None = None
+    user_corrected: bool = False
     suggested_form: Any | None = None
 
 
@@ -60,6 +71,19 @@ def _visible_message_filter(user_id: UUID):
     return Message.user_id == user_id, Message.connected_account_id.in_(active_ids)
 
 
+def _priority_reasons(value: object) -> list[Any]:
+    """Null means not scored. A stored list is returned in the stored order."""
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _due_date(value: date | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat()
+
+
 def _message_response(row: Message, provider: str | None) -> MessageResponse:
     return MessageResponse(
         id=row.id,
@@ -71,6 +95,17 @@ def _message_response(row: Message, provider: str | None) -> MessageResponse:
         is_read=row.is_read,
         provider=provider,
         priority_score=row.priority_score,
+        priority_band=row.priority_band,
+        priority_reasons=_priority_reasons(row.priority_reasons),
+        category=row.category,
+        category_source=row.category_source,
+        category_confidence=row.category_confidence,
+        project_name=row.project_name,
+        project_number=row.project_number,
+        due_date=_due_date(row.due_date),
+        responsible_party=row.responsible_party,
+        reference_number=row.reference_number,
+        user_corrected=row.user_corrected is True,
     )
 
 
