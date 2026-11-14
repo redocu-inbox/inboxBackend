@@ -28,6 +28,15 @@ LIST_KEYS = {
     "priority_score",
     "priority_band",
     "priority_reasons",
+    "category",
+    "category_source",
+    "category_confidence",
+    "project_name",
+    "project_number",
+    "due_date",
+    "responsible_party",
+    "reference_number",
+    "user_corrected",
     "suggested_form",
 }
 
@@ -107,6 +116,7 @@ def _add_message(
     received_at: datetime,
     priority_score: float | None,
     subject: str = "Hello",
+    **columns,
 ) -> str:
     with Session(engine) as session:
         message = Message(
@@ -117,6 +127,7 @@ def _add_message(
             body_preview="preview",
             received_at=received_at,
             priority_score=priority_score,
+            **columns,
         )
         session.add(message)
         session.commit()
@@ -462,6 +473,16 @@ def test_message_list_contract_sort_and_total(client, register_user):
     assert item["priority_score"] == 50
     assert item["priority_band"] is None
     assert item["priority_reasons"] == []
+    assert item["category"] is None
+    assert item["category_source"] is None
+    assert item["category_confidence"] is None
+    assert item["project_name"] is None
+    assert item["project_number"] is None
+    assert item["due_date"] is None
+    assert item["responsible_party"] is None
+    assert item["reference_number"] is None
+    assert item["user_corrected"] is False
+    assert "priority_scored_at" not in item
     assert item["suggested_form"] is None
     assert client.get("/messages?sort=nope", headers=ana).status_code == 422
 
@@ -486,7 +507,11 @@ def test_message_detail_includes_body_and_hides_other_users(client, register_use
     assert body["body_text"] is None
     assert body["draft"] is None
     assert body["priority_score"] is None
+    assert body["priority_band"] is None
     assert body["priority_reasons"] == []
+    assert body["category"] is None
+    assert body["user_corrected"] is False
+    assert "priority_scored_at" not in body
 
     missing = client.get(f"/messages/{uuid4()}", headers=ana)
     foreign = client.get(f"/messages/{message_id}", headers=bob)

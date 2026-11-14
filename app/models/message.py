@@ -1,9 +1,11 @@
 import app.db
 
-from datetime import datetime
+from datetime import date, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, DateTime, Text, UniqueConstraint
+from sqlalchemy import Column, Date, DateTime, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import SQLModel, Field
 
 from app.models.user import utcnow
@@ -29,5 +31,19 @@ class Message(SQLModel, table=True):
     body_text: str | None = Field(default=None, sa_column=Column(Text))
     received_at: datetime = Field(sa_type=DateTime(timezone=True), index=True)
     priority_score: float | None = Field(default=None, index=True)
+    # Null until a scorer writes them. priority_scored_at is not returned by the API.
+    priority_band: str | None = Field(default=None, max_length=16)
+    priority_reasons: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    priority_scored_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    category: str | None = Field(default=None, max_length=32)
+    category_source: str | None = Field(default=None, max_length=16)
+    category_confidence: float | None = Field(default=None)
+    project_name: str | None = Field(default=None, sa_column=Column(Text))
+    project_number: str | None = Field(default=None, max_length=64)
+    due_date: date | None = Field(default=None, sa_type=Date)
+    responsible_party: str | None = Field(default=None, sa_column=Column(Text))
+    reference_number: str | None = Field(default=None, max_length=64)
+    # Null until a correction. The API returns false for null.
+    user_corrected: bool | None = Field(default=None)
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
