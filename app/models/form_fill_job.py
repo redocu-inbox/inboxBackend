@@ -16,6 +16,7 @@ class FormFillStatus(str, Enum):
     needs_review = "needs_review"
     completed = "completed"
     failed = "failed"
+    rejected = "rejected"
 
 class FormFillJob(SQLModel, table=True):
     __tablename__ = "form_fill_jobs"

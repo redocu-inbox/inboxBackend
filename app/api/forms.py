@@ -325,6 +325,22 @@ def get_job_file(
     )
 
 
+@router.post("/forms/jobs/{job_id}/reject")
+def reject_job(
+    job_id: UUID,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> CreateFillJobResponse:
+    """Hide this job from suggested_form. The stored PDF stays until a refill."""
+    job = _owned_job(session, user.id, job_id)
+    job.status = FormFillStatus.rejected
+    job.updated_at = utcnow()
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    return CreateFillJobResponse(id=job.id, status=_job_status(job.status))
+
+
 @router.post("/forms/jobs/{job_id}/refill")
 async def refill_job(
     job_id: UUID,
