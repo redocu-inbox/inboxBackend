@@ -9,8 +9,9 @@ from sqlmodel import Session
 from app.db import engine
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
+from tests.pdf_fixtures import blank_pdf_bytes
 
-PDF_UPLOAD = {"file": ("form.pdf", b"%PDF-1.4", "application/pdf")}
+PDF_UPLOAD = {"file": ("form.pdf", blank_pdf_bytes(), "application/pdf")}
 
 
 def _upload_template(client, headers) -> str:
@@ -55,6 +56,14 @@ def bob(register_user):
     "method, path, kwargs",
     [
         ("post", "/forms/templates", {"files": PDF_UPLOAD}),
+        ("get", "/forms/templates", {}),
+        ("get", "/forms/templates/00000000-0000-0000-0000-000000000000", {}),
+        (
+            "patch",
+            "/forms/templates/00000000-0000-0000-0000-000000000000",
+            {"json": {}},
+        ),
+        ("delete", "/forms/templates/00000000-0000-0000-0000-000000000000", {}),
         (
             "post",
             "/forms/jobs",

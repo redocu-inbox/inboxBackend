@@ -16,3 +16,4 @@ msal>=1.31.0
 # IANA zones for SCORING_TIMEZONE. python:3.12-slim has no /usr/share/zoneinfo,
 # and zoneinfo uses this package when the system database is missing.
 tzdata>=2024.2
+pypdf>=5.4,<7
