@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, DateTime, String, Text
+from sqlalchemy import Column, DateTime, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
@@ -31,6 +31,10 @@ class FormFillJob(SQLModel, table=True):
     )
     confidence: float | None = Field(default=None)
     extracted_values: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False))
+    dropped_fields: list = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")),
+    )
     filled_file_path: str | None = Field(default=None, max_length=1024)
     error: str | None = Field(default=None, sa_column=Column(Text))
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True), nullable=False)

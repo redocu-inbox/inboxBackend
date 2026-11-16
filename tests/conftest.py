@@ -56,7 +56,9 @@ def client(tmp_path, monkeypatch) -> TestClient:
     """A client without lifespan, so the tests need no Redis. Uploads go to tmp_path."""
     from app.storage.local import LocalStorage
 
-    monkeypatch.setattr("app.services.forms.pipeline.get_storage", lambda: LocalStorage(str(tmp_path)))
+    storage = LocalStorage(str(tmp_path))
+    monkeypatch.setattr("app.services.forms.pipeline.get_storage", lambda: storage)
+    monkeypatch.setattr("app.storage.get_storage", lambda: storage)
     app.state.arq = AsyncMock()
     return TestClient(app)
 

@@ -131,8 +131,14 @@ def create_fill_job(
     user_id: UUID,
     template_id: UUID,
     message_id: UUID | None,
+    values: dict | None = None,
 ) -> FormFillJob:
-    """Insert a pending fill job for a template and message owned by this user."""
+    """Insert a pending fill job for a template and message owned by this user.
+
+    `values` is present when the caller already knows the field values. Those
+    are stored as extracted_values and confidence is 1.0. The filler does not
+    change that confidence later. Omit `values` to leave confidence unset.
+    """
     template = session.get(FormTemplate, template_id)
     if template is None or template.user_id != user_id:
         raise LookupError(f"Form template {template_id} was not found")
@@ -140,12 +146,15 @@ def create_fill_job(
         message = session.get(Message, message_id)
         if message is None or message.user_id != user_id:
             raise LookupError(f"Message {message_id} was not found")
+    supplied = values is not None
     job = FormFillJob(
         user_id=user_id,
         template_id=template_id,
         message_id=message_id,
         status=FormFillStatus.pending,
-        extracted_values={},
+        extracted_values=dict(values) if supplied else {},
+        confidence=1.0 if supplied else None,
+        dropped_fields=[],
     )
     session.add(job)
     return job
