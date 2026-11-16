@@ -40,6 +40,7 @@ from app.services.mailboxes import (
     TOKEN_REFRESH_FAILED,
     sync_in_flight,
 )
+from app.services.forms.fill_job import execute_form_fill
 from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
 
@@ -540,14 +541,13 @@ async def match_form_template(ctx: dict, job_id: str) -> None:
 
 
 async def run_form_fill(ctx: dict, job_id: str) -> None:
-    """TODO: load template bytes, call get_filler(...).fill, store the result,
-    set filled_file_path and status.
+    """Write the job's saved values into the AcroForm and store the PDF.
+
+    A missing id is logged and ignored. Running the job again overwrites the
+    same storage key. Confidence is left as it was stored at create time.
     """
-    logger.info(
-        "TODO run_form_fill fill_job=%s job_id=%s",
-        job_id,
-        ctx.get("job_id"),
-    )
+    del ctx
+    execute_form_fill(job_id)
 
 
 async def renew_graph_subscriptions(ctx: dict) -> None:

@@ -328,7 +328,7 @@ def test_legacy_empty_schema_reads_as_none(client, register_user):
     assert body["schema"] == {"kind": "none", "fields": []}
 
 
-def test_fill_job_routes_are_unchanged(client, register_user):
+def test_fill_job_without_values_enqueues_match(client, register_user):
     headers = register_user("jobs@example.com")
     template_id = _upload(client, headers, blank_pdf_bytes()).json()["id"]
     created = client.post("/forms/jobs", headers=headers, json={"template_id": template_id})
@@ -341,4 +341,24 @@ def test_fill_job_routes_are_unchanged(client, register_user):
 
     fetched = client.get(f"/forms/jobs/{created.json()['id']}", headers=headers)
     assert fetched.status_code == 200
-    assert set(fetched.json()) == {"status", "confidence", "error", "extracted_values"}
+    body = fetched.json()
+    assert set(body) == {
+        "id",
+        "template_id",
+        "message_id",
+        "status",
+        "confidence",
+        "extracted_values",
+        "dropped_fields",
+        "error",
+        "file_ready",
+    }
+    assert body["id"] == created.json()["id"]
+    assert body["template_id"] == template_id
+    assert body["message_id"] is None
+    assert body["status"] == "pending"
+    assert body["confidence"] is None
+    assert body["extracted_values"] == {}
+    assert body["dropped_fields"] == []
+    assert body["error"] is None
+    assert body["file_ready"] is False
