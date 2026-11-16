@@ -63,7 +63,7 @@ class PatchTemplateRequest(BaseModel):
 
 
 class CreateFillJobRequest(BaseModel):
-    template_id: UUID
+    template_id: UUID | None = None
     message_id: UUID | None = None
     values: dict | None = None
 
@@ -92,6 +92,8 @@ class FillJobResponse(BaseModel):
 
 
 _JOB_NOT_FOUND = "Fill job not found"
+_TEMPLATE_REQUIRED = "A template is required when values are sent."
+_MESSAGE_REQUIRED = "A message is required when values are omitted."
 
 
 def _storage():
@@ -273,6 +275,10 @@ async def create_job(
     session: Session = Depends(get_session),
 ) -> CreateFillJobResponse:
     supplied = "values" in body.model_fields_set and body.values is not None
+    if supplied and body.template_id is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_TEMPLATE_REQUIRED)
+    if not supplied and body.message_id is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_MESSAGE_REQUIRED)
     try:
         job = create_fill_job(
             session,

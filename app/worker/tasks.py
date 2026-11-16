@@ -14,7 +14,6 @@ from sqlmodel import Session, select
 
 from app.config import get_settings
 from app.db import engine
-from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import utcnow
 from app.models.connected_account import ConnectedAccount
@@ -41,6 +40,7 @@ from app.services.mailboxes import (
     sync_in_flight,
 )
 from app.services.forms.fill_job import execute_form_fill
+from app.services.forms.match import consider_form_match_on_sync, execute_form_match
 from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
 
@@ -327,6 +327,7 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
         )
         _mark_failed(session, account_id, claimed, GMAIL_UNAVAILABLE)
         return
+    consider_form_match_on_sync(ctx, account_id)
     logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
 
 
@@ -429,6 +430,7 @@ async def sync_mailbox_delta(
             )
             _mark_failed(session, account_id, claimed, GRAPH_UNAVAILABLE)
             return
+    consider_form_match_on_sync(ctx, account_id)
     logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
 
 
@@ -519,25 +521,12 @@ async def rescore_connected_mailboxes(ctx: dict | None = None) -> tuple[int, int
 
 
 async def match_form_template(ctx: dict, job_id: str) -> None:
-    """Mark the fill job running.
+    """Choose a template, extract values, and enqueue a fill when the model returns some.
 
-    TODO: call get_llm() to match a template, save extracted_values,
-    then enqueue run_form_fill.
+    A missing id is logged and ignored. The stub stops at needs_review and
+    does not enqueue run_form_fill. This job does not call Graph or Gmail.
     """
-    with Session(engine) as session:
-        job = session.get(FormFillJob, UUID(job_id))
-        if job is None:
-            logger.warning("fill job %s was not found", job_id)
-            return
-        job.status = FormFillStatus.running
-        job.updated_at = utcnow()
-        session.add(job)
-        session.commit()
-    logger.info(
-        "TODO match_form_template fill_job=%s job_id=%s",
-        job_id,
-        ctx.get("job_id"),
-    )
+    await execute_form_match(ctx, job_id)
 
 
 async def run_form_fill(ctx: dict, job_id: str) -> None:

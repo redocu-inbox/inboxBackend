@@ -129,7 +129,7 @@ def create_fill_job(
     session: Session,
     *,
     user_id: UUID,
-    template_id: UUID,
+    template_id: UUID | None,
     message_id: UUID | None,
     values: dict | None = None,
 ) -> FormFillJob:
@@ -138,10 +138,15 @@ def create_fill_job(
     `values` is present when the caller already knows the field values. Those
     are stored as extracted_values and confidence is 1.0. The filler does not
     change that confidence later. Omit `values` to leave confidence unset.
+    `template_id` may be omitted when the match job will choose a template.
     """
-    template = session.get(FormTemplate, template_id)
-    if template is None or template.user_id != user_id:
-        raise LookupError(f"Form template {template_id} was not found")
+    if template_id is None:
+        if values is not None:
+            raise LookupError("A template is required when values are sent.")
+    else:
+        template = session.get(FormTemplate, template_id)
+        if template is None or template.user_id != user_id:
+            raise LookupError(f"Form template {template_id} was not found")
     if message_id is not None:
         message = session.get(Message, message_id)
         if message is None or message.user_id != user_id:
