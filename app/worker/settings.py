@@ -9,7 +9,7 @@ the functions listed below (the function name `heartbeat` is the job name).
 
 import logging
 
-from arq import cron
+from arq import cron, func
 from arq.connections import RedisSettings
 
 from app.config import get_settings
@@ -74,8 +74,8 @@ class WorkerSettings:
         sync_mailbox_delta,
         rescore_mailbox_priority,
         send_password_reset,
-        match_form_template,
-        run_form_fill,
+        func(match_form_template, max_tries=3),
+        func(run_form_fill, max_tries=3),
         renew_graph_subscriptions,
     ]
     cron_jobs = _cron_jobs()
