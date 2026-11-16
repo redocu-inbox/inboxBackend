@@ -1,6 +1,6 @@
 # Inbox API
 
-Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Through phase 6, accounts can register and log in, connect an Outlook or Gmail mailbox, sync recent messages, and read a rule-based category and priority score. The worker also syncs each connected mailbox on a timer while the process is awake. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and a Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams. Gmail access is read-only.
+Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Through phase 8, accounts can register and log in, connect an Outlook or Gmail mailbox, sync recent messages, and read a rule-based category and priority score. A message can hold a local reply draft, and an Outlook draft can be saved unsent. The worker also syncs each connected mailbox on a timer while the process is awake. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and the AcroForm fields are stored on the template. A Microsoft Graph webhook can enqueue a mailbox sync. Filling a PDF, matching a template to a message, and calling a real LLM are still seams. Gmail access is read-only.
 
 You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or another Docker engine with Compose v2). You do not need a local Python install to run the stack.
 
@@ -17,6 +17,8 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | F2 | One active Outlook mailbox per user, callback failures always redirect, Graph sender/read/plain-text body, sync status, disconnect, and server-side logout |
 | 6 | Rule classification, priority scoring, and a correction route for each synced Outlook and Gmail message. Contract: [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md) |
 | Gmail | Read-only Gmail connect (`/auth/google/start`, callback, disconnect). One Outlook mailbox and one Gmail mailbox can both stay connected, and `GET /messages` lists both |
+| 7 | Local reply drafts, including an unsent Outlook push. A Gmail message is not pushed |
+| 8 | Form library: an upload stores AcroForm fields in `schema_json`. Templates can be listed, edited, and deleted |
 
 Phase 6 classifies each synced Outlook or Gmail message with deterministic rules and scores it from that category, the due date, and the message text. List and detail return the score, the band, the reasons, and the extracted fields. `PATCH /messages/{id}/classification` records a user correction and re-scores. A later sync keeps each corrected field. The classifier does not call an LLM and does not write back to the mailbox. Gmail is implemented: read-only connect, encrypted refresh tokens, and the same inbox as Outlook.
 
@@ -92,11 +94,11 @@ app/
   api/users.py            GET and PATCH /users/me, including mailbox
   api/messages.py         Message list, detail, local reply drafts, and sync
   api/graph.py            POST /webhooks/graph
-  api/forms.py            Form template upload and fill jobs
+  api/forms.py            Form template library and fill jobs
   api/deps.py             Current user, database session, ARQ pool
   models/                 SQLModel tables
   services/graph/         MSAL client, token save and refresh, unsent Outlook drafts; delta client is still a seam
-  services/forms/         Template storage, fill jobs, PDF filler seam
+  services/forms/         Template storage, AcroForm schema, fill jobs, PDF filler seam
   services/llm/           LLM protocol; stub unless openai or anthropic has a key
   worker/                 ARQ settings and jobs
   storage/                Local filesystem storage, with a seam for S3/R2 later
@@ -115,8 +117,10 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 | `connected_accounts` | One active Outlook mailbox and one active Gmail mailbox: encrypted tokens, and Graph fields when the provider is Microsoft |
 | `messages`           | A synced message (`graph_id`, subject, preview, received time, priority score, band, reasons, and classification fields). Sync fills those with the rule classifier and scorer |
 | `reply_drafts`       | One local reply per message: status, body, source, Outlook draft id, and error. Deleting the message or the user deletes the row |
-| `form_templates`     | An uploaded PDF: storage key, tags, and a `schema_json` field map (still empty) |
+| `form_templates`     | An uploaded PDF: storage key, tags, description, and `schema_json` (`kind` plus AcroForm fields). A row stored as `{}` reads as kind `none` |
 | `form_fill_jobs`     | One fill attempt: status, extracted values, confidence, error, filled-file path |
+
+`schema_json` is written on upload. `kind` is `acroform` when the PDF has AcroForm fields and `none` when it does not. Each field is `name`, `type` (`text`, `checkbox`, `choice`, or `other`), and `options`. `label` is present only after a PATCH sets it. An XFA-only file with no AcroForm fields is kind `none`.
 
 `form_fill_jobs.status` is a string (`pending`, `running`, `needs_review`, `completed`, `failed`), not a Postgres enum, so adding a status later is a normal migration.
 
@@ -152,7 +156,11 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `PATCH /messages/{id}/classification` | yes | Correct the category or an extracted field, log the change, and re-score. Another user's message is `404` |
 | `POST /messages/sync`        | yes  | `202` with `enqueued` and `sync_status`, `404` when no mailbox is connected, `503` when the queue rejects the job |
 | `POST /webhooks/graph`       | no   | Graph subscription handshake, or enqueue `sync_mailbox_delta` |
-| `POST /forms/templates`      | yes  | Upload a PDF template (`application/pdf` only) |
+| `POST /forms/templates`      | yes  | Upload a PDF. `415` for any other type, `413` when the body is over 10 MB, `422` when the PDF cannot be read. The response adds `kind` and `field_count` |
+| `GET /forms/templates`       | yes  | Newest first. Each item is `id`, `filename`, `mime_type`, `tags`, `description`, `kind`, `field_count`, and `created_at` |
+| `GET /forms/templates/{id}`  | yes  | The list item plus `schema`. Another user's id is `404` with detail `Form template not found.` |
+| `PATCH /forms/templates/{id}` | yes | Replace `tags` and `description`, and set `field_labels` on fields that already exist |
+| `DELETE /forms/templates/{id}` | yes | `204`. Deletes the stored file and the row. Fill jobs that reference the template are removed with it |
 | `POST /forms/jobs`           | yes  | Create a pending fill job and enqueue `match_form_template` |
 | `GET /forms/jobs/{job_id}`   | yes  | Status, confidence, error, and extracted values |
 
@@ -481,7 +489,7 @@ Check a test user against `https://redocu.app` only after the Render service has
 
 ## Tests
 
-The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, logout, per-user isolation, token encryption, the mailbox and OAuth rules, sync status, and plain-text message fields. Microsoft, Google, Graph, Gmail, and LLM calls are mocked or not made. A green suite is not a production connect.
+The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, logout, per-user isolation, token encryption, the mailbox and OAuth rules, sync status, plain-text message fields, and the form library. Microsoft, Google, Graph, Gmail, and LLM calls are mocked or not made. A green suite is not a production connect.
 
 ```bash
 docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pytest"
@@ -489,4 +497,4 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ## Not built yet
 
-Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). Writing PDF fields into `schema_json` and filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`). `openai` and `anthropic` run only when that provider's API key is set. A missing key stays on the stub. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Sending mail is not implemented. The Outlook draft route creates or updates an unsent draft and does not call send. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.
+Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). Filling a PDF (`PdfFormFiller.fill` raises `NotImplementedError`) and matching a template (`match_form_template` logs a TODO) are still open. `openai` and `anthropic` run only when that provider's API key is set. A missing key stays on the stub. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Sending mail is not implemented. The Outlook draft route creates or updates an unsent draft and does not call send. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.
