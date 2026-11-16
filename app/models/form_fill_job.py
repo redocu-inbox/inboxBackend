@@ -22,7 +22,9 @@ class FormFillJob(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     user_id: UUID = Field(foreign_key="users.id", index=True, ondelete="CASCADE")
-    template_id: UUID = Field(foreign_key="form_templates.id", index=True, ondelete="CASCADE")
+    template_id: UUID | None = Field(
+        default=None, foreign_key="form_templates.id", index=True, ondelete="CASCADE"
+    )
     message_id: UUID | None = Field(default=None, foreign_key="messages.id", index=True, ondelete="SET NULL")
     # Plain string, not a Postgres ENUM, adding a status later stays a normal migration.
     status: FormFillStatus = Field(

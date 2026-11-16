@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     # {frontend_url}/inbox. Override with FRONTEND_URL.
     frontend_url: str = "http://localhost:5173"
 
+    # When false, a mailbox sync does not enqueue form matching. Matching
+    # starts from POST /forms/jobs. Turning this on is a later change.
+    form_match_on_sync: bool = False
+
     # stub for now. Later values: openai, anthropic.
     llm_provider: str = "stub"
     llm_model: str = ""

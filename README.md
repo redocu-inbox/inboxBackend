@@ -1,6 +1,6 @@
 # Inbox API
 
-Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Through phase 9A, accounts can register and log in, connect an Outlook or Gmail mailbox, sync recent messages, and read a rule-based category and priority score. A message can hold a local reply draft, and an Outlook draft can be saved unsent. The worker also syncs each connected mailbox on a timer while the process is awake. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and the AcroForm fields are stored on the template. Posting field values fills that PDF, and the owner can download it. A Microsoft Graph webhook can enqueue a mailbox sync. Matching a template to a message, and calling a real LLM, are still seams. Gmail access is read-only.
+Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. Through phase 9B, accounts can register and log in, connect an Outlook or Gmail mailbox, sync recent messages, and read a rule-based category and priority score. A message can hold a local reply draft, and an Outlook draft can be saved unsent. The worker also syncs each connected mailbox on a timer while the process is awake. Milestone F is the frontend connection: a Vite app can start Microsoft or Google login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list. PDF form templates can be uploaded, and the AcroForm fields are stored on the template. Posting field values fills that PDF, and the owner can download it. A job without values matches one of that user's templates from the message text and asks the model for field values. With no model key, that job stops for review and stores no PDF. A Microsoft Graph webhook can enqueue a mailbox sync. Suggesting the form on the message, and attaching the PDF to an Outlook draft, come later. Gmail access is read-only.
 
 You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or another Docker engine with Compose v2). You do not need a local Python install to run the stack.
 
@@ -19,7 +19,8 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | Gmail | Read-only Gmail connect (`/auth/google/start`, callback, disconnect). One Outlook mailbox and one Gmail mailbox can both stay connected, and `GET /messages` lists both |
 | 7 | Local reply drafts, including an unsent Outlook push. A Gmail message is not pushed |
 | 8 | Form library: an upload stores AcroForm fields in `schema_json`. Templates can be listed, edited, and deleted |
-| 9A | Fill an AcroForm from known values. The owner downloads the PDF. Matching a template is still later |
+| 9A | Fill an AcroForm from known values. The owner downloads the PDF |
+| 9B | On-demand match: the message text picks a template, and a JSON extraction fills it. The stub stops for review |
 
 Phase 6 classifies each synced Outlook or Gmail message with deterministic rules and scores it from that category, the due date, and the message text. List and detail return the score, the band, the reasons, and the extracted fields. `PATCH /messages/{id}/classification` records a user correction and re-scores. A later sync keeps each corrected field. The classifier does not call an LLM and does not write back to the mailbox. Gmail is implemented: read-only connect, encrypted refresh tokens, and the same inbox as Outlook.
 
@@ -99,7 +100,7 @@ app/
   api/deps.py             Current user, database session, ARQ pool
   models/                 SQLModel tables
   services/graph/         MSAL client, token save and refresh, unsent Outlook drafts; delta client is still a seam
-  services/forms/         Template storage, AcroForm schema, fill jobs, and PDF filling
+  services/forms/         Template storage, AcroForm schema, matching, fill jobs, and PDF filling
   services/llm/           LLM protocol; stub unless openai or anthropic has a key
   worker/                 ARQ settings and jobs
   storage/                Local filesystem storage, with a seam for S3/R2 later
@@ -119,7 +120,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 | `messages`           | A synced message (`graph_id`, subject, preview, received time, priority score, band, reasons, and classification fields). Sync fills those with the rule classifier and scorer |
 | `reply_drafts`       | One local reply per message: status, body, source, Outlook draft id, and error. Deleting the message or the user deletes the row |
 | `form_templates`     | An uploaded PDF: storage key, tags, description, and `schema_json` (`kind` plus AcroForm fields). A row stored as `{}` reads as kind `none` |
-| `form_fill_jobs`     | One fill attempt: status, extracted values, dropped field names, confidence, error, and the filled-file path |
+| `form_fill_jobs`     | One fill attempt: optional template, status, extracted values, dropped field names, confidence, error, and the filled-file path |
 
 `schema_json` is written on upload. `kind` is `acroform` when the PDF has AcroForm fields and `none` when it does not. Each field is `name`, `type` (`text`, `checkbox`, `choice`, or `other`), and `options`. `label` is present only after a PATCH sets it. An XFA-only file with no AcroForm fields is kind `none`.
 
@@ -162,7 +163,7 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /forms/templates/{id}`  | yes  | The list item plus `schema`. Another user's id is `404` with detail `Form template not found.` |
 | `PATCH /forms/templates/{id}` | yes | Replace `tags` and `description`, and set `field_labels` on fields that already exist |
 | `DELETE /forms/templates/{id}` | yes | `204`. Deletes the stored file and the row. Fill jobs that reference the template are removed with it |
-| `POST /forms/jobs`           | yes  | Create a pending fill job. With `values`, save them, set confidence to `1.0`, and enqueue `run_form_fill`. Without `values`, enqueue `match_form_template`. The response is `id` and `status` |
+| `POST /forms/jobs`           | yes  | Create a pending fill job. With `values`, `template_id` is required, confidence is `1.0`, and the job is `run_form_fill`. Without `values`, `message_id` is required, `template_id` is optional, and the job is `match_form_template`. Omitting both `values` and `message_id` is `422`. The response is `id` and `status` |
 | `GET /forms/jobs/{job_id}`   | yes  | `id`, `template_id`, `message_id`, `status`, `confidence`, `extracted_values`, `dropped_fields`, `error`, and `file_ready`. Another user's id is `404` |
 | `GET /forms/jobs/{job_id}/file` | yes | The filled PDF, or `404` when it is not ready or the job is not theirs |
 | `POST /forms/jobs/{job_id}/refill` | yes | Replace `extracted_values`, set `pending`, and enqueue `run_form_fill` |
@@ -181,7 +182,7 @@ ARQ job names are the function names in `app/worker/tasks.py`.
 | `sync_mailbox_delta`        | `GET /auth/microsoft/callback`, `GET /auth/google/callback`, and `POST /messages/sync` (account id), and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, lists recent messages, upserts them, then classifies and scores each saved row. Google rows use Gmail, not Graph |
 | `rescore_mailbox_priority`  | worker startup, once per connected mailbox | Classifies and scores messages already stored for one mailbox. It does not call Graph or Gmail and does not change sync status |
 | `send_password_reset`       | `POST /auth/forgot-password` (user id and request id only) | Creates a reset code, stores its hash, and sends the link. The code is not a job argument |
-| `match_form_template`       | `POST /forms/jobs` when `values` is omitted | Sets the job to `running`, then logs a TODO. It does not call the LLM |
+| `match_form_template`       | `POST /forms/jobs` when `values` is omitted | Scores that user's AcroForm templates, or uses the template the request already set. A JSON object of field values is saved and `run_form_fill` is enqueued. The stub, and any reply that is not a JSON object, finishes `needs_review` with confidence `0` and no file. A missing model key stays on the stub. It does not call Graph or Gmail |
 | `run_form_fill`             | `POST /forms/jobs` when `values` is sent, and `POST /forms/jobs/{id}/refill` | Writes the saved values into the AcroForm and stores `forms/{user_id}/{job_id}/filled.pdf`. A template with no fillable fields fails. An empty value map finishes `needs_review` and stores no file |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Logs a TODO |
 | `generate_reply_draft`      | `POST /messages/{id}/draft` | Writes the local reply body. The stub stores a fixed sentence. A configured provider stores the model text. It does not call Graph |
@@ -247,6 +248,7 @@ The chain is:
 9. `d9a7c4e16f32` — `message_classification_corrections`, the log of user corrections
 10. `d28d17cb4c64` — `reply_drafts`, one local reply per message
 11. `e7b1c4a92d50` — `dropped_fields` on `form_fill_jobs`, a JSON array of names the filler did not write
+12. `a4c9e2b71d08` — `form_fill_jobs.template_id` may be null until a match chooses a template
 
 `b7d3e9a41c20` does not delete messages or tokens. If a user already has more than one Microsoft row, the one with the latest `updated_at` (then the greatest `id`) stays active. The others get `disconnected_at` set and stay in the database with their tokens and mail. The API hides those rows until that same Microsoft account is connected again. An explicit disconnect is different: it clears tokens and the delta link, and it keeps the messages. `e4c1a9b82d30` added one active row per user. `f5a2c8d14e60` drops that limit and keeps one active Outlook mailbox and one active Gmail mailbox. Mail from both is listed together.
 
@@ -493,7 +495,7 @@ Check a test user against `https://redocu.app` only after the Render service has
 
 ## Tests
 
-The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, logout, per-user isolation, token encryption, the mailbox and OAuth rules, sync status, plain-text message fields, the form library, and PDF fill. Microsoft, Google, Graph, Gmail, and LLM calls are mocked or not made. A green suite is not a production connect.
+The suite creates and uses a separate `inbox_test` database, so your dev data is not touched. It migrates that database from the Alembic chain, then covers registration and login, logout, per-user isolation, token encryption, the mailbox and OAuth rules, sync status, plain-text message fields, the form library, PDF fill, and on-demand form match. Microsoft, Google, Graph, Gmail, and LLM calls are mocked or not made. A green suite is not a production connect.
 
 ```bash
 docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pytest"
@@ -501,4 +503,4 @@ docker compose run --rm api sh -c "pip install -q -r requirements-dev.txt && pyt
 
 ## Not built yet
 
-Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). Matching a template (`match_form_template` logs a TODO) is still open. A job created with `values` fills the AcroForm and does not call a model. `openai` and `anthropic` run only when that provider's API key is set. A missing key stays on the stub. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Sending mail is not implemented. The Outlook draft route creates or updates an unsent draft and does not call send. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.
+Delta-link sync: `GraphClient.sync_inbox_delta` raises `NotImplementedError`. The worker lists recent messages and leaves `delta_link` unset. Creating a Graph subscription, and renewing one (`renew_graph_subscriptions` logs a TODO). `graph_subscription_id` and `graph_subscription_expires_at` stay unset, so a webhook notification still has no mailbox to load unless something else wrote the subscription id. Passwordless Microsoft or Google sign-in (an account with a null `hashed_password` still cannot log in). A job created with `values` fills the AcroForm and does not call a model. A job created from a message matches a template in the worker. `FORM_MATCH_ON_SYNC` defaults to off, so a mailbox sync does not enqueue that match. `suggested_form` stays null until a later phase. `openai` and `anthropic` run only when that provider's API key is set. A missing key stays on the stub. Microsoft disconnect does not revoke the Microsoft grant remotely. Gmail disconnect does. Sending mail is not implemented. The Outlook draft route creates or updates an unsent draft and does not call send. The classification contract is [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md). Gmail connect is read-only and does not send, modify, or delete mail.

@@ -99,7 +99,11 @@ def test_me_returns_the_callers_own_profile(client, ana, bob):
 
 def test_cannot_read_another_users_job(client, ana, bob):
     template_id = _upload_template(client, ana)
-    job = client.post("/forms/jobs", headers=ana, json={"template_id": template_id}).json()
+    job = client.post(
+        "/forms/jobs",
+        headers=ana,
+        json={"template_id": template_id, "values": {"Name": "Ada"}},
+    ).json()
 
     assert client.get(f"/forms/jobs/{job['id']}", headers=ana).status_code == 200
     assert client.get(f"/forms/jobs/{job['id']}", headers=bob).status_code == 404
@@ -107,7 +111,11 @@ def test_cannot_read_another_users_job(client, ana, bob):
 
 def test_cannot_use_another_users_template(client, ana, bob):
     template_id = _upload_template(client, ana)
-    response = client.post("/forms/jobs", headers=bob, json={"template_id": template_id})
+    response = client.post(
+        "/forms/jobs",
+        headers=bob,
+        json={"template_id": template_id, "values": {"Name": "Ada"}},
+    )
     assert response.status_code == 404
 
 
