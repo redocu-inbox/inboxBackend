@@ -11,7 +11,7 @@ from sqlmodel import Session
 from app.db import engine
 from app.models.form_fill_job import FormFillJob
 from app.services.forms.filler import PdfFormFiller
-from app.worker.tasks import run_form_fill
+from app.worker.form_tasks import run_form_fill
 from tests.pdf_fixtures import (
     blank_pdf_bytes,
     checkbox_field_pdf_bytes,

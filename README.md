@@ -102,7 +102,7 @@ app/
   services/graph/         MSAL client, token save and refresh, unsent Outlook drafts; delta client is still a seam
   services/forms/         Template storage, AcroForm schema, matching, fill jobs, and PDF filling
   services/llm/           LLM protocol; stub unless openai or anthropic has a key
-  worker/                 ARQ settings and jobs
+  worker/                 ARQ settings. Mail jobs, form jobs, and the remaining jobs are separate modules
   storage/                Local filesystem storage, with a seam for S3/R2 later
 alembic/                  Schema migrations
 docker/postgres/          Enables the vector extension on first database create
@@ -174,7 +174,7 @@ Graph sends `validationToken` when a subscription is created. The webhook answer
 
 ## Background jobs
 
-ARQ job names are the function names in `app/worker/tasks.py`.
+ARQ job names are the function names. Mail jobs are in `app/worker/mail_tasks.py`, form jobs are in `app/worker/form_tasks.py`, and `heartbeat` and `send_password_reset` stay in `app/worker/tasks.py`.
 
 | Job                         | Started by | What it does today |
 | --------------------------- | ---------- | ------------------ |

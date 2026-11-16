@@ -29,7 +29,7 @@ from app.services.mailboxes import (
     SYNC_STALE_AFTER,
     deactivate_extra_microsoft_mailboxes,
 )
-from app.worker.tasks import graph_message_fields, sync_mailbox_delta
+from app.worker.mail_tasks import graph_message_fields, sync_mailbox_delta
 from tests.test_frontend_connect import _Msal, _add_account, _add_message, _patch_redis, _user_id
 
 HTML_BODY = "<html><body><p>Hello</p><script>alert(1)</script><style>p{}</style></body></html>"
@@ -285,10 +285,10 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
     def _forbid(*args, **kwargs):
         raise AssertionError("Google token was sent to Graph")
 
-    monkeypatch.setattr("app.worker.tasks._graph_get", _forbid)
-    monkeypatch.setattr("app.worker.tasks.refresh_access_token", _forbid)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", _forbid)
+    monkeypatch.setattr("app.worker.mail_tasks.refresh_access_token", _forbid)
     monkeypatch.setattr(
-        "app.worker.tasks.collect_gmail_messages",
+        "app.worker.mail_tasks.collect_gmail_messages",
         lambda token: [_gmail_item(message_id="gmail-1", unread=True), _gmail_item(message_id="gmail-2", unread=False)],
     )
     _run_sync(str(account_id), 2)
@@ -322,7 +322,7 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
         lambda refresh_token: (_ for _ in ()).throw(TokenRefreshError("invalid_grant")),
     )
     monkeypatch.setattr(
-        "app.worker.tasks.collect_gmail_messages",
+        "app.worker.mail_tasks.collect_gmail_messages",
         lambda token: (_ for _ in ()).throw(AssertionError("list after invalid_grant")),
     )
     with Session(engine) as session:
@@ -349,7 +349,7 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
         assert token == "new-access"
         return [_gmail_item(message_id="gmail-1", unread=False)]
 
-    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", _unauthorized_once)
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", _unauthorized_once)
     monkeypatch.setattr(
         "app.services.google.tokens.exchange_refresh_token",
         lambda refresh_token: {"access_token": "new-access", "expires_in": 3600},
@@ -376,7 +376,7 @@ def test_gmail_sync_maps_mail_without_calling_graph(client, register_user, monke
         lambda refresh_token: (_ for _ in ()).throw(GoogleTokenUnavailable()),
     )
     monkeypatch.setattr(
-        "app.worker.tasks.collect_gmail_messages",
+        "app.worker.mail_tasks.collect_gmail_messages",
         lambda token: (_ for _ in ()).throw(AssertionError("list during google outage")),
     )
     with Session(engine) as session:
@@ -585,7 +585,7 @@ def test_sync_success_failure_and_superseded_generation(client, register_user, m
         account_id = str(account.id)
 
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {"value": [GRAPH_ITEM]},
     )
     _run_sync(account_id, 1)
@@ -624,7 +624,7 @@ def test_sync_success_failure_and_superseded_generation(client, register_user, m
     assert me["sync"]["last_successful_at"] is not None
 
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: (_ for _ in ()).throw(OSError("graph down")),
     )
     with Session(engine) as session:
@@ -726,7 +726,7 @@ def test_disconnect_hides_mail_blocks_jobs_and_reconnects_same_account(client, r
             disconnect_active_mailbox(session, UUID(user_id))
         return {"value": [GRAPH_ITEM]}
 
-    monkeypatch.setattr("app.worker.tasks._graph_get", graph_get)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", graph_get)
     _run_sync(account_id, 4)
     assert calls["graph"] == 1
     with Session(engine) as session:

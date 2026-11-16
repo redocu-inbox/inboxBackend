@@ -14,18 +14,16 @@ from arq.connections import RedisSettings
 
 from app.config import get_settings
 from app.logging_config import setup_logging
-from app.worker.tasks import (
+from app.worker.form_tasks import match_form_template, run_form_fill
+from app.worker.mail_tasks import (
     generate_reply_draft,
-    heartbeat,
-    match_form_template,
     renew_graph_subscriptions,
     rescore_connected_mailboxes,
     rescore_mailbox_priority,
-    run_form_fill,
-    send_password_reset,
     sync_connected_mailboxes,
     sync_mailbox_delta,
 )
+from app.worker.tasks import heartbeat, send_password_reset
 
 logger = logging.getLogger(__name__)
 

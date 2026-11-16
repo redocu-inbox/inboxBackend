@@ -23,9 +23,8 @@ from app.services.forms.match import (
     template_tokens,
     tokens,
 )
-from app.worker.tasks import sync_mailbox_delta
-from app.worker.tasks import match_form_template
-from app.worker.tasks import run_form_fill
+from app.worker.form_tasks import match_form_template, run_form_fill
+from app.worker.mail_tasks import sync_mailbox_delta
 from tests.pdf_fixtures import blank_pdf_bytes, text_field_pdf_bytes
 
 _SAFETY = "safety-inspection-report"
@@ -330,12 +329,12 @@ def test_sync_does_not_enqueue_a_match(client, register_user, monkeypatch):
         seen.append((ctx.get("redis"), account_id))
         real(ctx, account_id)
 
-    monkeypatch.setattr("app.worker.tasks.consider_form_match_on_sync", _spy)
+    monkeypatch.setattr("app.worker.mail_tasks.consider_form_match_on_sync", _spy)
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {"value": []},
     )
-    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", lambda token: [])
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", lambda token: [])
 
     def _account(provider):
         with Session(engine) as session:

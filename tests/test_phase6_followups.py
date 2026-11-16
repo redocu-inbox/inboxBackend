@@ -18,7 +18,7 @@ from app.services.priority.apply import classify_and_score
 from app.services.priority.classify import classify, event_dates
 from app.services.priority.score import score
 from app.worker.settings import mailbox_sync_minutes
-from app.worker.tasks import sync_connected_mailboxes
+from app.worker.mail_tasks import sync_connected_mailboxes
 from tests.test_frontend_connect import _user_id
 from tests.test_mailbox_reliability import GRAPH_ITEM, _future
 from tests.test_phase6_rules import _account
@@ -36,7 +36,7 @@ def _no_model_or_provider_call(monkeypatch):
         raise AssertionError("phase 6 rules must not call a provider or a model")
 
     monkeypatch.setattr("app.services.llm.factory.get_llm", _forbid)
-    monkeypatch.setattr("app.worker.tasks._graph_get", _forbid)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", _forbid)
     monkeypatch.setattr("app.services.google.http.google_get", _forbid)
 
 
@@ -428,18 +428,18 @@ def test_periodic_sync_skips_in_progress_and_isolates_provider_errors(
         gone_id = gone.id
 
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {"value": [GRAPH_ITEM]},
     )
     def _gmail_403(token):
         raise GmailRequestError(403)
 
-    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", _gmail_403)
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", _gmail_403)
 
     def _refresh_fails(session, account, generation=None):
         raise TokenRefreshError("token_refresh_failed")
 
-    monkeypatch.setattr("app.worker.tasks.refresh_access_token", _refresh_fails)
+    monkeypatch.setattr("app.worker.mail_tasks.refresh_access_token", _refresh_fails)
     result = asyncio.run(sync_connected_mailboxes({"job_id": "cron-1"}))
 
     assert result["ran"] == 3
@@ -499,7 +499,7 @@ def test_periodic_sync_continues_when_one_account_raises(client, register_user, 
             return None
         raise TokenRefreshError("token_refresh_failed")
 
-    monkeypatch.setattr("app.worker.tasks.sync_mailbox_delta", _sync)
+    monkeypatch.setattr("app.worker.mail_tasks.sync_mailbox_delta", _sync)
     result = asyncio.run(sync_connected_mailboxes({"job_id": "cron-2"}))
     assert set(calls) == {good_id, bad_id}
     assert busy_id not in calls
@@ -524,7 +524,7 @@ def test_periodic_sync_can_be_disabled(client, register_user, monkeypatch):
     def _forbid_sync(*args, **kwargs):
         raise AssertionError("disabled cron must not sync")
 
-    monkeypatch.setattr("app.worker.tasks.sync_mailbox_delta", _forbid_sync)
+    monkeypatch.setattr("app.worker.mail_tasks.sync_mailbox_delta", _forbid_sync)
     result = asyncio.run(sync_connected_mailboxes({"job_id": "cron-off"}))
     assert result == {"ran": 0, "skipped": 0, "errors": 0}
     with Session(engine) as session:

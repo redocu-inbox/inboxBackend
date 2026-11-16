@@ -11,7 +11,7 @@ from app.db import engine
 from app.models.classification_correction import MessageClassificationCorrection
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
-from app.worker.tasks import rescore_mailbox_priority, sync_mailbox_delta
+from app.worker.mail_tasks import rescore_mailbox_priority, sync_mailbox_delta
 from tests.test_frontend_connect import LIST_KEYS, _add_account, _add_message, _user_id
 
 FIXED = datetime(2026, 11, 9, 18, 0, tzinfo=timezone.utc)
@@ -24,7 +24,7 @@ def _no_provider_or_model(monkeypatch):
         raise AssertionError("correction must not call a provider or a model")
 
     monkeypatch.setattr("app.services.llm.factory.get_llm", _forbid)
-    monkeypatch.setattr("app.worker.tasks._graph_get", _forbid)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", _forbid)
     monkeypatch.setattr("app.services.google.http.google_get", _forbid)
     monkeypatch.setattr("app.api.messages.utcnow", lambda: FIXED)
 
@@ -287,7 +287,7 @@ def test_later_sync_keeps_corrected_fields_and_refreshes_the_rest(client, regist
         session.commit()
 
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {
             "value": [
                 {
