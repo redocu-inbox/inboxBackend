@@ -49,7 +49,7 @@ Only `priority_score` exists on `messages`. It is a nullable float with index `i
 
 `sort=priority` is already `priority_score DESC NULLS LAST`, then `received_at DESC`. Keep that order.
 
-The worker job `sync_mailbox_delta` (`app/worker/tasks.py`) upserts by `(connected_account_id, graph_id)` through `_upsert_message`. Microsoft and Google each have their own loop and their own commit. Both loops call `_upsert_message`. `_upsert_message` returns `None` today. A mapped item that the provider mapper rejects is skipped and is not classified.
+The worker job `sync_mailbox_delta` (`app/worker/mail_tasks.py`) upserts by `(connected_account_id, graph_id)` through `_upsert_message`. Microsoft and Google each have their own loop and their own commit. Both loops call `_upsert_message`. `_upsert_message` returns `None` today. A mapped item that the provider mapper rejects is skipped and is not classified.
 
 The Graph call is:
 
@@ -512,7 +512,7 @@ A user correction to `meeting_notes` removes the category reason and leaves keyw
 
 ## Test plan
 
-Use fixture dicts and a fixed `now` of `2026-11-09T18:00:00Z`. Do not call Graph, Gmail, `urlopen`, or `get_llm`. The pure functions need no database. Patch `app.services.llm.factory.get_llm` so a call fails the test. The re-score job and the pure functions also fail the test if they call `app.worker.tasks._graph_get` or the Gmail HTTP helper.
+Use fixture dicts and a fixed `now` of `2026-11-09T18:00:00Z`. Do not call Graph, Gmail, `urlopen`, or `get_llm`. The pure functions need no database. Patch `app.services.llm.factory.get_llm` so a call fails the test. The re-score job and the pure functions also fail the test if they call `app.worker.mail_tasks._graph_get` or the Gmail HTTP helper.
 
 `sync_mailbox_delta` may still call the existing provider fakes. It must not call `get_llm`.
 

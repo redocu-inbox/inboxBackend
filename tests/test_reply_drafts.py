@@ -20,7 +20,7 @@ from app.services.llm.providers import AnthropicClient, OpenAIClient, _anthropic
 from app.services.llm.stub import StubLLM
 from app.services.reply_drafts.generation import STUB_REPLY_SENTENCE, final_reply_body
 from app.worker.settings import WorkerSettings
-from app.worker.tasks import generate_reply_draft
+from app.worker.mail_tasks import generate_reply_draft
 from tests.test_frontend_connect import DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 _CONTRACT = {
@@ -194,9 +194,9 @@ def test_generate_reply_draft_stores_the_stub_sentence_outside_the_session(
     def refuse_graph(*_args, **_kwargs):
         raise AssertionError("generate_reply_draft called Graph")
 
-    monkeypatch.setattr("app.worker.tasks.Session", CountingSession)
-    monkeypatch.setattr("app.worker.tasks.build_reply_prompts", prompts)
-    monkeypatch.setattr("app.worker.tasks.get_llm", wrapped_get_llm)
+    monkeypatch.setattr("app.worker.mail_tasks.Session", CountingSession)
+    monkeypatch.setattr("app.worker.mail_tasks.build_reply_prompts", prompts)
+    monkeypatch.setattr("app.worker.mail_tasks.get_llm", wrapped_get_llm)
     monkeypatch.setattr("app.services.graph.drafts._graph_request", refuse_graph)
 
     asyncio.run(generate_reply_draft({"job_id": "draft-1"}, message_id))

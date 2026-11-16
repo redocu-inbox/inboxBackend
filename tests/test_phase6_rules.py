@@ -17,7 +17,7 @@ from app.services.priority.apply import classify_and_score
 from app.services.priority.classify import classify
 from app.services.priority.score import score
 from app.worker.settings import WorkerSettings, startup
-from app.worker.tasks import rescore_connected_mailboxes, rescore_mailbox_priority, sync_mailbox_delta
+from app.worker.mail_tasks import rescore_connected_mailboxes, rescore_mailbox_priority, sync_mailbox_delta
 from tests.test_frontend_connect import _user_id
 from tests.test_mailbox_reliability import GRAPH_ITEM, _future, _gmail_item, _run_sync
 
@@ -48,7 +48,7 @@ def _no_model_or_provider_call(monkeypatch):
         raise AssertionError("phase 6 rules must not call a provider or a model")
 
     monkeypatch.setattr("app.services.llm.factory.get_llm", _forbid)
-    monkeypatch.setattr("app.worker.tasks._graph_get", _forbid)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", _forbid)
     monkeypatch.setattr("app.services.google.http.google_get", _forbid)
 
 
@@ -542,10 +542,10 @@ def test_second_upsert_replaces_classification_for_outlook_and_gmail(client, reg
         outlook_id = str(outlook.id)
         gmail_id = str(gmail.id)
 
-    monkeypatch.setattr("app.worker.tasks._graph_get", lambda url, token: {"value": [GRAPH_ITEM]})
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", lambda url, token: {"value": [GRAPH_ITEM]})
     _run_sync(outlook_id, 1)
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {"value": [{**GRAPH_ITEM, "subject": "RFI 12 door hardware"}]},
     )
     _run_sync(outlook_id, 1)
@@ -559,10 +559,10 @@ def test_second_upsert_replaces_classification_for_outlook_and_gmail(client, reg
         assert rows[0].priority_score == 40.0
 
     item = _gmail_item(message_id="gmail-1", unread=True)
-    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", lambda token: [item])
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", lambda token: [item])
     _run_sync(gmail_id, 1)
     item["payload"]["headers"][0]["value"] = "Submittal for curtain wall"
-    monkeypatch.setattr("app.worker.tasks.collect_gmail_messages", lambda token: [item])
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", lambda token: [item])
     _run_sync(gmail_id, 1)
     with Session(engine) as session:
         rows = session.exec(
@@ -603,7 +603,7 @@ def test_classifier_and_scorer_failures_still_finish_sync_idle(client, register_
         raise RuntimeError("classifier bug")
 
     monkeypatch.setattr("app.services.priority.apply.classify", _boom)
-    monkeypatch.setattr("app.worker.tasks._graph_get", lambda url, token: {"value": [GRAPH_ITEM]})
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", lambda url, token: {"value": [GRAPH_ITEM]})
     _run_sync(str(account_id), 1)
     with Session(engine) as session:
         row = session.exec(select(Message)).one()
@@ -628,7 +628,7 @@ def test_classifier_and_scorer_failures_still_finish_sync_idle(client, register_
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scorer bug")),
     )
     monkeypatch.setattr(
-        "app.worker.tasks._graph_get",
+        "app.worker.mail_tasks._graph_get",
         lambda url, token: {"value": [{**GRAPH_ITEM, "id": "graph-new", "subject": "RFI 9"}]},
     )
     _run_sync(str(account_id), 1)
@@ -867,7 +867,7 @@ def test_startup_rescore_continues_after_one_mailbox_fails(client, register_user
             raise RuntimeError("rescore failed")
         return await original(ctx, account_id)
 
-    monkeypatch.setattr("app.worker.tasks.rescore_mailbox_priority", flaky)
+    monkeypatch.setattr("app.worker.mail_tasks.rescore_mailbox_priority", flaky)
     assert asyncio.run(rescore_connected_mailboxes({})) == (1, 1)
     assert (
         f"priority rescore on startup failed account={outlook_id} error_type=RuntimeError"
@@ -892,7 +892,7 @@ def test_startup_rescore_logs_and_returns_when_listing_fails(monkeypatch, app_lo
     def boom(*args, **kwargs):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr("app.worker.tasks.Session", boom)
+    monkeypatch.setattr("app.worker.mail_tasks.Session", boom)
     assert asyncio.run(rescore_connected_mailboxes({})) == (0, 0)
     assert "priority rescore on startup failed error_type=RuntimeError" in app_logs.text
     assert "priority rescore on startup finished" not in app_logs.text
@@ -915,7 +915,7 @@ def test_rescore_on_startup_can_be_turned_off(client, register_user, monkeypatch
     def boom(*args, **kwargs):
         raise AssertionError("disabled rescore must not open a session")
 
-    monkeypatch.setattr("app.worker.tasks.Session", boom)
+    monkeypatch.setattr("app.worker.mail_tasks.Session", boom)
     assert asyncio.run(rescore_connected_mailboxes({})) == (0, 0)
     assert "priority rescore on startup skipped" in app_logs.text
     with Session(engine) as session:
