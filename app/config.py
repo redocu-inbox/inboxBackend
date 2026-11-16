@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     graph_redirect_uri: str = ""
     # Shared secret Graph echoes on each webhook notification.
     graph_webhook_client_state: str = ""
+    # Public URL Graph calls when mail changes. Empty skips creating a subscription.
+    graph_webhook_url: str = ""
 
     # Google OAuth2 app used to connect a mailbox and list recent messages.
     google_client_id: str = ""

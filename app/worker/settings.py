@@ -37,7 +37,7 @@ def mailbox_sync_minutes(interval: int) -> set[int]:
 
 def _cron_jobs() -> list:
     settings = get_settings()
-    jobs = [cron(renew_graph_subscriptions, hour={0, 12}, minute=0)]
+    jobs = [cron(renew_graph_subscriptions, hour={0, 12}, minute=0, max_tries=3)]
     if settings.periodic_mailbox_sync:
         jobs.append(
             cron(
