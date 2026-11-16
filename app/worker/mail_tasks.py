@@ -5,8 +5,9 @@ ARQ passes in. Further arguments are strings. Form jobs live in form_tasks.
 """
 import json
 import logging
+import time
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 
 from sqlmodel import Session, select
@@ -25,7 +26,14 @@ from app.services.google.messages import (
     gmail_message_fields,
 )
 from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_access_token
+from app.services.graph.client import GraphClient
 from app.services.graph.html_text import to_plain_text
+from app.services.graph.subscriptions import (
+    GraphSubscriptionError,
+    create_graph_subscription,
+    renew_graph_subscription,
+    retry_after_seconds,
+)
 from app.services.graph.tokens import (
     MailboxNotWritable,
     TokenRefreshError,
@@ -41,13 +49,6 @@ from app.services.mailboxes import (
 from app.services.forms.match import consider_form_match_on_sync
 from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
-
-_GRAPH_HOST = "https://graph.microsoft.com/"
-_MESSAGES_URL = (
-    "https://graph.microsoft.com/v1.0/me/messages"
-    "?$select=id,subject,bodyPreview,receivedDateTime,from,isRead,body"
-    "&$top=25&$orderby=receivedDateTime%20desc"
-)
 
 def _load_account(session: Session, account_or_subscription_id: str | None) -> ConnectedAccount | None:
     """Find the mailbox by a graoh subscription id, or by its own id."""
@@ -195,21 +196,89 @@ def _mark_failed(session: Session, account_id: UUID, generation: int | None, err
     session.commit()
 
 
-def _collect_messages(access_token: str) -> list[dict]:
-    url: str | None = _MESSAGES_URL
-    pages = 0
-    items: list[dict] = []
-    while url and pages < 4:
-        if not url.startswith(_GRAPH_HOST):
-            raise ValueError("unexpected message page host")
-        payload = _graph_get(url, access_token)
-        values = payload.get("value", [])
-        if isinstance(values, list):
-            items.extend(item for item in values if isinstance(item, dict))
-        pages += 1
-        link = payload.get("@odata.nextLink")
-        url = link if isinstance(link, str) else None
-    return items
+def _delete_provider_message(session: Session, account: ConnectedAccount, graph_id: str) -> None:
+    """Delete the local row Graph marked removed. A missing row is left alone."""
+    row = session.exec(
+        select(Message).where(
+            Message.connected_account_id == account.id,
+            Message.graph_id == graph_id[:512],
+        )
+    ).first()
+    if row is not None:
+        session.delete(row)
+
+
+def _subscription_settings(account_id: UUID) -> tuple[str, str] | None:
+    """Webhook URL and client state, or None when a subscription must not be created."""
+    settings = get_settings()
+    url = settings.graph_webhook_url.strip()
+    state = settings.graph_webhook_client_state
+    if settings.app_env != "development" and not state:
+        logger.error(
+            "graph subscription refused account=%s reason=empty_client_state",
+            account_id,
+        )
+        return None
+    if not url or not state:
+        logger.info(
+            "graph subscription skipped account=%s reason=webhook_not_configured",
+            account_id,
+        )
+        return None
+    return url, state
+
+
+def _store_new_subscription(
+    session: Session,
+    account: ConnectedAccount,
+    *,
+    fail_on_rate_limit: bool,
+) -> None:
+    """POST a subscription and store its id. Sync callers do not fail the job on 429."""
+    configured = _subscription_settings(account.id)
+    if configured is None or not account.access_token:
+        return
+    url, state = configured
+    try:
+        subscription_id, expires = create_graph_subscription(
+            account.access_token,
+            notification_url=url,
+            client_state=state,
+        )
+    except GraphSubscriptionError as exc:
+        if exc.status == 429 and fail_on_rate_limit:
+            time.sleep(retry_after_seconds(exc.retry_after))
+            raise
+        logger.warning(
+            "graph subscription create failed account=%s status=%s",
+            account.id,
+            exc.status,
+        )
+        return
+    current = session.get(ConnectedAccount, account.id)
+    if current is None or current.disconnected_at is not None or current.provider != "microsoft":
+        return
+    current.graph_subscription_id = subscription_id
+    current.graph_subscription_expires_at = expires
+    current.updated_at = utcnow()
+    session.add(current)
+    session.commit()
+
+
+def _ensure_graph_subscription(session: Session, account_id: UUID) -> None:
+    """Create a subscription after a successful Outlook sync when none is stored."""
+    account = session.get(ConnectedAccount, account_id)
+    if (
+        account is None
+        or account.provider != "microsoft"
+        or account.disconnected_at is not None
+        or account.graph_subscription_id
+    ):
+        return
+    try:
+        _store_new_subscription(session, account, fail_on_rate_limit=False)
+    except GraphSubscriptionError:
+        logger.warning("graph subscription create failed account=%s status=429", account_id)
 
 
 def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None, ctx: dict) -> None:
@@ -360,7 +429,7 @@ async def sync_mailbox_delta(
                 locked = refresh_access_token(session, locked, generation=claimed)
             if locked.access_token is None:
                 raise MailboxNotWritable()
-            items = _collect_messages(locked.access_token)
+            delta = await GraphClient(locked).sync_inbox_delta(_graph_get)
         except MailboxNotWritable:
             logger.info("sync_mailbox_delta stopped account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
@@ -382,6 +451,8 @@ async def sync_mailbox_delta(
             )
             _mark_failed(session, account_id, claimed, GRAPH_UNAVAILABLE)
             return
+        if delta.truncated:
+            logger.warning("sync_mailbox_delta truncated account=%s pages=20", account_id)
 
         try:
             locked = _lock_account(session, account_id)
@@ -393,14 +464,19 @@ async def sync_mailbox_delta(
                     ctx.get("job_id"),
                 )
                 return
-            for item in items:
+            for removed_id in delta.removed_ids:
+                _delete_provider_message(session, locked, removed_id)
+            for item in delta.changed:
                 _classify_saved(session, _upsert_message(session, locked, item))
+            if delta.delta_link:
+                locked.delta_link = delta.delta_link
             locked.sync_status = "idle"
             locked.sync_error_code = None
             locked.last_sync_at = utcnow()
             locked.sync_status_at = locked.last_sync_at
             session.add(locked)
             session.commit()
+            _ensure_graph_subscription(session, locked.id)
         except Exception as exc:
             session.rollback()
             logger.warning(
@@ -502,8 +578,79 @@ async def rescore_connected_mailboxes(ctx: dict | None = None) -> tuple[int, int
 
 
 async def renew_graph_subscriptions(ctx: dict) -> None:
-    """TODO: renew subscriptions that expire within a day."""
-    logger.info("TODO renew_graph_subscriptions job_id=%s", ctx.get("job_id"))
+    """Renew Outlook subscriptions that expire within 24 hours.
+
+    A 404 creates the subscription again. A 429 waits for Retry-After once
+    and then raises so ARQ can retry. Gmail rows are not loaded. Tokens and
+    message bodies are not logged.
+    """
+    soon = utcnow() + timedelta(hours=24)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(ConnectedAccount.id).where(
+                ConnectedAccount.provider == "microsoft",
+                ConnectedAccount.disconnected_at.is_(None),
+                ConnectedAccount.graph_subscription_id.is_not(None),
+                ConnectedAccount.graph_subscription_expires_at.is_not(None),
+                ConnectedAccount.graph_subscription_expires_at <= soon,
+            )
+        ).all()
+    for account_id in rows:
+        _renew_subscription(account_id)
+    logger.info(
+        "renew_graph_subscriptions finished job_id=%s accounts=%s",
+        ctx.get("job_id"),
+        len(rows),
+    )
+
+
+def _renew_subscription(account_id: UUID) -> None:
+    with Session(engine) as session:
+        account = _lock_account(session, account_id)
+        if (
+            account is None
+            or account.provider != "microsoft"
+            or account.disconnected_at is not None
+            or not account.graph_subscription_id
+            or not account.access_token
+            or not account.refresh_token
+        ):
+            session.rollback()
+            return
+        try:
+            if needs_refresh(account):
+                account = refresh_access_token(session, account)
+        except (TokenRefreshError, MailboxNotWritable) as exc:
+            logger.warning(
+                "graph subscription refresh failed account=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            return
+        if account is None or not account.access_token or not account.graph_subscription_id:
+            return
+        try:
+            expires = renew_graph_subscription(account.access_token, account.graph_subscription_id)
+        except GraphSubscriptionError as exc:
+            if exc.status == 404:
+                _store_new_subscription(session, account, fail_on_rate_limit=True)
+                return
+            if exc.status == 429:
+                time.sleep(retry_after_seconds(exc.retry_after))
+                raise
+            logger.warning(
+                "graph subscription renew failed account=%s status=%s",
+                account_id,
+                exc.status,
+            )
+            return
+        current = session.get(ConnectedAccount, account.id)
+        if current is None or current.disconnected_at is not None:
+            return
+        current.graph_subscription_expires_at = expires
+        current.updated_at = utcnow()
+        session.add(current)
+        session.commit()
 
 
 def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
