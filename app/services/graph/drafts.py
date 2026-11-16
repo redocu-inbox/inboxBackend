@@ -1,9 +1,10 @@
 """Create or update an unsent Outlook reply draft.
 
 This module never calls `/send`. A failure raises `GraphDraftError` with a
-short code. The token and the draft text are not logged.
+short code. The token, the draft text, and attachment bytes are not logged.
 """
 
+import base64
 import json
 import logging
 from urllib.error import HTTPError, URLError
@@ -44,8 +45,22 @@ def patch_reply_draft(access_token: str, draft_id: str, body: str) -> None:
     )
 
 
+def add_file_attachment(access_token: str, draft_id: str, name: str, content: bytes) -> None:
+    """POST a fileAttachment onto an unsent draft. Does not send the message."""
+    _graph_request(
+        "POST",
+        _message_url(draft_id, "attachments"),
+        access_token,
+        {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": name,
+            "contentBytes": base64.b64encode(content).decode("ascii"),
+        },
+    )
+
+
 def _message_url(message_id: str, action: str | None) -> str:
-    if action not in {None, "createReply"}:
+    if action not in {None, "createReply", "attachments"}:
         raise GraphDraftError("refused")
     if not isinstance(message_id, str) or not message_id:
         raise GraphDraftError("invalid_message")

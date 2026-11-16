@@ -6,9 +6,10 @@ omits them. body_text is plain text, never raw HTML. Sync writes
 priority_score, priority_band, priority_reasons, and the classification
 fields. A correction leaves that field as the user saved it. A null reasons
 column is [] in JSON. user_corrected is false until a correction.
-priority_scored_at is stored and is not returned. suggested_form is null
-until a later phase. detail.draft is the local reply draft, or null.
-The list has no draft key. No message route sends mail.
+priority_scored_at is stored and is not returned. suggested_form is the
+newest needs_review or completed fill job for that message, or null.
+detail.draft is the local reply draft, or null.
+The list has no draft key and no body text. No message route sends mail.
 """
 
 import logging
@@ -28,10 +29,18 @@ from app.models.classification_correction import (
     MessageClassificationCorrection,
 )
 from app.models.connected_account import ConnectedAccount
+from app.models.form_fill_job import FormFillJob, FormFillStatus
+from app.models.form_template import FormTemplate
 from app.models.message import Message
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import User, utcnow
-from app.services.graph.drafts import GraphDraftError, create_reply_draft, patch_reply_draft
+from app.services.forms.suggest import SuggestedForm, suggested_forms_for_messages
+from app.services.graph.drafts import (
+    GraphDraftError,
+    add_file_attachment,
+    create_reply_draft,
+    patch_reply_draft,
+)
 from app.services.graph.html_text import MAX_PLAIN_TEXT_CHARS
 from app.services.graph.tokens import (
     MailboxNotWritable,
@@ -60,6 +69,16 @@ class ReplyDraftResponse(BaseModel):
     updated_at: datetime
 
 
+class SuggestedFormResponse(BaseModel):
+    """Newest fill worth showing. Rejected and in-progress jobs are omitted."""
+
+    job_id: UUID
+    template_id: UUID
+    template_filename: str
+    status: str
+    confidence: float | None = None
+
+
 class MessageResponse(BaseModel):
     id: UUID
     subject: str | None
@@ -82,7 +101,7 @@ class MessageResponse(BaseModel):
     responsible_party: str | None = None
     reference_number: str | None = None
     user_corrected: bool = False
-    suggested_form: Any | None = None
+    suggested_form: SuggestedFormResponse | None = None
 
 
 class MessageDetailResponse(MessageResponse):
@@ -184,7 +203,21 @@ def _due_date(value: date | None) -> str | None:
     return value.isoformat()
 
 
-def _message_response(row: Message, provider: str | None) -> MessageResponse:
+def _suggested_response(suggested: SuggestedForm | None) -> SuggestedFormResponse | None:
+    if suggested is None:
+        return None
+    return SuggestedFormResponse(
+        job_id=suggested.job_id,
+        template_id=suggested.template_id,
+        template_filename=suggested.template_filename,
+        status=suggested.status,
+        confidence=suggested.confidence,
+    )
+
+
+def _message_response(
+    row: Message, provider: str | None, suggested: SuggestedForm | None = None
+) -> MessageResponse:
     return MessageResponse(
         id=row.id,
         subject=row.subject,
@@ -206,6 +239,7 @@ def _message_response(row: Message, provider: str | None) -> MessageResponse:
         responsible_party=row.responsible_party,
         reference_number=row.reference_number,
         user_corrected=row.user_corrected is True,
+        suggested_form=_suggested_response(suggested),
     )
 
 
@@ -240,7 +274,8 @@ def list_messages(
         .offset(offset)
         .limit(limit)
     ).all()
-    return [_message_response(row, provider) for row, provider in rows]
+    suggestions = suggested_forms_for_messages(session, [row.id for row, _provider in rows])
+    return [_message_response(row, provider, suggestions.get(row.id)) for row, provider in rows]
 
 
 def _visible_message(
@@ -282,7 +317,8 @@ def _load_draft(session: Session, message_id: UUID) -> ReplyDraft | None:
 def _detail_response(
     session: Session, row: Message, provider: str | None
 ) -> MessageDetailResponse:
-    item = _message_response(row, provider)
+    suggested = suggested_forms_for_messages(session, [row.id]).get(row.id)
+    item = _message_response(row, provider, suggested)
     draft = _load_draft(session, row.id)
     return MessageDetailResponse(
         **item.model_dump(),
@@ -391,6 +427,22 @@ class ReplyDraftPatch(BaseModel):
         if len(text) > MAX_PLAIN_TEXT_CHARS:
             raise ValueError("too long")
         return text
+
+
+class DraftAttachmentRequest(BaseModel):
+    """Completed fill job to attach. Extra keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    form_fill_job_id: UUID
+
+
+# 3 MiB. A PDF of exactly this size is accepted. Anything larger is 409.
+_MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024
+_FORM_NOT_READY = "This form is not ready to attach."
+_FORM_OTHER_MESSAGE = "This form belongs to another message."
+_FORM_TOO_LARGE = "PDF must be 3 MB or smaller."
+_JOB_NOT_FOUND = "Fill job not found"
 
 
 def _ready_draft(draft: ReplyDraft | None) -> bool:
@@ -568,6 +620,138 @@ def push_outlook_draft(
             session.commit()
             draft = current
         patch_reply_draft(token, draft_id, text)
+    except GraphDraftError:
+        _store_outlook_error(session, draft, "outlook draft failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook draft could not be saved.",
+        ) from None
+    saved = session.get(ReplyDraft, draft.id)
+    if saved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    saved.error = None
+    saved.status = ReplyDraftStatus.ready
+    saved.updated_at = utcnow()
+    session.add(saved)
+    session.commit()
+    session.refresh(saved)
+    return _draft_response(saved)
+
+
+def _storage():
+    """Look up storage at call time so tests can replace the factory."""
+    from app.storage import get_storage
+
+    return get_storage()
+
+
+def _fill_status(value: object) -> str:
+    if isinstance(value, FormFillStatus):
+        return value.value
+    return str(value)
+
+
+def _filled_pdf(job: FormFillJob) -> bytes | None:
+    if not job.filled_file_path:
+        return None
+    try:
+        return _storage().get(job.filled_file_path)
+    except FileNotFoundError:
+        return None
+
+
+def _attachment_name(session: Session, job: FormFillJob) -> str:
+    if job.template_id is None:
+        return "filled.pdf"
+    template = session.get(FormTemplate, job.template_id)
+    if template is None or not template.filename:
+        return "filled.pdf"
+    return template.filename
+
+
+def _outlook_access_token(
+    session: Session, account: ConnectedAccount, draft: ReplyDraft, message_id: UUID
+) -> str:
+    try:
+        if needs_refresh(account):
+            account = refresh_access_token(session, account)
+    except (TokenRefreshError, MailboxNotWritable) as exc:
+        logger.warning(
+            "outlook draft refresh failed message=%s error_type=%s",
+            message_id,
+            type(exc).__name__,
+        )
+        _store_outlook_error(session, draft, "token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook token could not be refreshed.",
+        ) from exc
+    token = account.access_token
+    if not token:
+        _store_outlook_error(session, draft, "token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Outlook token could not be refreshed.",
+        )
+    return token
+
+
+@router.post("/messages/{message_id}/draft/attachments")
+def attach_filled_form(
+    message_id: UUID,
+    body: DraftAttachmentRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReplyDraftResponse:
+    """Attach a completed PDF to an unsent Outlook draft. This route does not send mail.
+
+    A missing Graph draft id runs the same createReply and body PATCH as the
+    Outlook push, then adds the file. An id that is already stored is left
+    as it is and only the attachment is posted.
+    """
+    row, account = _visible_message(session, user, message_id)
+    if account.provider != "microsoft":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Only an Outlook mailbox can save this draft.",
+        )
+    job = session.get(FormFillJob, body.form_fill_job_id)
+    if job is None or job.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_JOB_NOT_FOUND)
+    if _fill_status(job.status) != FormFillStatus.completed.value:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_FORM_NOT_READY)
+    if job.message_id != row.id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_FORM_OTHER_MESSAGE)
+    pdf = _filled_pdf(job)
+    if pdf is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_FORM_NOT_READY)
+    if len(pdf) > _MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_FORM_TOO_LARGE)
+    filename = _attachment_name(session, job)
+    draft = _load_draft(session, row.id)
+    if not _ready_draft(draft) or draft is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
+    text = draft.body or ""
+    provider_message_id = row.graph_id
+    token = _outlook_access_token(session, account, draft, row.id)
+    # Refresh commits the session, so load the draft again before writing its id.
+    draft = session.get(ReplyDraft, draft.id)
+    if not _ready_draft(draft) or draft is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
+    try:
+        draft_id = draft.graph_draft_id
+        if not draft_id:
+            draft_id = create_reply_draft(token, provider_message_id)
+            current = session.get(ReplyDraft, draft.id)
+            if current is None:
+                raise GraphDraftError("missing_draft")
+            current.graph_draft_id = draft_id
+            current.updated_at = utcnow()
+            session.add(current)
+            session.commit()
+            draft = current
+            patch_reply_draft(token, draft_id, text)
+        add_file_attachment(token, draft_id, filename, pdf)
     except GraphDraftError:
         _store_outlook_error(session, draft, "outlook draft failed")
         raise HTTPException(
