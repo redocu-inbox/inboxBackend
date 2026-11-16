@@ -128,11 +128,22 @@ def consider_form_match_on_sync(ctx: dict, account_id: UUID) -> None:
         )
 
 
+def _retries_remain(ctx: dict | None) -> bool:
+    """True when ARQ will run this job again. `job_try` starts at 1."""
+    raw = ctx.get("job_try") if isinstance(ctx, dict) else None
+    try:
+        job_try = int(raw) if raw is not None else 1
+    except (TypeError, ValueError):
+        job_try = 1
+    return job_try < 3
+
+
 async def execute_form_match(ctx: dict, job_id: str) -> None:
     """Match `job_id` and enqueue a fill when the model returns field values.
 
-    A missing id is logged and ignored. An unexpected error is stored as a
-    short message. The log does not include the message body or the values.
+    A missing id is logged and ignored. An unexpected error stays running
+    while ARQ will retry. The last try stores a short error. The log does not
+    include the message body or the values.
     """
     try:
         parsed = UUID(str(job_id))
@@ -141,46 +152,20 @@ async def execute_form_match(ctx: dict, job_id: str) -> None:
         return
     try:
         ready = _prepare(parsed)
-    except Exception as exc:
-        logger.warning(
-            "match_form_template failed fill_job=%s error_type=%s",
-            parsed,
-            type(exc).__name__,
-        )
-        _fail(parsed)
-        return
-    if ready is None:
-        return
-    try:
+        if ready is None:
+            return
         raw = await get_llm().complete(system=ready.system, user=ready.user_prompt)
+        if _save_extraction(parsed, ready, raw):
+            await _enqueue_fill(ctx, str(parsed))
     except Exception as exc:
         logger.warning(
             "match_form_template failed fill_job=%s error_type=%s",
             parsed,
             type(exc).__name__,
         )
+        if _retries_remain(ctx):
+            raise
         _fail(parsed)
-        return
-    try:
-        enqueue = _save_extraction(parsed, ready, raw)
-    except Exception as exc:
-        logger.warning(
-            "match_form_template failed fill_job=%s error_type=%s",
-            parsed,
-            type(exc).__name__,
-        )
-        _fail(parsed)
-        return
-    if not enqueue:
-        return
-    try:
-        await _enqueue_fill(ctx, str(parsed))
-    except Exception as exc:
-        logger.warning(
-            "run_form_fill enqueue failed fill_job=%s error_type=%s",
-            parsed,
-            type(exc).__name__,
-        )
 
 
 def _prepare(job_id: UUID) -> MatchReady | None:

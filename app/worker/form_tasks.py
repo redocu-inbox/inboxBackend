@@ -20,8 +20,8 @@ async def match_form_template(ctx: dict, job_id: str) -> None:
 async def run_form_fill(ctx: dict, job_id: str) -> None:
     """Write the job's saved values into the AcroForm and store the PDF.
 
-    A missing id is logged and ignored. Running the job again overwrites the
-    same storage key. Confidence is left as it was stored at create time.
+    A missing id is logged and ignored. An unexpected error stays running
+    until the third try, then fails with a short error. Running the job again
+    overwrites the same storage key. Confidence is left as it was stored.
     """
-    del ctx
-    execute_form_fill(job_id)
+    execute_form_fill(job_id, ctx)

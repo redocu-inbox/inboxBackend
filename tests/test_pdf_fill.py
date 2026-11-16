@@ -290,7 +290,7 @@ def test_unexpected_fill_error_is_a_short_message(client, register_user, monkeyp
             raise RuntimeError("secret Ada")
 
     monkeypatch.setattr("app.services.forms.fill_job.get_filler", lambda mime: Boom())
-    _run(created.json()["id"])
+    asyncio.run(run_form_fill({"job_try": 3}, created.json()["id"]))
     body = client.get(f"/forms/jobs/{created.json()['id']}", headers=headers).json()
     assert body["status"] == "failed"
     assert body["error"] == "The form could not be filled."

@@ -59,6 +59,14 @@ A healthy response looks like this:
 
 FastAPI also publishes interactive docs at http://localhost:8000/docs.
 
+Seed a local inbox after the migrations. This runs only when `APP_ENV` is `development`. It creates `demo@example.com` with password `seed-demo-password`, one Microsoft mailbox, three messages with different scores, and one AcroForm template. It does not connect Gmail and it does not print tokens.
+
+```bash
+python scripts/seed_demo.py
+```
+
+Inside Compose, that is `docker compose exec api python scripts/seed_demo.py`. Log in with that email and password.
+
 The API allows the origins in `CORS_ORIGINS` and allows credentials. It does not set a session cookie. Browsers may send `Authorization`, `Content-Type`, and `Accept`. `X-Total-Count` is exposed so the app can read the message total. The local default is the Vite dev server at http://localhost:5173 and http://127.0.0.1:5173. Do not set `CORS_ORIGINS` to `*`.
 
 Stop the stack with `Ctrl+C`, then:
@@ -99,7 +107,7 @@ app/
   api/forms.py            Form template library and fill jobs
   api/deps.py             Current user, database session, ARQ pool
   models/                 SQLModel tables
-  services/graph/         MSAL client, token save and refresh, unsent Outlook drafts; delta client is still a seam
+  services/graph/         MSAL client, token save and refresh, inbox delta, subscriptions, and unsent Outlook drafts
   services/forms/         Template storage, AcroForm schema, matching, fill jobs, and PDF filling
   services/llm/           LLM protocol; stub unless openai or anthropic has a key
   worker/                 ARQ settings. Mail jobs, form jobs, and the remaining jobs are separate modules
@@ -124,7 +132,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 
 `schema_json` is written on upload. `kind` is `acroform` when the PDF has AcroForm fields and `none` when it does not. Each field is `name`, `type` (`text`, `checkbox`, `choice`, or `other`), and `options`. `label` is present only after a PATCH sets it. An XFA-only file with no AcroForm fields is kind `none`.
 
-`form_fill_jobs.status` is a string (`pending`, `running`, `needs_review`, `completed`, `failed`), not a Postgres enum, so adding a status later is a normal migration.
+`form_fill_jobs.status` is a string (`pending`, `running`, `needs_review`, `completed`, `failed`, `rejected`), not a Postgres enum, so adding a status later is a normal migration.
 
 Microsoft and Google tokens on `ConnectedAccount` are encrypted by the column type (`EncryptedText`), so code reads and writes plaintext as usual. This needs `TOKEN_ENCRYPTION_KEY`; see `.env.example`. Losing that key means every mailbox has to reconnect. It is separate from `SECRET_KEY`.
 
@@ -183,7 +191,7 @@ ARQ job names are the function names. Mail jobs are in `app/worker/mail_tasks.py
 | `rescore_mailbox_priority`  | worker startup, once per connected mailbox | Classifies and scores messages already stored for one mailbox. It does not call Graph or Gmail and does not change sync status |
 | `send_password_reset`       | `POST /auth/forgot-password` (user id and request id only) | Creates a reset code, stores its hash, and sends the link. The code is not a job argument |
 | `match_form_template`       | `POST /forms/jobs` when `values` is omitted | Scores that user's AcroForm templates, or uses the template the request already set. A JSON object of field values is saved and `run_form_fill` is enqueued. The stub, and any reply that is not a JSON object, finishes `needs_review` with confidence `0` and no file. A missing model key stays on the stub. It does not call Graph or Gmail |
-| `run_form_fill`             | `POST /forms/jobs` when `values` is sent, and `POST /forms/jobs/{id}/refill` | Writes the saved values into the AcroForm and stores `forms/{user_id}/{job_id}/filled.pdf`. A template with no fillable fields fails. An empty value map finishes `needs_review` and stores no file |
+| `run_form_fill`             | `POST /forms/jobs` when `values` is sent, and `POST /forms/jobs/{id}/refill` | Writes the saved values into the AcroForm and stores `forms/{user_id}/{job_id}/filled.pdf`. A template with no fillable fields fails. An empty value map finishes `needs_review` and stores no file. An unexpected error stays `running` until the third try, then fails with a short error |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Renews Outlook subscriptions that expire within 24 hours. A 404 creates the subscription again. A 429 waits for Retry-After once, then the job fails so ARQ can retry |
 | `generate_reply_draft`      | `POST /messages/{id}/draft` | Writes the local reply body. The stub stores a fixed sentence. A configured provider stores the model text. It does not call Graph |
 | `sync_connected_mailboxes` | cron every 5 minutes by default | Syncs every connected Outlook and Gmail mailbox through `sync_mailbox_delta`. Skips a mailbox that is already pending or running. One account's token or provider error does not stop the others |
