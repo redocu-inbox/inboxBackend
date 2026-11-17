@@ -48,6 +48,7 @@ from app.services.graph.tokens import (
     needs_refresh,
     refresh_access_token,
 )
+from app.services.inbox.approve import approve_message
 from app.services.inbox.attachments import payloads as attachment_payloads
 from app.services.inbox.attachments import bind_attachments, expire_unbound
 from app.services.inbox.compose import create_local_email
@@ -140,6 +141,7 @@ class MessageResponse(BaseModel):
     user_corrected: bool = False
     suggested_form: SuggestedFormResponse | None = None
     new_email: NewEmailResponse | None = None
+    approved_at: datetime | None = None
 
 
 class MessageDetailResponse(MessageResponse):
@@ -287,6 +289,7 @@ def _message_response(
         suggested_form=_suggested_response(suggested),
         conversation_id=row.conversation_id,
         new_email=_new_email(row),
+        approved_at=row.approved_at,
     )
 
 
@@ -397,19 +400,22 @@ def _detail_response(
     suggested = suggested_forms_for_messages(session, [row.id]).get(row.id)
     item = _message_response(row, account.provider, suggested)
     draft = _load_draft(session, row.id)
+    draft_body = _draft_response(session, draft) if draft is not None else None
     everyone = reply_all(row, account)
     reply_all_recipients = (
         DraftRecipientsResponse(to=everyone["to"], cc=everyone["cc"]) if everyone["to"] else None
     )
+    # True only when a draft already has a To list approve will send as saved.
+    can_edit = draft_body is not None and draft_body.recipients is not None
     return MessageDetailResponse(
         **item.model_dump(),
         body_text=row.body_text,
-        draft=_draft_response(session, draft) if draft is not None else None,
+        draft=draft_body,
         to=_string_list(row.to_recipients),
         cc=_string_list(row.cc_recipients),
         reply_to=_string_list(row.reply_to),
         reply_all_recipients=reply_all_recipients,
-        can_edit_recipients=False,
+        can_edit_recipients=can_edit,
         account_id=account.id,
         account_email=account.email,
     )
@@ -486,6 +492,20 @@ async def create_new_email(
         attachment_ids=body.attachment_ids,
         forward_of_id=body.forward_of_id,
     )
+    return _detail_response(session, message, account)
+
+
+@router.post("/messages/{message_id}/approve")
+def approve_draft(
+    message_id: UUID,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> MessageDetailResponse:
+    """Send the ready draft once. This is the only message route that sends mail."""
+    message = approve_message(session, user, message_id)
+    account = session.get(ConnectedAccount, message.connected_account_id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
     return _detail_response(session, message, account)
 
 

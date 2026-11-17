@@ -1,5 +1,6 @@
 import app.db
 
+from app.models.approval import Approval
 from app.models.classification_correction import MessageClassificationCorrection
 from app.models.connected_account import ConnectedAccount
 from app.models.form_fill_job import FormFillJob, FormFillStatus
@@ -13,6 +14,7 @@ from app.models.user import User
 
 
 __all__ = [
+    "Approval",
     "ConnectedAccount",
     "MessageClassificationCorrection",
     "FormFillJob",

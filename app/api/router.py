@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.api.approvals import router as approvals_router
 from app.api.attachments import router as attachments_router
 from app.api.auth import router as auth_router
 from app.api.health import router as health_router
@@ -18,4 +19,5 @@ api_router.include_router(users_router)
 api_router.include_router(graph_router)
 api_router.include_router(forms_router)
 api_router.include_router(messages_router)
+api_router.include_router(approvals_router)
 api_router.include_router(attachments_router)

@@ -76,7 +76,8 @@ class Settings(BaseSettings):
     graph_scopes: str = (
         "https://graph.microsoft.com/User.Read,"
         "https://graph.microsoft.com/Mail.Read,"
-        "https://graph.microsoft.com/Mail.ReadWrite"
+        "https://graph.microsoft.com/Mail.ReadWrite,"
+        "https://graph.microsoft.com/Mail.Send"
     )
 
     # Vite origin, with no path. The Microsoft callback redirects to

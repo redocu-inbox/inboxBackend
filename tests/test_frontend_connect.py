@@ -39,6 +39,7 @@ LIST_KEYS = {
     "user_corrected",
     "suggested_form",
     "new_email",
+    "approved_at",
 }
 
 
@@ -212,7 +213,9 @@ def test_google_start_returns_an_authorization_url(client, register_user, monkey
     assert query["client_id"] == ["google-client-id"]
     assert query["redirect_uri"] == ["http://localhost:8000/auth/google/callback"]
     assert query["response_type"] == ["code"]
-    assert query["scope"] == ["openid email https://www.googleapis.com/auth/gmail.readonly"]
+    assert query["scope"] == [
+        "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send"
+    ]
     assert query["access_type"] == ["offline"]
     assert query["prompt"] == ["consent"]
     assert "client_secret" not in query
@@ -662,7 +665,7 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
         "access_token": "google-access-token",
         "refresh_token": "google-refresh-token",
         "expires_in": 3600,
-        "scope": "openid email https://www.googleapis.com/auth/gmail.readonly",
+        "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
     }
 
     def _boom(*args, **kwargs):
@@ -703,7 +706,7 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
         lambda code: {
             "access_token": "google-access-token",
             "expires_in": 3600,
-            "scope": "openid email https://www.googleapis.com/auth/gmail.readonly",
+            "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
         },
     )
     no_refresh = _google_callback(client, f"code=abc&state={_OAUTH_STATE}")

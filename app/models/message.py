@@ -58,5 +58,7 @@ class Message(SQLModel, table=True):
     forward_of_id: UUID | None = Field(default=None, foreign_key="messages.id")
     # Materials attached to a new email: [{id, name}]. Null on received mail.
     material_attachments: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Set only after approve has sent this draft. A second approve sees this and stops.
+    approved_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
