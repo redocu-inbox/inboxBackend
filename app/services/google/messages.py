@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 from app.services.google.http import GMAIL_INBOX_LIST_URL, gmail_message_url, google_get
 from app.services.graph.html_text import to_plain_text
+from app.services.inbox.recipients import header_people
 
 _EMAIL_IN_BRACKETS = re.compile(r"<([^<>\s]+@[^<>\s]+)>")
 _LIST_BASE = GMAIL_INBOX_LIST_URL.split("?", 1)[0]
@@ -125,6 +126,9 @@ def gmail_message_fields(item: dict) -> dict | None:
         is_read = None
     from_name, from_email = _sender(_header(payload, "From"))
     plain, html = _bodies(payload)
+    thread_id = item.get("threadId")
+    labels = item.get("labelIds") if isinstance(item.get("labelIds"), list) else []
+    direction = "outgoing" if "SENT" in labels and "INBOX" not in labels else "incoming"
     return {
         "graph_id": gmail_id[:512],
         "subject": to_plain_text(_header(payload, "Subject")),
@@ -134,6 +138,12 @@ def gmail_message_fields(item: dict) -> dict | None:
         "from_email": from_email,
         "is_read": is_read,
         "body_text": to_plain_text(plain) or to_plain_text(html),
+        "conversation_id": thread_id[:512] if isinstance(thread_id, str) and thread_id else None,
+        "to_recipients": header_people(_header(payload, "To")),
+        "cc_recipients": header_people(_header(payload, "Cc")),
+        "reply_to": header_people(_header(payload, "Reply-To")),
+        "direction": direction,
+        "origin": "provider",
     }
 
 

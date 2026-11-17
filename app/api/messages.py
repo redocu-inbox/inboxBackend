@@ -48,12 +48,33 @@ from app.services.graph.tokens import (
     needs_refresh,
     refresh_access_token,
 )
+from app.services.inbox.attachments import payloads as attachment_payloads
+from app.services.inbox.attachments import bind_attachments, expire_unbound
+from app.services.inbox.compose import create_local_email
+from app.services.inbox.history import conversation_page
+from app.services.inbox.recipients import normalize_list, reply_all, saved_or_default
 from app.services.mailboxes import mark_sync_enqueue_failed, request_mailbox_sync
 from app.services.priority.apply import message_fields
 from app.services.priority.score import score
 
 router = APIRouter(tags=["messages"])
 logger = logging.getLogger(__name__)
+
+
+class DraftRecipientsResponse(BaseModel):
+    """Saved outgoing addresses. Absent when a reply has nobody to answer."""
+
+    to: list[str]
+    cc: list[str]
+
+
+class DraftFileResponse(BaseModel):
+    """One file staged from the computer and bound to this draft."""
+
+    id: UUID
+    file_name: str
+    size_bytes: int
+    content_type: str | None = None
 
 
 class ReplyDraftResponse(BaseModel):
@@ -67,6 +88,22 @@ class ReplyDraftResponse(BaseModel):
     graph_draft_id: str | None = None
     error: str | None = None
     updated_at: datetime
+    recipients: DraftRecipientsResponse | None = None
+    attachments: list[DraftFileResponse] = Field(default_factory=list)
+
+
+class MaterialRefResponse(BaseModel):
+    id: str
+    name: str
+
+
+class NewEmailResponse(BaseModel):
+    """Set only on an email this app composed. Received mail leaves it null."""
+
+    to: list[str]
+    cc: list[str]
+    attachments: list[MaterialRefResponse] = Field(default_factory=list)
+    forward_of_id: UUID | None = None
 
 
 class SuggestedFormResponse(BaseModel):
@@ -102,11 +139,19 @@ class MessageResponse(BaseModel):
     reference_number: str | None = None
     user_corrected: bool = False
     suggested_form: SuggestedFormResponse | None = None
+    new_email: NewEmailResponse | None = None
 
 
 class MessageDetailResponse(MessageResponse):
     body_text: str | None = None
     draft: ReplyDraftResponse | None = None
+    to: list[str] = Field(default_factory=list)
+    cc: list[str] = Field(default_factory=list)
+    reply_to: list[str] = Field(default_factory=list)
+    reply_all_recipients: DraftRecipientsResponse | None = None
+    can_edit_recipients: bool = False
+    account_id: UUID | None = None
+    account_email: str | None = None
 
 
 class SyncResponse(BaseModel):
@@ -240,6 +285,8 @@ def _message_response(
         reference_number=row.reference_number,
         user_corrected=row.user_corrected is True,
         suggested_form=_suggested_response(suggested),
+        conversation_id=row.conversation_id,
+        new_email=_new_email(row),
     )
 
 
@@ -297,7 +344,35 @@ def _draft_status(value: object) -> str:
     return str(value)
 
 
-def _draft_response(row: ReplyDraft) -> ReplyDraftResponse:
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _new_email(row: Message) -> NewEmailResponse | None:
+    if row.origin != "local":
+        return None
+    materials = []
+    if isinstance(row.material_attachments, list):
+        for item in row.material_attachments:
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("name"), str):
+                materials.append(MaterialRefResponse(id=item["id"], name=item["name"]))
+    return NewEmailResponse(
+        to=_string_list(row.to_recipients),
+        cc=_string_list(row.cc_recipients),
+        attachments=materials,
+        forward_of_id=row.forward_of_id,
+    )
+
+
+def _draft_response(session: Session, row: ReplyDraft) -> ReplyDraftResponse:
+    message = session.get(Message, row.message_id)
+    recipients = None
+    if message is not None:
+        saved = saved_or_default(message, row.to_recipients, row.cc_recipients)
+        if saved is not None:
+            recipients = DraftRecipientsResponse(to=saved["to"], cc=saved["cc"])
     return ReplyDraftResponse(
         id=row.id,
         message_id=row.message_id,
@@ -307,6 +382,8 @@ def _draft_response(row: ReplyDraft) -> ReplyDraftResponse:
         graph_draft_id=row.graph_draft_id,
         error=row.error,
         updated_at=row.updated_at,
+        recipients=recipients,
+        attachments=[DraftFileResponse(**item) for item in attachment_payloads(session, row.message_id)],
     )
 
 
@@ -315,15 +392,26 @@ def _load_draft(session: Session, message_id: UUID) -> ReplyDraft | None:
 
 
 def _detail_response(
-    session: Session, row: Message, provider: str | None
+    session: Session, row: Message, account: ConnectedAccount
 ) -> MessageDetailResponse:
     suggested = suggested_forms_for_messages(session, [row.id]).get(row.id)
-    item = _message_response(row, provider, suggested)
+    item = _message_response(row, account.provider, suggested)
     draft = _load_draft(session, row.id)
+    everyone = reply_all(row, account)
+    reply_all_recipients = (
+        DraftRecipientsResponse(to=everyone["to"], cc=everyone["cc"]) if everyone["to"] else None
+    )
     return MessageDetailResponse(
         **item.model_dump(),
         body_text=row.body_text,
-        draft=_draft_response(draft) if draft is not None else None,
+        draft=_draft_response(session, draft) if draft is not None else None,
+        to=_string_list(row.to_recipients),
+        cc=_string_list(row.cc_recipients),
+        reply_to=_string_list(row.reply_to),
+        reply_all_recipients=reply_all_recipients,
+        can_edit_recipients=False,
+        account_id=account.id,
+        account_email=account.email,
     )
 
 
@@ -343,7 +431,75 @@ def read_message(
     session: Session = Depends(get_session),
 ) -> MessageDetailResponse:
     row, account = _visible_message(session, user, message_id)
-    return _detail_response(session, row, account.provider)
+    return _detail_response(session, row, account)
+
+
+class NewEmailInput(BaseModel):
+    """A new email or a forward. Creating it does not send."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: UUID | None = None
+    to: list[str]
+    cc: list[str] = Field(default_factory=list)
+    subject: str
+    body: str | None = None
+    instructions: str | None = None
+    material_ids: list[UUID] = Field(default_factory=list)
+    attachment_ids: list[UUID] = Field(default_factory=list)
+    forward_of_id: UUID | None = None
+
+
+class ConversationMessage(BaseModel):
+    id: UUID
+    from_name: str | None = None
+    from_email: str | None = None
+    to: list[str]
+    cc: list[str]
+    body_text: str
+    received_at: datetime
+    direction: Literal["incoming", "outgoing"]
+
+
+class ConversationPage(BaseModel):
+    messages: list[ConversationMessage]
+    next_cursor: str | None = None
+
+
+@router.post("/messages/new", status_code=status.HTTP_201_CREATED)
+async def create_new_email(
+    body: NewEmailInput,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> MessageDetailResponse:
+    """Save a new email or a forward. The mailbox is not contacted."""
+    message, account = await create_local_email(
+        session,
+        user,
+        account_id=body.account_id,
+        to=body.to,
+        cc=body.cc,
+        subject=body.subject,
+        body=body.body,
+        instructions=body.instructions,
+        material_ids=body.material_ids,
+        attachment_ids=body.attachment_ids,
+        forward_of_id=body.forward_of_id,
+    )
+    return _detail_response(session, message, account)
+
+
+@router.get("/messages/{message_id}/conversation")
+def read_conversation(
+    message_id: UUID,
+    cursor: str | None = None,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ConversationPage:
+    """Plain-text history for this mailbox's copy of the thread. Drafts are omitted."""
+    row, account = _visible_message(session, user, message_id)
+    page = conversation_page(session, row, account, cursor)
+    return ConversationPage.model_validate(page)
 
 
 @router.patch("/messages/{message_id}/classification")
@@ -373,7 +529,7 @@ def correct_classification(
             continue
         changes.append((field, old_value, new_value))
     if not changes:
-        return _detail_response(session, row, account.provider)
+        return _detail_response(session, row, account)
 
     moment = utcnow()
     for field, old_value, new_value in changes:
@@ -406,19 +562,28 @@ def correct_classification(
     row.priority_scored_at = stamp
     session.add(row)
     session.commit()
-    return _detail_response(session, row, account.provider)
+    return _detail_response(session, row, account)
 
 
 class ReplyDraftPatch(BaseModel):
-    """Replace the local reply text. Extra keys are rejected."""
+    """Replace the local reply text, and optionally who it goes to or which files it keeps.
 
-    model_config = ConfigDict(extra="forbid")
+    Extra keys are rejected. Omitted recipient and file fields stay as they are.
+    `attachmentIds` is the name the app sends; `attachment_ids` is accepted too.
+    """
 
-    body: str
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    body: str | None = None
+    to: list[str] | None = None
+    cc: list[str] | None = None
+    attachment_ids: list[UUID] | None = Field(default=None, alias="attachmentIds")
 
     @field_validator("body", mode="before")
     @classmethod
-    def _body(cls, value: object) -> str:
+    def _body(cls, value: object) -> str | None:
+        if value is None:
+            return None
         if not isinstance(value, str):
             raise ValueError("invalid body")
         text = value.strip()
@@ -506,7 +671,7 @@ async def create_reply_draft_job(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Reply draft could not be queued.",
         ) from exc
-    return _draft_response(draft)
+    return _draft_response(session, draft)
 
 
 @router.get("/messages/{message_id}/draft")
@@ -519,7 +684,7 @@ def read_reply_draft(
     draft = _load_draft(session, message_id)
     if draft is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
-    return _draft_response(draft)
+    return _draft_response(session, draft)
 
 
 @router.patch("/messages/{message_id}/draft")
@@ -529,20 +694,73 @@ def update_reply_draft(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> ReplyDraftResponse:
-    """Save trimmed text. source is user and status is ready. Does not call Graph."""
-    _visible_message(session, user, message_id)
+    """Save trimmed text, recipients, or staged files. Does not call the mailbox.
+
+    `can_edit_recipients` stays false until a later approve path sends the saved
+    addresses. The addresses are still stored and echoed.
+    """
+    row, _account = _visible_message(session, user, message_id)
     draft = _load_draft(session, message_id)
     if draft is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
-    draft.body = body.body
-    draft.source = "user"
-    draft.status = ReplyDraftStatus.ready
-    draft.error = None
+    fields = body.model_fields_set
+    if not fields or (body.body is None and "to" not in fields and "cc" not in fields and "attachment_ids" not in fields):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Nothing to save.")
+    if "attachment_ids" in fields:
+        expire_unbound(session, user.id)
+    if body.body is not None:
+        draft.body = body.body
+        draft.source = "user"
+        draft.status = ReplyDraftStatus.ready
+        draft.error = None
+    if "to" in fields or "cc" in fields:
+        current_to = draft.to_recipients if isinstance(draft.to_recipients, list) else None
+        current_cc = draft.cc_recipients if isinstance(draft.cc_recipients, list) else []
+        if current_to is None:
+            fallback = saved_or_default(row, None, None)
+            current_to = fallback["to"] if fallback else []
+            current_cc = []
+        next_to = body.to if "to" in fields else current_to
+        next_cc = body.cc if "cc" in fields else current_cc
+        if next_to is None:
+            next_to = []
+        if next_cc is None:
+            next_cc = []
+        try:
+            cleaned_to = normalize_list(next_to)
+            cleaned_cc = normalize_list(next_cc)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Enter a valid email address.",
+            ) from exc
+        if not cleaned_to:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Add at least one To address.",
+            )
+        from app.services.inbox.recipients import MAX_RECIPIENTS, email_of
+
+        seen = {email_of(item) for item in cleaned_to}
+        cleaned_cc = [item for item in cleaned_cc if email_of(item) not in seen]
+        if len(cleaned_to) + len(cleaned_cc) > MAX_RECIPIENTS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="To and Cc together can include at most 50 people.",
+            )
+        draft.to_recipients = cleaned_to
+        draft.cc_recipients = cleaned_cc
+        if row.origin == "local":
+            row.to_recipients = cleaned_to
+            row.cc_recipients = cleaned_cc
+            session.add(row)
+    if "attachment_ids" in fields:
+        bind_attachments(session, user.id, row.id, body.attachment_ids or [])
     draft.updated_at = utcnow()
     session.add(draft)
     session.commit()
     session.refresh(draft)
-    return _draft_response(draft)
+    return _draft_response(session, draft)
 
 
 @router.delete("/messages/{message_id}/draft", status_code=status.HTTP_204_NO_CONTENT)
@@ -635,7 +853,7 @@ def push_outlook_draft(
     session.add(saved)
     session.commit()
     session.refresh(saved)
-    return _draft_response(saved)
+    return _draft_response(session, saved)
 
 
 def _storage():
@@ -767,7 +985,7 @@ def attach_filled_form(
     session.add(saved)
     session.commit()
     session.refresh(saved)
-    return _draft_response(saved)
+    return _draft_response(session, saved)
 
 
 _SYNC_RANK = {"failed": 3, "running": 2, "pending": 1, "idle": 0}

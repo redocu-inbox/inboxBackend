@@ -38,6 +38,20 @@ LIST_KEYS = {
     "reference_number",
     "user_corrected",
     "suggested_form",
+    "new_email",
+}
+
+
+DETAIL_KEYS = LIST_KEYS | {
+    "body_text",
+    "draft",
+    "to",
+    "cc",
+    "reply_to",
+    "reply_all_recipients",
+    "can_edit_recipients",
+    "account_id",
+    "account_email",
 }
 
 # Frozen reply-draft object. created_at stays on the table and is not a key.
@@ -50,6 +64,8 @@ DRAFT_KEYS = {
     "graph_draft_id",
     "error",
     "updated_at",
+    "recipients",
+    "attachments",
 }
 
 
@@ -515,7 +531,7 @@ def test_message_detail_includes_body_and_hides_other_users(client, register_use
     detail = client.get(f"/messages/{message_id}", headers=ana)
     assert detail.status_code == 200
     body = detail.json()
-    assert set(body) == LIST_KEYS | {"body_text", "draft"}
+    assert set(body) == DETAIL_KEYS
     assert body["body_text"] is None
     assert body["draft"] is None
     assert body["priority_score"] is None

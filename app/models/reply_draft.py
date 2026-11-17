@@ -11,6 +11,7 @@ from enum import Enum
 from uuid import UUID, uuid4
 
 from sqlalchemy import Column, DateTime, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 from app.models.user import utcnow
@@ -37,6 +38,9 @@ class ReplyDraft(SQLModel, table=True):
     source: str | None = Field(default=None, max_length=16)
     graph_draft_id: str | None = Field(default=None, sa_column=Column(Text))
     error: str | None = Field(default=None, sa_column=Column(Text))
+    # Saved outgoing To/Cc. Null means the reply still uses the sender or Reply-To.
+    to_recipients: list | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    cc_recipients: list | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(
         default_factory=utcnow,
         sa_type=DateTime(timezone=True),

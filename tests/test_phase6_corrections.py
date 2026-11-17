@@ -12,7 +12,7 @@ from app.models.classification_correction import MessageClassificationCorrection
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
 from app.worker.mail_tasks import rescore_mailbox_priority, sync_mailbox_delta
-from tests.test_frontend_connect import LIST_KEYS, _add_account, _add_message, _user_id
+from tests.test_frontend_connect import DETAIL_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 FIXED = datetime(2026, 11, 9, 18, 0, tzinfo=timezone.utc)
 OLD = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -74,7 +74,7 @@ def test_category_correction_rescores_and_records_the_original(client, register_
     )
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == LIST_KEYS | {"body_text", "draft"}
+    assert set(body) == DETAIL_KEYS
     assert body["category"] == "rfi"
     assert body["category_source"] == "user"
     assert body["category_confidence"] == 1.0
