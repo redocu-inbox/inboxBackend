@@ -14,7 +14,7 @@ from app.models.form_template import FormTemplate
 from app.models.reply_draft import ReplyDraft
 from app.services.graph.drafts import GraphDraftError
 from tests.pdf_fixtures import text_field_pdf_bytes
-from tests.test_frontend_connect import DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
+from tests.test_frontend_connect import DETAIL_KEYS, DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 from tests.test_reply_drafts import _fresh_token, _insert_draft, _mailbox
 
 _SUGGESTED_KEYS = {
@@ -145,7 +145,7 @@ def test_suggested_form_is_the_newest_reviewable_job_for_either_provider(client,
     )
 
     detail = client.get(f"/messages/{outlook_id}", headers=headers).json()
-    assert set(detail) == LIST_KEYS | {"body_text", "draft"}
+    assert set(detail) == DETAIL_KEYS
     assert detail["suggested_form"] == by_id[outlook_id]["suggested_form"]
     gmail_detail = client.get(f"/messages/{gmail_id}", headers=headers).json()
     assert gmail_detail["suggested_form"] == by_id[gmail_id]["suggested_form"]

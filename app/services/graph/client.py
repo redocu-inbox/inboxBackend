@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from app.models.connected_account import ConnectedAccount
 
 _GRAPH_HOST = "https://graph.microsoft.com/"
-_SELECT = "id,subject,bodyPreview,receivedDateTime,from,isRead,body"
+_SELECT = (
+    "id,subject,bodyPreview,receivedDateTime,from,isRead,body,"
+    "conversationId,toRecipients,ccRecipients,replyTo"
+)
 INBOX_DELTA_URL = (
     "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta"
     f"?$select={_SELECT}"

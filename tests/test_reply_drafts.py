@@ -21,7 +21,7 @@ from app.services.llm.stub import StubLLM
 from app.services.reply_drafts.generation import STUB_REPLY_SENTENCE, final_reply_body
 from app.worker.settings import WorkerSettings
 from app.worker.mail_tasks import generate_reply_draft
-from tests.test_frontend_connect import DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
+from tests.test_frontend_connect import DETAIL_KEYS, DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 _CONTRACT = {
     "id",
@@ -32,6 +32,8 @@ _CONTRACT = {
     "graph_draft_id",
     "error",
     "updated_at",
+    "recipients",
+    "attachments",
 }
 
 
@@ -99,7 +101,7 @@ def test_draft_routes_keep_the_contract_and_leave_the_list_alone(client, registe
         assert row.created_at is not None
 
     detail = client.get(f"/messages/{message_id}", headers=headers).json()
-    assert set(detail) == LIST_KEYS | {"body_text", "draft"}
+    assert set(detail) == DETAIL_KEYS
     _assert_contract(detail["draft"], message_id)
     listed = client.get("/messages", headers=headers).json()
     assert set(listed[0]) == LIST_KEYS

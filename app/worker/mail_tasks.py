@@ -28,6 +28,7 @@ from app.services.google.messages import (
 from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_access_token
 from app.services.graph.client import GraphClient
 from app.services.graph.html_text import to_plain_text
+from app.services.inbox.recipients import graph_people
 from app.services.graph.subscriptions import (
     GraphSubscriptionError,
     create_graph_subscription,
@@ -93,6 +94,7 @@ def graph_message_fields(item: dict) -> dict | None:
     is_read = item.get("isRead")
     body = item.get("body") if isinstance(item.get("body"), dict) else {}
     content = body.get("content") if isinstance(body.get("content"), str) else None
+    conversation = item.get("conversationId")
     return {
         "graph_id": graph_id[:512],
         "subject": to_plain_text(item.get("subject")),
@@ -102,6 +104,12 @@ def graph_message_fields(item: dict) -> dict | None:
         "from_email": _plain_address(email_address.get("address")),
         "is_read": is_read if isinstance(is_read, bool) else None,
         "body_text": to_plain_text(content),
+        "conversation_id": conversation[:512] if isinstance(conversation, str) and conversation else None,
+        "to_recipients": graph_people(item.get("toRecipients")),
+        "cc_recipients": graph_people(item.get("ccRecipients")),
+        "reply_to": graph_people(item.get("replyTo")),
+        "direction": "incoming",
+        "origin": "provider",
     }
 
 

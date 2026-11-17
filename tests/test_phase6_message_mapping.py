@@ -16,7 +16,7 @@ from sqlmodel import Session
 
 from app.db import engine
 from app.models.message import Message
-from tests.test_frontend_connect import LIST_KEYS, _add_account, _add_message, _user_id
+from tests.test_frontend_connect import DETAIL_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 _CHANGE_ORDER_REASONS = [
     {"code": "keyword_change_order", "label": "Change order", "weight": 22},
@@ -157,7 +157,7 @@ def test_stored_priority_and_classification_round_trip(client, register_user):
     detail = client.get(f"/messages/{scored}", headers=ana)
     assert detail.status_code == 200
     body = detail.json()
-    assert set(body) == LIST_KEYS | {"body_text", "draft"}
+    assert set(body) == DETAIL_KEYS
     assert body["priority_reasons"] == _CHANGE_ORDER_REASONS
     assert body["due_date"] == "2026-11-11"
     assert body["category"] == "rfi"

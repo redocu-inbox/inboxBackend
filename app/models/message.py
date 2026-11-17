@@ -45,5 +45,18 @@ class Message(SQLModel, table=True):
     reference_number: str | None = Field(default=None, max_length=64)
     # Null until a correction. The API returns false for null.
     user_corrected: bool | None = Field(default=None)
+    # Provider thread id. Null on mail synced before this column, and on a local draft.
+    conversation_id: str | None = Field(default=None, max_length=512, index=True)
+    to_recipients: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    cc_recipients: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    reply_to: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # incoming for received mail, outgoing for mail this mailbox sent.
+    direction: str = Field(default="incoming", max_length=16)
+    # provider for synced mail. local for a draft created in this app, which stays
+    # out of conversation history until a later send stores it from the provider.
+    origin: str = Field(default="provider", max_length=16)
+    forward_of_id: UUID | None = Field(default=None, foreign_key="messages.id")
+    # Materials attached to a new email: [{id, name}]. Null on received mail.
+    material_attachments: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     created_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
     updated_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True))
