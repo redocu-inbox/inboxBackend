@@ -36,6 +36,7 @@ from app.services.google.connect import connect_google_mailbox
 from app.services.google.http import fetch_mailbox_identity
 from app.services.google.oauth import (
     GMAIL_READONLY_SCOPE,
+    GMAIL_SEND_SCOPE,
     exchange_authorization_code,
     google_authorization_url,
     revoke_google_token,
@@ -436,13 +437,15 @@ async def google_callback(
         # leaves openid and email, and the connect must not be saved as success.
         scope = result.get("scope")
         granted = scope.split() if isinstance(scope, str) else []
-        gmail_granted = any(
-            part == "gmail.readonly"
-            or part == GMAIL_READONLY_SCOPE
-            or part.endswith("/gmail.readonly")
-            for part in granted
-        )
-        if not gmail_granted:
+
+        def _google_scope(tail: str, full: str) -> bool:
+            return any(part == tail or part == full or part.endswith("/" + tail) for part in granted)
+
+        # Read stays required for sync. Send is required so approve can deliver mail.
+        # A grant that omits either is revoked instead of saved.
+        if not _google_scope("gmail.readonly", GMAIL_READONLY_SCOPE) or not _google_scope(
+            "gmail.send", GMAIL_SEND_SCOPE
+        ):
             refresh = result.get("refresh_token")
             token = refresh if isinstance(refresh, str) and refresh else result.get("access_token")
             if isinstance(token, str) and token:

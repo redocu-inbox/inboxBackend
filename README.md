@@ -325,7 +325,7 @@ The connect flow uses a confidential Microsoft Entra app (MSAL) and stores the t
 | `GRAPH_CLIENT_SECRET` | Client secret |
 | `GRAPH_TENANT_ID` | Authority segment. The authority is `https://login.microsoftonline.com/{GRAPH_TENANT_ID}`. `.env.example` uses `consumers` (personal Microsoft accounts). A work or school mailbox can use its tenant id, or `common`. If the variable is unset, the code default is `common` |
 | `GRAPH_REDIRECT_URI` | Redirect URI registered on the app, and the callback this API serves. Locally: `http://localhost:8000/auth/microsoft/callback` |
-| `GRAPH_SCOPES` | Comma-separated scopes sent on the authorize redirect, the code exchange, and token refresh. The default is `https://graph.microsoft.com/User.Read`, `https://graph.microsoft.com/Mail.Read`, and `https://graph.microsoft.com/Mail.ReadWrite` |
+| `GRAPH_SCOPES` | Comma-separated scopes sent on the authorize redirect, the code exchange, and token refresh. The default is `https://graph.microsoft.com/User.Read`, `https://graph.microsoft.com/Mail.Read`, `https://graph.microsoft.com/Mail.ReadWrite`, and `https://graph.microsoft.com/Mail.Send` |
 | `TOKEN_ENCRYPTION_KEY` | Fernet key for the token columns |
 | `FRONTEND_URL` | One http(s) origin, no path. The callback redirects to `{FRONTEND_URL}/inbox`. Local default `http://localhost:5173`. Production `https://redocu.app`. Rejected at startup if it has whitespace, a path, a query, or userinfo |
 
@@ -460,7 +460,7 @@ Gmail uses the same start, callback, profile, sync, and message routes as Outloo
 Create an OAuth client in Google Cloud:
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), create or select a project and enable the Gmail API.
-2. Open **APIs & Services → OAuth consent screen**. Choose External. Add the scopes `openid`, `email`, and `https://www.googleapis.com/auth/gmail.readonly`. While the app is in **Testing**, only listed test users can connect. Add the Google account you will try.
+2. Open **APIs & Services → OAuth consent screen**. Choose External. Add the scopes `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.send`. While the app is in **Testing**, only listed test users can connect. Add the Google account you will try. A mailbox connected before `gmail.send` was requested has to reconnect before approve can send.
 3. Open **APIs & Services → Credentials → Create credentials → OAuth client ID**. Application type is **Web application**.
 4. Under **Authorized redirect URIs**, add the API callback, not the Vite origin. Locally: `http://localhost:8000/auth/google/callback`. Production: `https://redocu-api.onrender.com/auth/google/callback`. Do not register `https://redocu.app`. That host is `FRONTEND_URL`.
 5. Copy the client id and client secret into the environment. Leave them out of the frontend, git, logs, and tests.
@@ -473,13 +473,13 @@ Create an OAuth client in Google Cloud:
 | `TOKEN_ENCRYPTION_KEY` | Fernet key for the token columns. The same key used for Microsoft |
 | `FRONTEND_URL` | Where the callback sends the browser. Production `https://redocu.app` |
 
-The authorize URL requests `openid`, `email`, and `https://www.googleapis.com/auth/gmail.readonly`, with `access_type=offline` and `prompt=consent`, so Google returns a refresh token. `GET /auth/google/start` with the Bearer token returns `{"authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..."}`. The Bearer token is not copied into that URL. Missing client id or redirect URI, or Redis down, is `503 {"detail":"Gmail connect is temporarily unavailable."}`.
+The authorize URL requests `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.send`, with `access_type=offline` and `prompt=consent`, so Google returns a refresh token. `GET /auth/google/start` with the Bearer token returns `{"authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..."}`. The Bearer token is not copied into that URL. Missing client id or redirect URI, or Redis down, is `503 {"detail":"Gmail connect is temporarily unavailable."}`.
 
 The callback is `GET /auth/google/callback`. It deletes the one-time Redis state, exchanges the code at `https://oauth2.googleapis.com/token`, and reads `sub` and `email` from `https://www.googleapis.com/oauth2/v3/userinfo`. Tokens are encrypted on `connected_accounts` with `provider` `google`. `provider_account_id` is the OpenID `sub`. Success and failure use the same inbox redirect as Microsoft.
 
 | `error` | When |
 | ------- | ---- |
-| `google_denied` | Google sent an `error` query parameter (the user cancelled, or consent was denied), or the token's scopes do not include `gmail.readonly`. The token is revoked and no mailbox is saved |
+| `google_denied` | Google sent an `error` query parameter (the user cancelled, or consent was denied), or the token's scopes do not include both `gmail.readonly` and `gmail.send`. The token is revoked and no mailbox is saved |
 | `invalid_state` | `code` or `state` is missing, the state is unusable, or Redis could not be read |
 | `token_exchange` | The code exchange failed, userinfo failed, the refresh token was missing, or an unexpected error happened before the row was committed |
 | `mailbox_taken` | That Google `sub` is already stored for a different app user |

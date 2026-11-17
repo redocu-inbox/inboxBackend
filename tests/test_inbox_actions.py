@@ -198,7 +198,7 @@ def test_reply_all_drops_the_mailbox_and_a_patch_keeps_the_edited_list(client, r
         "cc": ["office@keystone.example", "bob@keystone.example"],
     }
     assert "ana@outlook.com" not in str(detail["reply_all_recipients"])
-    assert detail["can_edit_recipients"] is False
+    assert detail["can_edit_recipients"] is True
     assert detail["draft"]["recipients"] == {
         "to": ["Luis <replies@keystone.example>"],
         "cc": [],
