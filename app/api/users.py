@@ -36,6 +36,8 @@ class MailboxEntryResponse(MailboxResponse):
     """One active mailbox and that mailbox's own sync status."""
 
     sync: SyncStatusResponse
+    # True only when this Slack connection granted chat:write.
+    chat_write: bool = False
 
 
 class UserResponse(BaseModel):
@@ -110,14 +112,20 @@ def _profile_mailbox(accounts: list[ConnectedAccount]) -> ConnectedAccount | Non
 
     Prefer the Microsoft row when one is connected. A newer Gmail row must not
     take this field, or that client labels the Gmail address as Outlook and
-    Disconnect clears the Outlook tokens.
+    Disconnect clears the Outlook tokens. Slack stays in `mailboxes` only.
     """
-    for account in accounts:
-        if account.provider == "microsoft":
-            return account
-    if not accounts:
-        return None
-    return accounts[0]
+    for provider in ("microsoft", "google"):
+        for account in accounts:
+            if account.provider == provider:
+                return account
+    return None
+
+
+def _chat_write(account: ConnectedAccount) -> bool:
+    if account.provider != "slack" or not account.scopes:
+        return False
+    granted = {part.strip() for part in account.scopes.replace(",", " ").split() if part.strip()}
+    return "chat:write" in granted
 
 
 def _mailbox(account: ConnectedAccount) -> MailboxResponse:
@@ -130,6 +138,7 @@ def _mailbox_entry(account: ConnectedAccount) -> MailboxEntryResponse:
         provider=account.provider,
         email=account.email,
         sync=_sync_response(account),
+        chat_write=_chat_write(account),
     )
 
 

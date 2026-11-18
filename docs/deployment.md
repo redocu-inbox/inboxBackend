@@ -64,6 +64,8 @@ Inside this compose file both listen assumptions use port 8000 on the API contai
 - `GRAPH_REDIRECT_URI` is not `https://<host>/auth/microsoft/callback`
 - `GRAPH_WEBHOOK_CLIENT_STATE` is shorter than 16 characters
 
+`SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_REDIRECT_URI` are not required to boot. Slack connect returns 503 until they are set. When `SLACK_REDIRECT_URI` is set, it must be `https://<host>/auth/slack/callback` with no query or userinfo. The production value for this API is `https://redocu-api.onrender.com/auth/slack/callback`. `SLACK_SEND_ENABLED` defaults to on. Set it to `0` to refuse Slack sends without stopping sync. These values stay on the API and the worker. They are not frontend build variables, and this repository does not change them on the host.
+
 `GRAPH_CLIENT_ID` and `GRAPH_CLIENT_SECRET` are not required for the process to boot. Outlook connect will fail until they are set. They stay on the API and the worker. They are not frontend build variables. No Entra app has been verified from this repository.
 
 `EMAIL_PROVIDER` is `resend` or `disabled` in production. `fake` and `console` refuse to boot. Resend also needs `EMAIL_API_KEY` and `EMAIL_FROM`. Password-reset logout is not the same as `POST /auth/logout`: a reset bumps `session_version` in Postgres and rejects every older access token. The reset code's hash is in Postgres. The code itself is not. Redis still only holds the rate-limit counters and the job ids.
@@ -169,6 +171,12 @@ Do this only after the process is up, Postgres has the `vector` extension, and t
 4. Open the URL in a browser, sign in, and stop on `https://redocu.app/inbox`. Success is `connected=1`. Failure is `connected=0` and one of `microsoft_denied`, `invalid_state`, `token_exchange`, `mailbox_taken`, `mailbox_conflict`.
 5. `GET /users/me` shows `mailbox.email`. `POST /messages/sync` returns 202. Poll `GET /messages` until rows appear or `sync.status` is `idle` or `failed`.
 6. Stop. Do not call a send endpoint. This API does not implement send. Do not grant `Mail.Send` for this test.
+
+## Slack
+
+User token scopes, fixed in the app: `im:history`, `im:read`, `mpim:history`, `mpim:read`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `users:read`, `chat:write`. Register the redirect `https://redocu-api.onrender.com/auth/slack/callback` on the Slack app. The authorize request uses `user_scope`, so the stored token is a user token.
+
+Sync pulls DMs, group DMs, and channel messages that @-mention the connected user. It does not post. `POST /messages/{id}/slack-reply` and `POST /slack/send` are the only routes that call `chat.postMessage`, and only for the signed-in user. Do not call them from the smoke test below.
 
 ## What is still blocked
 

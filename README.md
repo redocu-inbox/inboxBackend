@@ -176,7 +176,7 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `GET /forms/jobs/{job_id}/file` | yes | The filled PDF, or `404` when it is not ready or the job is not theirs |
 | `POST /forms/jobs/{job_id}/refill` | yes | Replace `extracted_values`, set `pending`, and enqueue `run_form_fill` |
 
-A new route is protected by adding `user: User = Depends(get_current_user)`, and it must filter its queries by `user.id`. Return 404, not 403, for another user's row, so a caller cannot tell the row exists. `/health`, `/auth/register`, `/auth/login`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/microsoft/callback`, `/auth/google/callback`, and `/webhooks/graph` are public on purpose. Each callback is public because the provider redirects the browser there. The Redis state from the matching start route is what ties that request to a user.
+A new route is protected by adding `user: User = Depends(get_current_user)`, and it must filter its queries by `user.id`. Return 404, not 403, for another user's row, so a caller cannot tell the row exists. `/health`, `/auth/register`, `/auth/login`, `/auth/forgot-password`, `/auth/reset-password`, `/auth/microsoft/callback`, `/auth/google/callback`, `/auth/slack/callback`, and `/webhooks/graph` are public on purpose. Each callback is public because the provider redirects the browser there. The Redis state from the matching start route is what ties that request to a user.
 
 Graph sends `validationToken` when a subscription is created. The webhook answers with that exact token as `text/plain`. Other calls are change notifications. A notification whose `clientState` matches `GRAPH_WEBHOOK_CLIENT_STATE` is accepted with `202` and enqueued with that notification's `subscriptionId`. A mismatch is logged and skipped. After a successful Outlook sync, when `GRAPH_WEBHOOK_URL` and `GRAPH_WEBHOOK_CLIENT_STATE` are both set and the account has no subscription id, the sync creates one. Empty settings are logged and skipped. Gmail does not create a subscription. See Background jobs for how the id is resolved.
 
@@ -187,7 +187,7 @@ ARQ job names are the function names. Mail jobs are in `app/worker/mail_tasks.py
 | Job                         | Started by | What it does today |
 | --------------------------- | ---------- | ------------------ |
 | `heartbeat`                 | nothing yet | Logs and returns `"ok"` |
-| `sync_mailbox_delta`        | `GET /auth/microsoft/callback`, `GET /auth/google/callback`, and `POST /messages/sync` (account id), and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, reads the Outlook inbox delta, upserts changes, deletes removed rows, then classifies and scores each saved row. Google rows use Gmail, not Graph |
+| `sync_mailbox_delta`        | `GET /auth/microsoft/callback`, `GET /auth/google/callback`, `GET /auth/slack/callback`, and `POST /messages/sync` (account id), and `POST /webhooks/graph` (subscription id) | Refreshes the access token when it is due, reads the Outlook inbox delta, upserts changes, deletes removed rows, then classifies and scores each saved row. Google rows use Gmail, not Graph. Slack rows read DMs, group DMs, and personal @-mentions. None of those paths send Slack messages |
 | `rescore_mailbox_priority`  | worker startup, once per connected mailbox | Classifies and scores messages already stored for one mailbox. It does not call Graph or Gmail and does not change sync status |
 | `send_password_reset`       | `POST /auth/forgot-password` (user id and request id only) | Creates a reset code, stores its hash, and sends the link. The code is not a job argument |
 | `match_form_template`       | `POST /forms/jobs` when `values` is omitted | Scores that user's AcroForm templates, or uses the template the request already set. A JSON object of field values is saved and `run_form_fill` is enqueued. The stub, and any reply that is not a JSON object, finishes `needs_review` with confidence `0` and no file. A missing model key stays on the stub. It does not call Graph or Gmail |
@@ -451,7 +451,7 @@ Deploy:
 5. Existing JWTs without `jti` keep working until they expire. New logins get a `jti`. `POST /auth/logout` stores that `jti` in Postgres. A Redis restart does not undo a logout.
 6. Users who already had two Microsoft rows keep both rows. Only the newest stays visible. Tokens and messages on the others are not deleted.
 
-`APP_ENV=production` refuses the local database password, a database URL without `sslmode=require` (or stricter), a Redis URL without a password, an http frontend origin, a CORS list that omits that origin or contains `*`, a `GRAPH_REDIRECT_URI` whose path is not `/auth/microsoft/callback`, a `GOOGLE_REDIRECT_URI` whose path is not `/auth/google/callback`, and a webhook client state shorter than 16 characters. Both redirect URIs must be https with no query or userinfo. `APP_ENV=development` and `APP_ENV=test` do not apply those checks.
+`APP_ENV=production` refuses the local database password, a database URL without `sslmode=require` (or stricter), a Redis URL without a password, an http frontend origin, a CORS list that omits that origin or contains `*`, a `GRAPH_REDIRECT_URI` whose path is not `/auth/microsoft/callback`, a `GOOGLE_REDIRECT_URI` whose path is not `/auth/google/callback`, and a webhook client state shorter than 16 characters. Both redirect URIs must be https with no query or userinfo. `SLACK_REDIRECT_URI` is checked the same way only when it is set. Leaving the Slack variables empty does not stop the process from booting. `APP_ENV=development` and `APP_ENV=test` do not apply those checks.
 
 ## Connecting a Gmail mailbox
 
@@ -500,6 +500,62 @@ Check a test user against `https://redocu.app` only after the Render service has
 7. Cancel consent once and confirm the inbox URL is `connected=0&error=google_denied`, with no Google error text in the query.
 8. Disconnect Gmail. Those messages leave the list. Outlook mail stays. Connecting the same Google account again shows the stored Gmail messages beside the Outlook mail.
 9. A second Gmail account, while the first is still connected, returns `mailbox_conflict` and does not replace the stored Gmail tokens. Outlook is unchanged.
+
+## Connecting Slack
+
+Slack uses the same start, callback, profile, sync, and message list as Outlook and Gmail. The provider value is `slack`. The token is a **user token**. The authorize URL sends the scopes in `user_scope`, not `scope`, so Slack does not issue a bot token. Outlook and Gmail can stay connected at the same time.
+
+Create a Slack app and add a user token redirect:
+
+1. Create an app at [api.slack.com/apps](https://api.slack.com/apps).
+2. Under **OAuth & Permissions → Redirect URLs**, add the API callback, not the Vite origin. Locally: `http://localhost:8000/auth/slack/callback`. Production: `https://redocu-api.onrender.com/auth/slack/callback`.
+3. Under **User Token Scopes**, add exactly: `im:history`, `im:read`, `mpim:history`, `mpim:read`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `users:read`, `chat:write`.
+4. Copy the client id and client secret into the environment. Leave them out of the frontend, git, logs, and tests.
+
+| Variable | Role |
+| -------- | ---- |
+| `SLACK_CLIENT_ID` | Slack app client id |
+| `SLACK_CLIENT_SECRET` | Slack app client secret |
+| `SLACK_REDIRECT_URI` | Redirect URI registered on the app, and the callback this API serves |
+| `SLACK_SEND_ENABLED` | `1` (default) allows explicit send. `0` refuses `chat.postMessage` and leaves sync on |
+| `TOKEN_ENCRYPTION_KEY` | Fernet key for the token column. The same key used for Microsoft and Google |
+| `FRONTEND_URL` | Where the callback sends the browser |
+
+If any of `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, or `SLACK_REDIRECT_URI` is empty, `GET /auth/slack/start` returns `503 {"detail":"Slack is not configured."}`. Outlook and Gmail are unchanged. The callback in that state redirects to `{FRONTEND_URL}/inbox?connected=0&error=not_configured`.
+
+`GET /auth/slack/start` with the Bearer token returns `{"authorization_url":"https://slack.com/oauth/v2/authorize?..."}`. The Bearer token is not copied into that URL.
+
+The callback is `GET /auth/slack/callback`. It deletes the one-time Redis state and exchanges the code at `https://slack.com/api/oauth.v2.access`. Only `authed_user.access_token` with `token_type` `user` is stored. A bot token is not saved. `provider_account_id` is `{team_id}:{user_id}`. These scopes do not include an email address, so the `email` column stores a label, `{display name} ({team name})`. The user token is encrypted with the same Fernet column as the other mailboxes. There is no refresh token unless Slack token rotation is turned on later; this app does not use rotation.
+
+| `error` | When |
+| ------- | ---- |
+| `not_configured` | Slack client id, secret, or redirect URI is empty |
+| `slack_denied` | Slack sent an `error` query parameter, or the response had no user token |
+| `invalid_state` | `code` or `state` is missing, the state is unusable, or Redis could not be read |
+| `token_exchange` | The code exchange failed |
+| `mailbox_taken` | That Slack user is already stored for a different app user |
+| `mailbox_conflict` | This user already has a different active Slack workspace. Disconnect it first |
+
+`POST /auth/slack/disconnect` calls `auth.revoke`, then clears the local token and sets `disconnected_at`. Messages stay in the database and disappear from `GET /messages` until that same Slack user connects again. Success is `200 {"disconnected": true}`. No active Slack connection is `404 {"detail":"No mailbox is connected."}`.
+
+The 5-minute `sync_connected_mailboxes` cron includes Slack. A user token with no refresh token is still synced. The first sync of a conversation looks back 14 days. Later syncs continue from the last Slack `ts` stored for that conversation. What is stored:
+
+- Every normal message in a DM or a group DM.
+- A channel or private-channel message only when its text mentions the connected user as `<@user id>`. `@channel` and `@here` are not enough. Join, leave, and topic messages are dropped.
+- The same classifier and priority scorer used for email. Slack text is the body and the subject is null. Bulk and no-reply penalties are not applied to Slack rows. Outlook and Gmail penalties are unchanged.
+
+`GET /users/me` lists the Slack row in `mailboxes` with `provider` `slack`, the display label in `email`, that row's `sync`, and `chat_write` true when the stored scopes include `chat:write`. The legacy `mailbox` field stays Outlook, or Gmail when Outlook is not connected. It is null when Slack is the only connection.
+
+`GET /messages` includes Slack rows with `provider` `slack`, `slack_channel_id`, `slack_thread_ts`, and `slack_permalink`. Those three are null on email. `subject` is null. `from_name` is the Slack display name. `from_email` is null.
+
+Sending happens only when the signed-in user calls one of these routes. Sync, scoring, reply drafts, and `POST /messages/{id}/approve` do not post to Slack. Approve on a Slack row returns `409 {"detail":"Use the Slack reply endpoint."}`.
+
+| Route | Body | What it does |
+| ----- | ---- | ------------ |
+| `POST /messages/{id}/slack-reply` | `{"text":"..."}` | `chat.postMessage` in that message's `thread_ts`, as the user |
+| `POST /slack/send` | `{"channel":"D...","text":"...","thread_ts":null}` | `chat.postMessage` to a conversation the user can access |
+
+Text must be non-empty and at most 40,000 characters. `SLACK_SEND_ENABLED=0` returns `403 {"detail":"Slack sending is turned off."}`. A missing `chat:write` scope, or Slack `missing_scope`, returns `409 {"detail":"Reconnect Slack to allow sending."}`. `not_in_channel` is 403. `channel_not_found` is 404. A 429 that survives the short retry is returned with `Retry-After`. Every attempt is written to `slack_sent_messages`. A successful send is also stored on `messages` so it shows up in the thread.
 
 ## Tests
 

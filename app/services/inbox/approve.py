@@ -256,6 +256,11 @@ def approve_message(session: Session, user: User, message_id: UUID) -> Message:
     account = session.get(ConnectedAccount, message.connected_account_id)
     if account is None or account.user_id != user.id or account.disconnected_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
+    if account.provider == "slack":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Use the Slack reply endpoint.",
+        )
     if message.approved_at is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This email was already sent.")
     draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == message.id)).first()

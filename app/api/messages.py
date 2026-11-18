@@ -142,6 +142,9 @@ class MessageResponse(BaseModel):
     suggested_form: SuggestedFormResponse | None = None
     new_email: NewEmailResponse | None = None
     approved_at: datetime | None = None
+    slack_channel_id: str | None = None
+    slack_thread_ts: str | None = None
+    slack_permalink: str | None = None
 
 
 class MessageDetailResponse(MessageResponse):
@@ -290,6 +293,9 @@ def _message_response(
         conversation_id=row.conversation_id,
         new_email=_new_email(row),
         approved_at=row.approved_at,
+        slack_channel_id=row.slack_channel_id,
+        slack_thread_ts=row.slack_thread_ts,
+        slack_permalink=row.slack_permalink,
     )
 
 
@@ -465,6 +471,9 @@ class ConversationMessage(BaseModel):
     body_text: str
     received_at: datetime
     direction: Literal["incoming", "outgoing"]
+    slack_channel_id: str | None = None
+    slack_thread_ts: str | None = None
+    slack_permalink: str | None = None
 
 
 class ConversationPage(BaseModel):
@@ -810,6 +819,11 @@ def push_outlook_draft(
     A later push PATCHes that same id. This route does not send mail.
     """
     row, account = _visible_message(session, user, message_id)
+    if account.provider == "slack":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Use the Slack reply endpoint.",
+        )
     if account.provider != "microsoft":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -948,6 +962,11 @@ def attach_filled_form(
     as it is and only the attachment is posted.
     """
     row, account = _visible_message(session, user, message_id)
+    if account.provider == "slack":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Use the Slack reply endpoint.",
+        )
     if account.provider != "microsoft":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

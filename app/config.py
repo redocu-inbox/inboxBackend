@@ -19,6 +19,7 @@ _LOCAL_DB_PASSWORD = "inbox"
 _ACCEPTED_SSLMODES = {"require", "verify-ca", "verify-full"}
 _GRAPH_CALLBACK_PATH = "/auth/microsoft/callback"
 _GOOGLE_CALLBACK_PATH = "/auth/google/callback"
+_SLACK_CALLBACK_PATH = "/auth/slack/callback"
 
 
 class Settings(BaseSettings):
@@ -72,6 +73,13 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""
+
+    # Slack user token (not a bot token). Empty values leave Slack disabled.
+    slack_client_id: str = ""
+    slack_client_secret: str = ""
+    slack_redirect_uri: str = ""
+    # Kill switch for chat.postMessage. Sync and read stay available when this is false.
+    slack_send_enabled: bool = True
 
     graph_scopes: str = (
         "https://graph.microsoft.com/User.Read,"
@@ -181,6 +189,13 @@ class Settings(BaseSettings):
             setting_name="GOOGLE_REDIRECT_URI",
             expected_path=_GOOGLE_CALLBACK_PATH,
         )
+        # Slack is optional. An empty redirect must not stop the process from booting.
+        if self.slack_redirect_uri.strip():
+            _check_production_redirect(
+                self.slack_redirect_uri.strip(),
+                setting_name="SLACK_REDIRECT_URI",
+                expected_path=_SLACK_CALLBACK_PATH,
+            )
         if len(self.graph_webhook_client_state) < 16:
             raise ValueError(
                 "GRAPH_WEBHOOK_CLIENT_STATE must be a random string of at least 16 characters "

@@ -20,6 +20,7 @@ SYNC_STALE_AFTER = timedelta(minutes=10)
 
 ACTIVE_MAILBOX_INDEX = "uq_connected_accounts_one_active_microsoft"
 ACTIVE_GOOGLE_MAILBOX_INDEX = "uq_connected_accounts_one_active_google"
+ACTIVE_SLACK_MAILBOX_INDEX = "uq_connected_accounts_one_active_slack"
 ONE_ACTIVE_MAILBOX_INDEX = "uq_connected_accounts_one_active"
 
 # Keeps the newest active Microsoft row per user. Does not touch tokens,
@@ -61,6 +62,8 @@ QUEUE_UNAVAILABLE = "queue_unavailable"
 TOKEN_REFRESH_FAILED = "token_refresh_failed"
 GRAPH_UNAVAILABLE = "graph_unavailable"
 GMAIL_UNAVAILABLE = "gmail_unavailable"
+SLACK_UNAVAILABLE = "slack_unavailable"
+SLACK_RATE_LIMITED = "slack_rate_limited"
 
 
 def deactivate_extra_mailboxes(connection) -> None:

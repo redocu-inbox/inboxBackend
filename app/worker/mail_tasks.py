@@ -44,9 +44,13 @@ from app.services.graph.tokens import (
 from app.services.mailboxes import (
     GMAIL_UNAVAILABLE,
     GRAPH_UNAVAILABLE,
+    SLACK_RATE_LIMITED,
+    SLACK_UNAVAILABLE,
     TOKEN_REFRESH_FAILED,
     sync_in_flight,
 )
+from app.services.slack.http import SlackRateLimited
+from app.services.slack.sync import collect_slack_messages
 from app.services.forms.match import consider_form_match_on_sync
 from app.services.priority.apply import classify_and_score, locked_fields
 from app.models.message import Message
@@ -145,12 +149,21 @@ def _upsert_message(
     return existing
 
 
-def _classify_saved(session: Session, row: Message | None) -> None:
+def _classify_saved(session: Session, row: Message | None, *, provider: str | None = None) -> None:
     """Classify and score one upserted row. Corrected fields stay as stored."""
     if row is None:
         return
     held = locked_fields(session, [row.id]).get(row.id, set())
-    classify_and_score(row, locked=held)
+    classify_and_score(row, locked=held, provider=provider)
+
+
+def _has_sync_credentials(account: ConnectedAccount) -> bool:
+    """Slack user tokens are long-lived and have no refresh token."""
+    if not account.access_token:
+        return False
+    if account.provider == "slack":
+        return True
+    return bool(account.refresh_token)
 
 
 logger = logging.getLogger(__name__)
@@ -181,7 +194,7 @@ def _stale(account: ConnectedAccount, generation: int | None) -> bool:
     """True when this job must not read Graph or write tokens or messages."""
     if account.disconnected_at is not None:
         return True
-    if not account.access_token or not account.refresh_token:
+    if not _has_sync_credentials(account):
         return True
     if generation is not None and int(account.sync_generation or 0) != generation:
         return True
@@ -368,7 +381,11 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
         for item in items:
-            _classify_saved(session, _upsert_message(session, locked, item, gmail_message_fields))
+            _classify_saved(
+                session,
+                _upsert_message(session, locked, item, gmail_message_fields),
+                provider="google",
+            )
         locked.sync_status = "idle"
         locked.sync_error_code = None
         locked.last_sync_at = utcnow()
@@ -387,6 +404,82 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
         return
     consider_form_match_on_sync(ctx, account_id)
     logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
+
+
+def _sync_slack_mailbox(
+    session: Session,
+    account_id: UUID,
+    claimed: int | None,
+    ctx: dict,
+) -> None:
+    """Store DMs, group DMs, and personal mentions. This does not post to Slack."""
+    locked = _lock_account(session, account_id)
+    if locked is None or locked.provider != "slack" or _stale(locked, claimed):
+        session.rollback()
+        return
+    locked.sync_status = "running"
+    locked.sync_error_code = None
+    locked.sync_status_at = utcnow()
+    session.add(locked)
+    session.commit()
+    try:
+        items = collect_slack_messages(session, locked)
+    except SlackRateLimited:
+        session.rollback()
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s",
+            account_id,
+            SLACK_RATE_LIMITED,
+        )
+        _mark_failed(session, account_id, claimed, SLACK_RATE_LIMITED)
+        return
+    except Exception as exc:
+        session.rollback()
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            SLACK_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, SLACK_UNAVAILABLE)
+        return
+
+    try:
+        locked = _lock_account(session, account_id)
+        if locked is None or locked.provider != "slack" or _stale(locked, claimed):
+            session.rollback()
+            logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
+            return
+        for item in items:
+            _classify_saved(
+                session,
+                _upsert_message(session, locked, item, _mapped_fields),
+                provider="slack",
+            )
+        locked.sync_status = "idle"
+        locked.sync_error_code = None
+        locked.last_sync_at = utcnow()
+        locked.sync_status_at = locked.last_sync_at
+        session.add(locked)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.warning(
+            "sync_mailbox_delta failed account=%s code=%s error_type=%s",
+            account_id,
+            SLACK_UNAVAILABLE,
+            type(exc).__name__,
+        )
+        _mark_failed(session, account_id, claimed, SLACK_UNAVAILABLE)
+        return
+    consider_form_match_on_sync(ctx, account_id)
+    logger.info("sync_mailbox_delta finished account=%s job_id=%s", account_id, ctx.get("job_id"))
+
+
+def _mapped_fields(item: dict) -> dict | None:
+    if not item.get("graph_id") or item.get("received_at") is None:
+        return None
+    return item
 
 
 async def sync_mailbox_delta(
@@ -415,6 +508,9 @@ async def sync_mailbox_delta(
             claimed = int(account.sync_generation or 0)
         if account.provider == "google":
             _sync_google_mailbox(session, account_id, claimed, ctx)
+            return
+        if account.provider == "slack":
+            _sync_slack_mailbox(session, account_id, claimed, ctx)
             return
         if account.provider != "microsoft":
             logger.info(
@@ -475,7 +571,11 @@ async def sync_mailbox_delta(
             for removed_id in delta.removed_ids:
                 _delete_provider_message(session, locked, removed_id)
             for item in delta.changed:
-                _classify_saved(session, _upsert_message(session, locked, item))
+                _classify_saved(
+                    session,
+                    _upsert_message(session, locked, item),
+                    provider="microsoft",
+                )
             if delta.delta_link:
                 locked.delta_link = delta.delta_link
             locked.sync_status = "idle"
@@ -523,7 +623,7 @@ async def rescore_mailbox_priority(ctx: dict, account_id: str) -> int | None:
         ).all()
         held = locked_fields(session, [row.id for row in rows])
         for row in rows:
-            if classify_and_score(row, locked=held.get(row.id, set())):
+            if classify_and_score(row, locked=held.get(row.id, set()), provider=account.provider):
                 row.updated_at = utcnow()
                 session.add(row)
         session.commit()
@@ -676,7 +776,7 @@ def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
             session.exec(
                 select(ConnectedAccount)
                 .where(ConnectedAccount.disconnected_at.is_(None))
-                .where(ConnectedAccount.provider.in_(("microsoft", "google")))
+                .where(ConnectedAccount.provider.in_(("microsoft", "google", "slack")))
                 .order_by(ConnectedAccount.id)
                 .with_for_update()
             ).all()
@@ -684,7 +784,7 @@ def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
         now = utcnow()
         changed = False
         for account in accounts:
-            if not account.access_token or not account.refresh_token:
+            if not _has_sync_credentials(account):
                 skipped += 1
                 continue
             if sync_in_flight(account, now=now):
@@ -706,7 +806,7 @@ def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
 
 
 async def sync_connected_mailboxes(ctx: dict) -> dict[str, int]:
-    """Sync every connected Outlook and Gmail mailbox.
+    """Sync every connected Outlook, Gmail, and Slack mailbox.
 
     Calls the same `sync_mailbox_delta` path as a manual sync, including its
     row lock and generation check. A mailbox that is already pending or running

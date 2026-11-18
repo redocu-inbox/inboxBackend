@@ -9,6 +9,7 @@ from app.models.message import Message
 from app.models.password_reset import PasswordResetRequest, PasswordResetToken
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.revoked_token import RevokedToken
+from app.models.slack import SlackSentMessage, SlackSyncCursor, SlackUserCache
 from app.models.staged_attachment import StagedAttachment
 from app.models.user import User
 
@@ -26,6 +27,9 @@ __all__ = [
     "ReplyDraft",
     "ReplyDraftStatus",
     "RevokedToken",
+    "SlackSentMessage",
+    "SlackSyncCursor",
+    "SlackUserCache",
     "StagedAttachment",
     "User",
 ]
