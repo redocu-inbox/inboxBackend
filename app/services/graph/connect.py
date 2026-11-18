@@ -75,8 +75,8 @@ def connect_mailbox(
     tenant_id: str | None,
     email: str,
     access_token: str,
-    refresh_token: str,
-    expires_at: datetime,
+    refresh_token: str | None,
+    expires_at: datetime | None,
     scopes: str | None,
     _retry: bool = False,
 ) -> ConnectOutcome:
@@ -86,7 +86,8 @@ def connect_mailbox(
     provider is rejected while one is still active. An account id owned by
     another app user is rejected. Neither rejection changes the stored tokens.
     A unique-index race is rolled back and classified instead of being left
-    half-saved.
+    half-saved. Slack user tokens have no refresh token and no expiry; those
+    arguments are null for that provider.
     """
     if (
         not provider_account_id

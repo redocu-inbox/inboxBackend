@@ -319,6 +319,9 @@ def _bulk_reason(
     fields: Mapping[str, object],
     keyword_parts: tuple[str, str, str],
 ) -> tuple[str, str, int] | None:
+    # Slack has no From address. Phrases like "do not reply" show up in normal chat.
+    if fields.get("provider") == "slack":
+        return None
     if _construction_mail(fields, keyword_parts) or _platform_sender(fields.get("from_email")):
         return None
     local = _local_part(fields.get("from_email")).lower()

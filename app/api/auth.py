@@ -43,6 +43,16 @@ from app.services.google.oauth import (
 )
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.oauth import build_msal_app
+from app.services.slack.connect import connect_slack_mailbox
+from app.services.slack.oauth import (
+    SlackOAuthError,
+    exchange_slack_code,
+    mailbox_label,
+    revoke_slack_token,
+    slack_authorization_url,
+    slack_display_name,
+    slack_is_configured,
+)
 from app.services.mailboxes import (
     disconnect_active_mailbox,
     lock_active_mailbox,
@@ -100,6 +110,8 @@ class DisconnectResponse(BaseModel):
 # The frontend branches on these. Provider text is logged and stays out of the URL.
 _ERR_DENIED = "microsoft_denied"
 _ERR_GOOGLE_DENIED = "google_denied"
+_ERR_SLACK_DENIED = "slack_denied"
+_ERR_SLACK_UNCONFIGURED = "not_configured"
 _ERR_STATE = "invalid_state"
 _ERR_TOKEN = "token_exchange"
 _ERR_TAKEN = "mailbox_taken"
@@ -521,6 +533,139 @@ def google_disconnect(
     if copied:
         revoke_google_token(copied)
     if not disconnect_active_mailbox(session, user.id, provider="google"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No mailbox is connected.",
+        )
+    return DisconnectResponse(disconnected=True)
+
+
+@router.get("/slack/start", status_code=status.HTTP_200_OK)
+def slack_start(user: User = Depends(get_current_user)) -> MicrosoftStartResponse:
+    """Return Slack's authorize URL for a user token. The Bearer token is not copied into it."""
+    if not slack_is_configured():
+        logger.warning("Slack authorize URL is not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Slack is not configured.",
+        )
+    state = secrets.token_urlsafe(32)
+    try:
+        _store_oauth_state(state, user.id)
+    except Exception as exc:
+        logger.warning("oauth state store unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Slack connect is temporarily unavailable.",
+        ) from exc
+    try:
+        url = slack_authorization_url(state)
+    except Exception as exc:
+        _delete_oauth_state(state)
+        logger.warning("Slack authorize URL failed error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Slack connect is temporarily unavailable.",
+        ) from exc
+    return MicrosoftStartResponse(authorization_url=url)
+
+
+@router.get("/slack/callback")
+async def slack_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    session: Session = Depends(get_session),
+) -> RedirectResponse:
+    """Finish Slack user OAuth and send the browser back to the configured frontend.
+
+    Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
+    Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
+    The error is one of not_configured, slack_denied, invalid_state, token_exchange,
+    mailbox_taken, or mailbox_conflict. A bot token is slack_denied and is not stored.
+    """
+    if not slack_is_configured():
+        if state:
+            _consume_oauth_user_id(state)
+        return _inbox_failure(_ERR_SLACK_UNCONFIGURED, provider="Slack")
+    persisted = False
+    try:
+        if error:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_SLACK_DENIED, provider="Slack")
+        if not code or not state:
+            if state:
+                _consume_oauth_user_id(state)
+            return _inbox_failure(_ERR_STATE, provider="Slack")
+
+        user_id = _consume_oauth_user_id(state)
+        if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
+            return _inbox_failure(_ERR_STATE, provider="Slack")
+        if session.get(User, user_id) is None:
+            return _inbox_failure(_ERR_STATE, provider="Slack")
+
+        try:
+            grant = exchange_slack_code(code)
+        except SlackOAuthError as exc:
+            return _inbox_failure(exc.reason, provider="Slack")
+
+        display = slack_display_name(grant.access_token, grant.user_id)
+        label = mailbox_label(display, grant.team_name)
+        outcome = connect_slack_mailbox(
+            session,
+            user_id=user_id,
+            provider_account_id=f"{grant.team_id}:{grant.user_id}",
+            team_id=grant.team_id,
+            email=label,
+            access_token=grant.access_token,
+            scopes=grant.scopes,
+        )
+        if outcome.status is ConnectStatus.mailbox_taken:
+            return _inbox_failure(_ERR_TAKEN, provider="Slack")
+        if outcome.status is ConnectStatus.mailbox_conflict:
+            return _inbox_failure(_ERR_CONFLICT, provider="Slack")
+        if outcome.status is not ConnectStatus.connected or outcome.account_id is None:
+            return _inbox_failure(_ERR_TOKEN, provider="Slack")
+        persisted = True
+        try:
+            await get_arq_enqueue(request, outcome.account_id, outcome.generation)
+        except Exception as exc:
+            logger.warning(
+                "sync enqueue failed account=%s error_type=%s",
+                outcome.account_id,
+                type(exc).__name__,
+            )
+            if outcome.generation is not None:
+                mark_sync_enqueue_failed(session, outcome.account_id, outcome.generation)
+        return _inbox_redirect(connected="1", email=outcome.email or label)
+    except Exception as exc:
+        logger.warning("Slack callback failed error_type=%s", type(exc).__name__)
+        if persisted:
+            return _inbox_redirect(connected="1")
+        return _inbox_failure(_ERR_TOKEN, provider="Slack")
+
+
+@router.post("/slack/disconnect")
+def slack_disconnect(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> DisconnectResponse:
+    """Revoke the Slack user token and hide that mailbox. Messages stay stored."""
+    account = lock_active_mailbox(session, user.id, provider="slack")
+    if account is None:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No mailbox is connected.",
+        )
+    token = account.access_token
+    copied = token if isinstance(token, str) and token else None
+    session.rollback()
+    if copied:
+        revoke_slack_token(copied)
+    if not disconnect_active_mailbox(session, user.id, provider="slack"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No mailbox is connected.",

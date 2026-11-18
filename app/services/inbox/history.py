@@ -90,4 +90,7 @@ def _history_item(row: Message) -> dict:
         "body_text": row.body_text or "",
         "received_at": row.received_at,
         "direction": direction,
+        "slack_channel_id": row.slack_channel_id,
+        "slack_thread_ts": row.slack_thread_ts,
+        "slack_permalink": row.slack_permalink,
     }

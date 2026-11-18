@@ -122,6 +122,24 @@ def test_rescore_on_startup_defaults_to_on_and_accepts_zero(monkeypatch):
     assert Settings(_env_file=None, app_env="development").rescore_on_startup is True
 
 
+def test_production_slack_redirect_is_optional_and_checked_when_set():
+    settings = _production()
+    assert settings.slack_client_id == ""
+    assert settings.slack_client_secret == ""
+    assert settings.slack_redirect_uri == ""
+    assert settings.slack_send_enabled is True
+    with pytest.raises(ValidationError):
+        _production(slack_redirect_uri="http://redocu-api.onrender.com/auth/slack/callback")
+    with pytest.raises(ValidationError):
+        _production(slack_redirect_uri="https://redocu-api.onrender.com/auth/google/callback")
+    accepted = _production(
+        slack_redirect_uri="https://redocu-api.onrender.com/auth/slack/callback",
+        slack_send_enabled=False,
+    )
+    assert accepted.slack_redirect_uri.endswith("/auth/slack/callback")
+    assert accepted.slack_send_enabled is False
+
+
 def test_development_still_allows_local_defaults():
     Settings(
         _env_file=None,

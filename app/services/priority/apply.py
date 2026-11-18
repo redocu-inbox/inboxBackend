@@ -48,6 +48,7 @@ def classify_and_score(
     message: Any,
     now: datetime | None = None,
     locked: set[str] | None = None,
+    provider: str | None = None,
 ) -> bool:
     """Classify, then score. Return whether a score was written.
 
@@ -74,6 +75,8 @@ def classify_and_score(
             if name not in held:
                 setattr(message, name, result[name])
         fields = _fields(message)
+    if provider == "slack":
+        fields["provider"] = "slack"
     try:
         scored, band, reasons, stamp = score(fields, moment)
     except Exception as exc:

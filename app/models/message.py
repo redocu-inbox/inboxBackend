@@ -47,6 +47,10 @@ class Message(SQLModel, table=True):
     user_corrected: bool | None = Field(default=None)
     # Provider thread id. Null on mail synced before this column, and on a local draft.
     conversation_id: str | None = Field(default=None, max_length=512, index=True)
+    # Slack only. Email rows leave these null. thread_ts is the chat.postMessage thread.
+    slack_channel_id: str | None = Field(default=None, max_length=32)
+    slack_thread_ts: str | None = Field(default=None, max_length=32)
+    slack_permalink: str | None = Field(default=None, sa_column=Column(Text))
     to_recipients: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     cc_recipients: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     reply_to: list[Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))

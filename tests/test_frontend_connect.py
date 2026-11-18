@@ -40,6 +40,9 @@ LIST_KEYS = {
     "suggested_form",
     "new_email",
     "approved_at",
+    "slack_channel_id",
+    "slack_thread_ts",
+    "slack_permalink",
 }
 
 
@@ -393,12 +396,14 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
             "provider": "google",
             "email": "ana@gmail.com",
             "sync": idle,
+            "chat_write": False,
         },
         {
             "connected": True,
             "provider": "microsoft",
             "email": "ana@outlook.com",
             "sync": idle,
+            "chat_write": False,
         },
     ]
 
