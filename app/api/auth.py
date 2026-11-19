@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.models.revoked_token import RevokedToken
 from app.models.user import User, utcnow
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.services.account_deletion import account_is_deleting, lock_account_write
 from app.services.auth.password_reset import consume_reset_token, open_reset_request
 from app.services.auth.rate_limit import (
     RateLimitExceeded,
@@ -123,13 +124,25 @@ _UNAVAILABLE = object()
 
 def _token_response(session: Session, user: User) -> TokenResponse:
     """Mint a JWT for the session_version currently stored on the user row."""
-    locked = session.exec(select(User).where(User.id == user.id).with_for_update()).one()
+    locked = None
+    if lock_account_write(session, user.id):
+        locked = session.get(User, user.id, with_for_update=True, populate_existing=True)
+    if locked is None:
+        raise _invalid_login()
     response = TokenResponse(
         access_token=create_access_token(locked.id, int(locked.session_version or 0)),
         expires_in=get_settings().access_token_expire_minutes * 60,
     )
     session.commit()
     return response
+
+
+def _invalid_login() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect email or password",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -158,11 +171,7 @@ def login(body: LoginRequest, session: Session = Depends(get_session)) -> TokenR
     user = session.exec(select(User).where(User.email == body.email)).first()
     if not verify_password(body.password, user.hashed_password if user else None):
         # Same response for a wrong password and an unknown email.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _invalid_login()
     return _token_response(session, user)
 
 
@@ -193,6 +202,8 @@ async def forgot_password(
     if user is None:
         return {}
     request_id = open_reset_request(session, user)
+    if request_id is None:
+        return {}
     try:
         await get_arq(request).enqueue_job("send_password_reset", str(user.id), str(request_id))
     except Exception:
@@ -440,7 +451,7 @@ async def google_callback(
         user_id = _consume_oauth_user_id(state)
         if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
             return _inbox_failure(_ERR_STATE, provider="Google")
-        if session.get(User, user_id) is None:
+        if session.get(User, user_id) is None or account_is_deleting(session, user_id):
             return _inbox_failure(_ERR_STATE, provider="Google")
 
         result = exchange_authorization_code(code)
@@ -605,7 +616,7 @@ async def slack_callback(
         user_id = _consume_oauth_user_id(state)
         if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
             return _inbox_failure(_ERR_STATE, provider="Slack")
-        if session.get(User, user_id) is None:
+        if session.get(User, user_id) is None or account_is_deleting(session, user_id):
             return _inbox_failure(_ERR_STATE, provider="Slack")
 
         try:
@@ -725,7 +736,7 @@ async def microsoft_callback(
             return _inbox_failure(_ERR_STATE)
         if not isinstance(user_id, UUID):
             return _inbox_failure(_ERR_STATE)
-        if session.get(User, user_id) is None:
+        if session.get(User, user_id) is None or account_is_deleting(session, user_id):
             return _inbox_failure(_ERR_STATE)
 
         result = _exchange_code(code)

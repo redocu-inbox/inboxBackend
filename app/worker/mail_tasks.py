@@ -17,6 +17,7 @@ from app.db import engine
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import utcnow
 from app.models.connected_account import ConnectedAccount
+from app.services.account_deletion import account_is_deleting, lock_account_write
 from app.services.llm.factory import get_llm
 from app.services.llm.stub import StubLLM
 from app.services.reply_drafts.generation import build_reply_prompts, final_reply_body
@@ -187,6 +188,10 @@ def _generation(value: object) -> int | None:
 
 
 def _lock_account(session: Session, account_id: UUID) -> ConnectedAccount | None:
+    with session.no_autoflush:
+        user_id = session.scalar(select(ConnectedAccount.user_id).where(ConnectedAccount.id == account_id))
+        if user_id is None or not lock_account_write(session, user_id):
+            return None
     # populate_existing: this session may already hold the row from before a
     # disconnect committed on another connection.
     return session.exec(
@@ -283,7 +288,7 @@ def _store_new_subscription(
             exc.status,
         )
         return
-    current = session.get(ConnectedAccount, account.id)
+    current = _lock_account(session, account.id)
     if current is None or current.disconnected_at is not None or current.provider != "microsoft":
         return
     current.graph_subscription_id = subscription_id
@@ -301,6 +306,7 @@ def _ensure_graph_subscription(session: Session, account_id: UUID) -> None:
         or account.provider != "microsoft"
         or account.disconnected_at is not None
         or account.graph_subscription_id
+        or account_is_deleting(session, account.user_id)
     ):
         return
     try:
@@ -625,6 +631,8 @@ async def rescore_mailbox_priority(ctx: dict, account_id: str) -> int | None:
         account = session.get(ConnectedAccount, account_uuid)
         if account is None or account.disconnected_at is not None:
             return None
+        if not lock_account_write(session, account.user_id):
+            return None
         rows = session.exec(
             select(Message).where(Message.connected_account_id == account.id)
         ).all()
@@ -742,7 +750,11 @@ def _renew_subscription(account_id: UUID) -> None:
                 type(exc).__name__,
             )
             return
-        if account is None or not account.access_token or not account.graph_subscription_id:
+        if (
+            not account.access_token
+            or not account.graph_subscription_id
+            or account_is_deleting(session, account.user_id)
+        ):
             return
         try:
             expires = renew_graph_subscription(account.access_token, account.graph_subscription_id)
@@ -759,7 +771,7 @@ def _renew_subscription(account_id: UUID) -> None:
                 exc.status,
             )
             return
-        current = session.get(ConnectedAccount, account.id)
+        current = _lock_account(session, account.id)
         if current is None or current.disconnected_at is not None:
             return
         current.graph_subscription_expires_at = expires
@@ -795,6 +807,9 @@ def _claim_periodic_syncs() -> tuple[list[tuple[UUID, int]], int]:
                 skipped += 1
                 continue
             if sync_in_flight(account, now=now):
+                skipped += 1
+                continue
+            if not lock_account_write(session, account.user_id):
                 skipped += 1
                 continue
             account.sync_generation = int(account.sync_generation or 0) + 1
@@ -872,6 +887,8 @@ def _pending_reply_fields(message_id: str) -> tuple[str | None, str | None, str 
         draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
         if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
             return None
+        if account_is_deleting(session, draft.user_id):
+            return None
         message = session.get(Message, parsed)
         if message is None:
             return None
@@ -887,6 +904,8 @@ def _fail_reply_draft(message_id: str) -> None:
     with Session(engine) as session:
         draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
         if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
+            return
+        if not lock_account_write(session, draft.user_id):
             return
         draft.status = ReplyDraftStatus.failed
         draft.error = "generation failed"
@@ -904,6 +923,8 @@ def _save_reply_draft(message_id: str, body: str) -> None:
     with Session(engine) as session:
         draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == parsed)).first()
         if draft is None or _reply_status(draft.status) != ReplyDraftStatus.pending.value:
+            return
+        if not lock_account_write(session, draft.user_id):
             return
         draft.body = body
         draft.status = ReplyDraftStatus.ready

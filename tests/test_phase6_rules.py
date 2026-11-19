@@ -509,9 +509,11 @@ def test_shared_inbox_signals_and_weekday_deadlines():
 def test_rescore_is_registered_and_not_on_the_cron():
     assert rescore_mailbox_priority in WorkerSettings.functions
     assert rescore_connected_mailboxes not in WorkerSettings.functions
-    names = [getattr(job.coroutine, "__name__", "") for job in WorkerSettings.cron_jobs]
-    assert names == ["renew_graph_subscriptions", "sync_connected_mailboxes"]
-    assert WorkerSettings.cron_jobs[1].minute == set(range(0, 60, 5))
+    cron_jobs = {job.coroutine.__name__: job for job in WorkerSettings.cron_jobs}
+    assert "renew_graph_subscriptions" in cron_jobs
+    assert "rescore_mailbox_priority" not in cron_jobs
+    assert "rescore_connected_mailboxes" not in cron_jobs
+    assert cron_jobs["sync_connected_mailboxes"].minute == set(range(0, 60, 5))
     assert WorkerSettings.on_startup is startup
 
 

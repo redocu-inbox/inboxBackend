@@ -4,11 +4,12 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
-from app.api.deps import get_current_user, get_session
+from app.api.deps import get_current_user, get_deletion_user, get_session
+from app.models.account_deletion import AccountDeletion
 from app.models.connected_account import ConnectedAccount
 from app.models.user import User, utcnow
 from app.services.mailboxes import SYNC_STATUSES
@@ -62,6 +63,11 @@ class UpdateProfileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     display_name: str | None = Field(default=None, max_length=256)
+
+
+class AccountDeletionResponse(BaseModel):
+    status: Literal["pending"] = "pending"
+    requested_at: datetime
 
 
 def active_mailboxes(session: Session, user_id: UUID) -> list[ConnectedAccount]:
@@ -185,3 +191,23 @@ def update_me(
         session.commit()
         session.refresh(user)
     return _user_response(user, session)
+
+
+@router.delete(
+    "/me",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={status.HTTP_409_CONFLICT: {"description": "Account activity is in progress. Retry shortly."}},
+)
+def request_account_deletion(
+    user: User = Depends(get_deletion_user),
+    session: Session = Depends(get_session),
+) -> AccountDeletionResponse:
+    """Record one deletion request and block account activity once it commits."""
+    deletion = session.get(AccountDeletion, user.id)
+    if deletion is not None:
+        return AccountDeletionResponse(requested_at=deletion.requested_at)
+    deletion = AccountDeletion(user_id=user.id)
+    response = AccountDeletionResponse(requested_at=deletion.requested_at)
+    session.add(deletion)
+    session.commit()
+    return response

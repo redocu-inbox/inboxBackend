@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.models.password_reset import PasswordResetRequest, PasswordResetToken
 from app.models.user import User, utcnow
 from app.security import hash_password
+from app.services.account_deletion import lock_account_write
 from app.services.email.base import EmailDeliveryError, EmailMessage
 from app.services.email.factory import get_email_sender
 
@@ -42,9 +43,13 @@ def reset_link(raw_token: str) -> str:
     return f"{origin}/reset-password#token={quote(raw_token, safe='')}"
 
 
-def open_reset_request(session: Session, user: User) -> UUID:
+def open_reset_request(session: Session, user: User) -> UUID | None:
     """Invalidate unused codes and record a new request. Does not create a code."""
-    locked = session.exec(select(User).where(User.id == user.id).with_for_update()).one()
+    if not lock_account_write(session, user.id):
+        return None
+    locked = session.get(User, user.id, with_for_update=True, populate_existing=True)
+    if locked is None:
+        return None
     now = utcnow()
     unused = session.exec(
         select(PasswordResetToken).where(
@@ -63,6 +68,8 @@ def open_reset_request(session: Session, user: User) -> UUID:
 
 def deliver_password_reset(session: Session, user_id: UUID, request_id: UUID) -> None:
     """Create a hash, then send the link. Stale requests send nothing."""
+    if not lock_account_write(session, user_id):
+        return
     locked_user = session.exec(select(User).where(User.id == user_id).with_for_update()).first()
     request = session.get(PasswordResetRequest, request_id)
     if locked_user is None or request is None or request.user_id != locked_user.id:
@@ -96,6 +103,8 @@ def deliver_password_reset(session: Session, user_id: UUID, request_id: UUID) ->
     )
     email = locked_user.email
     session.commit()
+    if not lock_account_write(session, user_id):
+        return
     message = EmailMessage(
         to=email,
         subject=SUBJECT,
@@ -132,7 +141,11 @@ def consume_reset_token(session: Session, raw_token: str, new_password: str) -> 
     if row is None or row.used_at is not None or row.expires_at <= now:
         session.rollback()
         return False
-    user = session.exec(select(User).where(User.id == row.user_id).with_for_update()).one()
+    if not lock_account_write(session, row.user_id):
+        return False
+    user = session.get(User, row.user_id, with_for_update=True, populate_existing=True)
+    if user is None:
+        return False
     row.used_at = now
     user.hashed_password = password_hash
     user.session_version = int(user.session_version or 0) + 1

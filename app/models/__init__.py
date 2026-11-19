@@ -1,5 +1,6 @@
 import app.db
 
+from app.models.account_deletion import AccountDeletion
 from app.models.approval import Approval
 from app.models.classification_correction import MessageClassificationCorrection
 from app.models.connected_account import ConnectedAccount
@@ -15,6 +16,7 @@ from app.models.user import User
 
 
 __all__ = [
+    "AccountDeletion",
     "Approval",
     "ConnectedAccount",
     "MessageClassificationCorrection",

@@ -15,6 +15,7 @@ from app.db import engine
 from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.form_template import FormTemplate
 from app.models.user import utcnow
+from app.services.account_deletion import lock_account_write
 from app.services.forms.filler import get_filler
 from app.services.forms.schema import schema_summary
 
@@ -71,6 +72,8 @@ def _execute(job_id: UUID) -> bool:
         if job is None:
             logger.warning("fill job %s was not found", job_id)
             return False
+        if not lock_account_write(session, job.user_id):
+            return False
         job.status = FormFillStatus.running
         job.updated_at = utcnow()
         session.add(job)
@@ -78,12 +81,11 @@ def _execute(job_id: UUID) -> bool:
 
         template = session.get(FormTemplate, job.template_id)
         if template is None:
-            _finish(session, job, status=FormFillStatus.failed, error=FILL_FAILED, dropped=[], pdf=None)
-            return True
+            return _finish(session, job, status=FormFillStatus.failed, error=FILL_FAILED, dropped=[], pdf=None)
         kind, _count, _schema = schema_summary(template.form_schema)
         values = job.extracted_values if isinstance(job.extracted_values, dict) else {}
         if kind != "acroform":
-            _finish(
+            return _finish(
                 session,
                 job,
                 status=FormFillStatus.failed,
@@ -91,9 +93,8 @@ def _execute(job_id: UUID) -> bool:
                 dropped=[],
                 pdf=None,
             )
-            return True
         if len(values) == 0:
-            _finish(
+            return _finish(
                 session,
                 job,
                 status=FormFillStatus.needs_review,
@@ -101,11 +102,10 @@ def _execute(job_id: UUID) -> bool:
                 dropped=[],
                 pdf=None,
             )
-            return True
         data = _storage().get(template.storage_path)
         result = get_filler(template.mime_type).fill(data, values)
         status = FormFillStatus.needs_review if result.dropped else FormFillStatus.completed
-        _finish(
+        return _finish(
             session,
             job,
             status=status,
@@ -113,7 +113,6 @@ def _execute(job_id: UUID) -> bool:
             dropped=result.dropped,
             pdf=result.pdf,
         )
-        return True
 
 
 def _log_finished(job_id: UUID, started: float) -> None:
@@ -141,7 +140,9 @@ def _finish(
     error: str | None,
     dropped: list[str],
     pdf: bytes | None,
-) -> None:
+) -> bool:
+    if not lock_account_write(session, job.user_id):
+        return False
     if pdf is None:
         _clear_file(job)
     else:
@@ -154,12 +155,13 @@ def _finish(
     job.updated_at = utcnow()
     session.add(job)
     session.commit()
+    return True
 
 
 def _fail(job_id: UUID) -> None:
     with Session(engine) as session:
         job = session.get(FormFillJob, job_id)
-        if job is None:
+        if job is None or not lock_account_write(session, job.user_id):
             return
         _clear_file(job)
         job.status = FormFillStatus.failed

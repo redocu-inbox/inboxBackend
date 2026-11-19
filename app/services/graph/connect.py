@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 
 from app.models.connected_account import ConnectedAccount
 from app.models.user import User, utcnow
+from app.services.account_deletion import lock_account_write
 
 
 class ConnectStatus(str, Enum):
@@ -32,6 +33,8 @@ class ConnectOutcome:
 
 
 def _lock_user(session: Session, user_id: UUID) -> User | None:
+    if not lock_account_write(session, user_id):
+        return None
     return session.exec(
         select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
     ).first()

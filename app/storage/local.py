@@ -1,6 +1,20 @@
 """Store files on the local disk. Fine for development; not shared across machines."""
 
 from pathlib import Path
+from shutil import rmtree
+from stat import S_ISDIR
+
+
+def _relative_key(key: str) -> Path:
+    path = Path(key)
+    if not path.parts or path.anchor or key.startswith("\\") or ".." in path.parts:
+        raise ValueError(f"Invalid storage key: {key!r}")
+    return path
+
+
+def _ignore_missing(_operation, _path, error: Exception) -> None:
+    if not isinstance(error, FileNotFoundError):
+        raise error
 
 
 class LocalStorage:
@@ -28,10 +42,22 @@ class LocalStorage:
         path = self._resolve(key)
         path.unlink(missing_ok=True)
 
+    def delete_tree(self, prefix: str) -> None:
+        path = self.root.resolve() / _relative_key(prefix)
+        if path.parent.resolve() != path.parent:
+            raise ValueError("Storage tree has a symlink in its parent path.")
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if S_ISDIR(mode):
+            rmtree(path, onexc=_ignore_missing)
+        else:
+            # Unlink a symlink at the prefix without following it.
+            path.unlink(missing_ok=True)
+
     def _resolve(self, key: str) -> Path:
-        if not key or key.startswith(("/", "\\")) or ".." in Path(key).parts:
-            raise ValueError(f"Invalid storage key: {key!r}")
-        path = (self.root / key).resolve()
+        path = (self.root / _relative_key(key)).resolve()
         if not path.is_relative_to(self.root.resolve()):
             raise ValueError(f"Invalid storage key: {key!r}")
         return path

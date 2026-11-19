@@ -12,6 +12,7 @@ from sqlmodel import Session, select
 
 from app.models.connected_account import ConnectedAccount
 from app.models.user import utcnow
+from app.services.account_deletion import lock_account_write
 from app.services.graph.oauth import build_msal_app
 from app.config import get_settings
 
@@ -50,6 +51,9 @@ def save_tokens(
     Returns the locked row after commit, or None when nothing was written.
     A None result rolls back this unit of work and does not restore cleared tokens.
     """
+    if not lock_account_write(session, account.user_id):
+        session.rollback()
+        return None
     locked = session.exec(
         select(ConnectedAccount)
         .where(ConnectedAccount.id == account.id)
