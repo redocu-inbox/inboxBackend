@@ -201,7 +201,7 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `POST /forms/jobs/{job_id}/refill` | yes | Replace `extracted_values`, set `pending`, and enqueue `run_form_fill` |
 | `POST /messages/new` | yes | Save a new email or a forward. Does not contact the mailbox |
 | `GET /messages/{id}/conversation` | yes | Plain-text history for this mailbox's copy of the thread. Local drafts are omitted |
-| `POST /messages/{id}/approve` | yes | Send a ready Outlook or Gmail draft once, set `approved_at`, and write an approval. A Slack row is `409` |
+| `POST /messages/{id}/approve` | yes | Submit a ready Outlook or Gmail draft once. Set `approved_at` when the send is confirmed. A Slack row is `409` |
 | `POST /messages/{id}/draft/attachments` | yes | Attach a completed PDF to an unsent Outlook draft. Does not send |
 | `POST /attachments` | yes | Stage one file from the computer. Saving a draft is what binds it |
 | `GET /approvals` | yes | This user's approvals, newest first. `X-Total-Count` is the full count |
@@ -458,7 +458,7 @@ Another user's message id is `404` with detail `Message not found.`
 `POST /messages/{id}/approve` sends a ready Outlook or Gmail draft through its mailbox. Before sending, the API saves the draft snapshot and provider reference. Outlook uses `Mail.ReadWrite` to prepare the draft and `Mail.Send` to submit it. Gmail accepts `gmail.send` or `gmail.modify` for sending.
 
 - `200` returns message detail with `approved_at` set. The confirmed attempt appears in `GET /approvals`.
-- `202` returns `{"send_status":"confirmation_pending","attempt_id":"<uuid>"}` while the provider outcome is uncertain. Message detail returns that ID as `pending_send_attempt_id` so the client can restore the pending state after a reload.
+- `202` returns `{"send_status":"confirmation_pending","attempt_id":"<uuid>"}` while an accepted Outlook send awaits confirmation or a provider outcome is uncertain. Message detail returns that ID as `pending_send_attempt_id` so the client can restore the pending state after a reload.
 - `409` covers an already confirmed send, an unready draft, a Slack message, or missing mailbox permissions.
 - `502` means draft preparation failed or the provider definitively rejected the send. The draft can be approved again after the issue is resolved.
 
