@@ -14,7 +14,8 @@ _REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 _AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
-_GOOGLE_SCOPE = f"openid email {GMAIL_READONLY_SCOPE} {GMAIL_SEND_SCOPE}"
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+_GOOGLE_SCOPE = f"openid email {GMAIL_MODIFY_SCOPE}"
 _TIMEOUT_SECONDS = 30
 
 logger = logging.getLogger(__name__)

@@ -597,7 +597,7 @@ def test_approve_does_not_send_slack_and_disconnect_hides_messages(client, regis
     def _explode(*args, **kwargs):
         raise AssertionError("graph send")
 
-    monkeypatch.setattr("app.services.inbox.approve._deliver", _explode)
+    monkeypatch.setattr("app.services.mail.send.urlopen", _explode)
     monkeypatch.setattr("app.services.inbox.approve.refresh_access_token", _explode)
     approved = client.post(f"/messages/{message_id}/approve", headers=headers)
     assert approved.status_code == 409

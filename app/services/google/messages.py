@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 from app.services.google.http import GMAIL_INBOX_LIST_URL, gmail_message_url, google_get
 from app.services.graph.html_text import to_plain_text
+from app.services.inbox.body_html import sanitize_body_html
 from app.services.inbox.recipients import header_people
 
 _EMAIL_IN_BRACKETS = re.compile(r"<([^<>\s]+@[^<>\s]+)>")
@@ -138,6 +139,7 @@ def gmail_message_fields(item: dict) -> dict | None:
         "from_email": from_email,
         "is_read": is_read,
         "body_text": to_plain_text(plain) or to_plain_text(html),
+        "body_html": sanitize_body_html(html),
         "conversation_id": thread_id[:512] if isinstance(thread_id, str) and thread_id else None,
         "to_recipients": header_people(_header(payload, "To")),
         "cc_recipients": header_people(_header(payload, "Cc")),

@@ -1,6 +1,6 @@
 """Turn Microsoft Graph body HTML into plain text.
 
-Graph `body.content` is often HTML. The API stores and returns plain text only.
+Graph `body.content` is often HTML. This converter produces the plain-text field.
 Tags, comments, and the contents of script, style, and noscript are dropped.
 A value that is empty after that becomes null so the client can keep showing
 `body_preview`. Angle brackets never survive, including when Graph mislabels

@@ -2,24 +2,27 @@
 
 The JSON keys are frozen for the frontend. from_name, from_email, is_read, and
 body_text are filled when a sync stores them, and stay null when the provider
-omits them. body_text is plain text, never raw HTML. Sync writes
+omits them. Detail carries plain text and a separate sanitized HTML fragment. Sync writes
 priority_score, priority_band, priority_reasons, and the classification
 fields. A correction leaves that field as the user saved it. A null reasons
 column is [] in JSON. user_corrected is false until a correction.
 priority_scored_at is stored and is not returned. suggested_form is the
 newest needs_review or completed fill job for that message, or null.
-detail.draft is the local reply draft, or null.
-The list has no draft key and no body text. No message route sends mail.
+detail.draft is the local reply draft, or null. has_draft reports saved reply text.
+The list omits archived and trashed messages, draft details, and message bodies.
 """
 
 import logging
 from datetime import date, datetime
 from typing import Any, Literal
+from urllib.error import HTTPError
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy import func, nulls_last
+from sqlalchemy.orm import defer
 from sqlmodel import Session, select
 
 from app.api.deps import get_arq, get_current_user, get_session
@@ -35,6 +38,8 @@ from app.models.message import Message
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import User, utcnow
 from app.services.forms.suggest import SuggestedForm, suggested_forms_for_messages
+from app.services.google.oauth import GMAIL_MODIFY_SCOPE, GoogleTokenUnavailable
+from app.services.google.tokens import refresh_google_access_token
 from app.services.graph.drafts import (
     GraphDraftError,
     add_file_attachment,
@@ -48,18 +53,32 @@ from app.services.graph.tokens import (
     needs_refresh,
     refresh_access_token,
 )
-from app.services.inbox.approve import approve_message
+from app.services.inbox.approve import (
+    approve_message,
+    confirm_send_attempt,
+    lock_outlook_draft_for_edit,
+    pending_send_attempt_id,
+    scope_granted,
+)
 from app.services.inbox.attachments import payloads as attachment_payloads
 from app.services.inbox.attachments import bind_attachments, expire_unbound
 from app.services.inbox.compose import create_local_email
 from app.services.inbox.history import conversation_page
+from app.services.inbox.mail_actions import MoveAction, write_provider_message
 from app.services.inbox.recipients import normalize_list, reply_all, saved_or_default
-from app.services.mailboxes import mark_sync_enqueue_failed, request_mailbox_sync
+from app.services.mailboxes import lock_active_mailbox, mark_sync_enqueue_failed, request_mailbox_sync
 from app.services.priority.apply import message_fields
 from app.services.priority.score import score
 
 router = APIRouter(tags=["messages"])
 logger = logging.getLogger(__name__)
+
+
+_WRITE_SCOPES = {
+    "microsoft": "https://graph.microsoft.com/Mail.ReadWrite",
+    "google": GMAIL_MODIFY_SCOPE,
+}
+_RECONNECT_FOR_ACTIONS = "Reconnect this mailbox to enable email actions."
 
 
 class DraftRecipientsResponse(BaseModel):
@@ -126,6 +145,7 @@ class MessageResponse(BaseModel):
     received_at: datetime
     is_read: bool | None = None
     provider: str | None = None
+    has_draft: bool
     conversation_id: str | None = None
     priority_score: float | None = None
     priority_band: str | None = None
@@ -149,6 +169,7 @@ class MessageResponse(BaseModel):
 
 class MessageDetailResponse(MessageResponse):
     body_text: str | None = None
+    body_html: str | None = None
     draft: ReplyDraftResponse | None = None
     to: list[str] = Field(default_factory=list)
     cc: list[str] = Field(default_factory=list)
@@ -157,6 +178,7 @@ class MessageDetailResponse(MessageResponse):
     can_edit_recipients: bool = False
     account_id: UUID | None = None
     account_email: str | None = None
+    pending_send_attempt_id: UUID | None = None
 
 
 class SyncResponse(BaseModel):
@@ -232,12 +254,16 @@ class ClassificationPatch(BaseModel):
 
 
 def _visible_message_filter(user_id: UUID):
-    """Messages on this user's active mailboxes. Disconnected mailboxes stay in the database."""
+    """Inbox messages on this user's active mailboxes."""
     active_ids = select(ConnectedAccount.id).where(
         ConnectedAccount.user_id == user_id,
         ConnectedAccount.disconnected_at.is_(None),
     )
-    return Message.user_id == user_id, Message.connected_account_id.in_(active_ids)
+    return (
+        Message.user_id == user_id,
+        Message.connected_account_id.in_(active_ids),
+        Message.inbox_removed_at.is_(None),
+    )
 
 
 def _priority_reasons(value: object) -> list[Any]:
@@ -266,7 +292,7 @@ def _suggested_response(suggested: SuggestedForm | None) -> SuggestedFormRespons
 
 
 def _message_response(
-    row: Message, provider: str | None, suggested: SuggestedForm | None = None
+    row: Message, provider: str | None, suggested: SuggestedForm | None, *, draft_text: str | None
 ) -> MessageResponse:
     return MessageResponse(
         id=row.id,
@@ -277,6 +303,7 @@ def _message_response(
         received_at=row.received_at,
         is_read=row.is_read,
         provider=provider,
+        has_draft=bool(draft_text and draft_text.strip()),
         priority_score=row.priority_score,
         priority_band=row.priority_band,
         priority_reasons=_priority_reasons(row.priority_reasons),
@@ -323,15 +350,20 @@ def list_messages(
     total = session.scalar(select(func.count(Message.id)).where(*visible))
     response.headers["X-Total-Count"] = str(total or 0)
     rows = session.exec(
-        select(Message, ConnectedAccount.provider)
+        select(Message, ConnectedAccount.provider, ReplyDraft.body)
         .join(ConnectedAccount, ConnectedAccount.id == Message.connected_account_id)
+        .outerjoin(ReplyDraft, ReplyDraft.message_id == Message.id)
+        .options(defer(Message.body_html))
         .where(*visible)
         .order_by(*_order_by(sort))
         .offset(offset)
         .limit(limit)
     ).all()
-    suggestions = suggested_forms_for_messages(session, [row.id for row, _provider in rows])
-    return [_message_response(row, provider, suggestions.get(row.id)) for row, provider in rows]
+    suggestions = suggested_forms_for_messages(session, [row.id for row, _, _ in rows])
+    return [
+        _message_response(row, provider, suggestions.get(row.id), draft_text=draft_text)
+        for row, provider, draft_text in rows
+    ]
 
 
 def _visible_message(
@@ -404,8 +436,8 @@ def _detail_response(
     session: Session, row: Message, account: ConnectedAccount
 ) -> MessageDetailResponse:
     suggested = suggested_forms_for_messages(session, [row.id]).get(row.id)
-    item = _message_response(row, account.provider, suggested)
     draft = _load_draft(session, row.id)
+    item = _message_response(row, account.provider, suggested, draft_text=draft.body if draft else None)
     draft_body = _draft_response(session, draft) if draft is not None else None
     everyone = reply_all(row, account)
     reply_all_recipients = (
@@ -416,6 +448,7 @@ def _detail_response(
     return MessageDetailResponse(
         **item.model_dump(),
         body_text=row.body_text,
+        body_html=row.body_html,
         draft=draft_body,
         to=_string_list(row.to_recipients),
         cc=_string_list(row.cc_recipients),
@@ -424,6 +457,7 @@ def _detail_response(
         can_edit_recipients=can_edit,
         account_id=account.id,
         account_email=account.email,
+        pending_send_attempt_id=pending_send_attempt_id(session, row.id) if row.approved_at is None else None,
     )
 
 
@@ -504,18 +538,56 @@ async def create_new_email(
     return _detail_response(session, message, account)
 
 
-@router.post("/messages/{message_id}/approve")
+class ApprovalPendingResponse(BaseModel):
+    send_status: Literal["confirmation_pending"] = "confirmation_pending"
+    attempt_id: UUID
+
+
+class SendAttemptResponse(BaseModel):
+    attempt_id: UUID
+    send_status: Literal["confirmation_pending", "sent", "failed"]
+    approved_at: datetime | None = None
+
+
+@router.post(
+    "/messages/{message_id}/approve",
+    response_model=MessageDetailResponse,
+    responses={202: {"model": ApprovalPendingResponse}},
+)
 def approve_draft(
     message_id: UUID,
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
-) -> MessageDetailResponse:
+) -> MessageDetailResponse | JSONResponse:
     """Send the ready draft once. This is the only message route that sends mail."""
-    message = approve_message(session, user, message_id)
+    message, pending_id = approve_message(session, user, message_id)
+    if pending_id is not None:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=ApprovalPendingResponse(attempt_id=pending_id).model_dump(mode="json"),
+        )
     account = session.get(ConnectedAccount, message.connected_account_id)
     if account is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found.")
     return _detail_response(session, message, account)
+
+
+@router.get("/messages/{message_id}/send-attempts/{attempt_id}")
+def read_send_attempt(
+    message_id: UUID,
+    attempt_id: UUID,
+    response: Response,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> SendAttemptResponse:
+    attempt = confirm_send_attempt(session, user.id, message_id, attempt_id)
+    response.headers["Cache-Control"] = "no-store"
+    send_status: Literal["confirmation_pending", "sent", "failed"] = "confirmation_pending"
+    if attempt.approved_at is not None:
+        send_status = "sent"
+    elif attempt.send_failed_at is not None:
+        send_status = "failed"
+    return SendAttemptResponse(attempt_id=attempt.id, send_status=send_status, approved_at=attempt.approved_at)
 
 
 @router.get("/messages/{message_id}/conversation")
@@ -832,46 +904,17 @@ def push_outlook_draft(
     draft = _load_draft(session, row.id)
     if not _ready_draft(draft) or draft is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
-    text = draft.body or ""
     provider_message_id = row.graph_id
-    try:
-        if needs_refresh(account):
-            account = refresh_access_token(session, account)
-    except (TokenRefreshError, MailboxNotWritable) as exc:
-        logger.warning(
-            "outlook draft refresh failed message=%s error_type=%s",
-            row.id,
-            type(exc).__name__,
-        )
-        _store_outlook_error(session, draft, "token refresh failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Outlook token could not be refreshed.",
-        ) from exc
-    token = account.access_token
-    if not token:
-        _store_outlook_error(session, draft, "token refresh failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Outlook token could not be refreshed.",
-        )
-    # Refresh commits the session, so load the draft again before writing its id.
-    draft = session.get(ReplyDraft, draft.id)
+    token = _outlook_access_token(session, account, draft, row.id)
+    draft = session.get(ReplyDraft, draft.id, populate_existing=True, with_for_update=True)
     if not _ready_draft(draft) or draft is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
     try:
         draft_id = draft.graph_draft_id
         if not draft_id:
             draft_id = create_reply_draft(token, provider_message_id)
-            current = session.get(ReplyDraft, draft.id)
-            if current is None:
-                raise GraphDraftError("missing_draft")
-            current.graph_draft_id = draft_id
-            current.updated_at = utcnow()
-            session.add(current)
-            session.commit()
-            draft = current
-        patch_reply_draft(token, draft_id, text)
+            draft.graph_draft_id = draft_id
+        patch_reply_draft(token, draft_id, draft.body or "")
     except GraphDraftError:
         _store_outlook_error(session, draft, "outlook draft failed")
         raise HTTPException(
@@ -938,7 +981,7 @@ def _outlook_access_token(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Outlook token could not be refreshed.",
         ) from exc
-    token = account.access_token
+    token = lock_outlook_draft_for_edit(session, account, message_id).access_token
     if not token:
         _store_outlook_error(session, draft, "token refresh failed")
         raise HTTPException(
@@ -988,26 +1031,17 @@ def attach_filled_form(
     draft = _load_draft(session, row.id)
     if not _ready_draft(draft) or draft is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
-    text = draft.body or ""
     provider_message_id = row.graph_id
     token = _outlook_access_token(session, account, draft, row.id)
-    # Refresh commits the session, so load the draft again before writing its id.
-    draft = session.get(ReplyDraft, draft.id)
+    draft = session.get(ReplyDraft, draft.id, populate_existing=True, with_for_update=True)
     if not _ready_draft(draft) or draft is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Draft is not ready.")
     try:
         draft_id = draft.graph_draft_id
         if not draft_id:
             draft_id = create_reply_draft(token, provider_message_id)
-            current = session.get(ReplyDraft, draft.id)
-            if current is None:
-                raise GraphDraftError("missing_draft")
-            current.graph_draft_id = draft_id
-            current.updated_at = utcnow()
-            session.add(current)
-            session.commit()
-            draft = current
-            patch_reply_draft(token, draft_id, text)
+            draft.graph_draft_id = draft_id
+            patch_reply_draft(token, draft_id, draft.body or "")
         add_file_attachment(token, draft_id, filename, pdf)
     except GraphDraftError:
         _store_outlook_error(session, draft, "outlook draft failed")
@@ -1076,3 +1110,108 @@ async def sync_messages(
             ) from exc
         enqueued = True
     return SyncResponse(enqueued=enqueued, sync_status=_combined_sync_status(requested))
+
+
+class ReadStateInput(BaseModel):
+    is_read: StrictBool
+
+
+def _apply_mail_change(
+    session: Session,
+    user: User,
+    message_id: UUID,
+    change: bool | MoveAction,
+) -> None:
+    row, _ = _visible_message(session, user, message_id)
+    user_id = user.id
+    account_id = row.connected_account_id
+
+    account = lock_active_mailbox(session, user_id, account_id=account_id)
+    if account is None:
+        raise HTTPException(404, "Message not found.")
+
+    scope = _WRITE_SCOPES.get(account.provider)
+    if row.origin != "provider" or scope is None:
+        raise HTTPException(409, "This action is only available for synced email.")
+    if not scope_granted(account.scopes, scope):
+        raise HTTPException(409, _RECONNECT_FOR_ACTIONS)
+
+    if needs_refresh(account) or not account.access_token:
+        refresh = (
+            refresh_google_access_token
+            if account.provider == "google"
+            else refresh_access_token
+        )
+        try:
+            refresh(session, account, generation=account.sync_generation)
+        except MailboxNotWritable:
+            raise HTTPException(404, "Message not found.") from None
+        except TokenRefreshError:
+            raise HTTPException(409, _RECONNECT_FOR_ACTIONS) from None
+        except GoogleTokenUnavailable:
+            raise HTTPException(502, "The mailbox token could not be refreshed.") from None
+
+        # The refresh helper commits, so acquire the lock again.
+        account = lock_active_mailbox(session, user_id, account_id=account_id)
+        if account is None:
+            raise HTTPException(404, "Message not found.")
+
+    row = session.get(Message, message_id, populate_existing=True, with_for_update=True)
+    if row is None or row.inbox_removed_at is not None:
+        raise HTTPException(404, "Inbox message not found.")
+
+    token = account.access_token
+    if not token or not scope_granted(account.scopes, scope):
+        raise HTTPException(409, _RECONNECT_FOR_ACTIONS)
+
+    try:
+        write_provider_message(account.provider, token, row.graph_id, change)
+    except HTTPError as exc:
+        exc.close()
+        if exc.code in {401, 403}:
+            raise HTTPException(409, _RECONNECT_FOR_ACTIONS) from None
+        if exc.code == 404:
+            raise HTTPException(404, "Message no longer available.") from None
+        raise HTTPException(502, "The provider could not update this message.") from None
+    except OSError:
+        raise HTTPException(502, "The provider could not update this message.") from None
+
+    now = utcnow()
+    if isinstance(change, bool):
+        row.is_read = change
+    else:
+        row.inbox_removed_at = now
+    row.updated_at = now
+
+    # A worker may already have fetched the pre-action version of the inbox.
+    account.sync_generation = int(account.sync_generation or 0) + 1
+    if account.sync_status in {"pending", "running"}:
+        account.sync_status = "idle"
+        account.sync_status_at = now
+        account.sync_error_code = None
+
+    session.add(row)
+    session.add(account)
+    session.commit()
+
+
+@router.patch("/messages/{message_id}/read-state", status_code=204)
+def set_message_read_state(
+    message_id: UUID,
+    body: ReadStateInput,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    _apply_mail_change(session, user, message_id, body.is_read)
+    return Response(status_code=204)
+
+
+@router.post("/messages/{message_id}/actions/{action}", status_code=204)
+def move_inbox_message(
+    message_id: UUID,
+    action: MoveAction,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    _apply_mail_change(session, user, message_id, action)
+    return Response(status_code=204)

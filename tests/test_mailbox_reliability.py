@@ -53,6 +53,32 @@ def test_plain_text_drops_script_style_and_tags():
     assert to_plain_text("<script>alert(1)</script>") is None
 
 
+def test_html_fragment_keeps_formatting_and_clickable_web_links_only():
+    content = (
+        '<style>p{display:none}</style><p onclick="bad()" style="color:red">'
+        '<strong>Hello</strong> <a href="https://example.test/a">Web link</a> '
+        '<a href="http://example.test/">HTTP link</a> '
+        '<a href="java&#x73;cript:bad()">Unsafe</a> <a href="//example.test/">Relative</a> '
+        '<img src="https://images.example.test/pixel" srcset="another-pixel">'
+        '<svg><a href="https://images.example.test/">Hidden SVG</a></svg>'
+        '<iframe src="https://images.example.test/">Hidden frame</iframe></p>'
+    )
+    fields = graph_message_fields({**GRAPH_ITEM, "body": {"contentType": "HTML", "content": content}})
+    html = fields["body_html"]
+    assert html.startswith("<p><strong>Hello</strong>")
+    assert 'href="https://example.test/a"' in html
+    assert 'href="http://example.test/"' in html
+    assert ">Unsafe</a>" in html and ">Relative</a>" in html
+    assert html.count("href=") == 2
+    for unexpected in ("onclick", "style", "<img", "<svg", "<iframe", "images.example", "Hidden", "bad()"):
+        assert unexpected not in html
+
+    no_content = {"contentType": "html", "content": '<p><img src="https://images.example.test/pixel"></p>'}
+    assert graph_message_fields({**GRAPH_ITEM, "body": no_content})["body_html"] is None
+    assert graph_message_fields({**GRAPH_ITEM, "body": {"contentType": "text", "content": "Hi"}})["body_html"] is None
+    assert "body_html" not in graph_message_fields({**GRAPH_ITEM, "body": None})
+
+
 def test_graph_fields_are_plain_and_null_when_missing():
     fields = graph_message_fields(GRAPH_ITEM)
     assert fields["subject"] == "Invoice 12"
@@ -115,7 +141,9 @@ def test_second_microsoft_account_is_rejected_without_touching_tokens(client, re
 def test_reconnect_same_oid_updates_the_one_row(client, register_user, monkeypatch):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
-    _add_account(user_id, email="old@outlook.com", oid="oid-same", access_token="old-access")
+    account_id = _add_account(
+        user_id, email="old@outlook.com", oid="oid-same", access_token="old-access"
+    )
     _patch_redis(monkeypatch, user_id.encode())
     monkeypatch.setattr(
         "app.api.auth.build_msal_app",
@@ -141,7 +169,12 @@ def test_reconnect_same_oid_updates_the_one_row(client, register_user, monkeypat
     assert "connected=1" in response.headers["location"]
     assert urlsplit(response.headers["location"]).hostname == "localhost"
     me = client.get("/users/me", headers=headers).json()
-    assert me["mailbox"] == {"connected": True, "provider": "microsoft", "email": "new@outlook.com"}
+    assert me["mailbox"] == {
+        "id": account_id,
+        "connected": True,
+        "provider": "microsoft",
+        "email": "new@outlook.com",
+    }
     assert me["sync"]["status"] == "pending"
     assert me["sync"]["last_successful_at"] is None
     with Session(engine) as session:

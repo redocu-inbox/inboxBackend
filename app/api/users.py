@@ -27,6 +27,7 @@ class SyncStatusResponse(BaseModel):
 class MailboxResponse(BaseModel):
     """The connected mailbox. Tokens, scopes, and the delta link stay on the server."""
 
+    id: UUID
     connected: bool
     provider: str
     email: str
@@ -129,18 +130,23 @@ def _chat_write(account: ConnectedAccount) -> bool:
 
 
 def _mailbox(account: ConnectedAccount) -> MailboxResponse:
-    return MailboxResponse(connected=True, provider=account.provider, email=account.email)
+    return MailboxResponse(
+        id=account.id,
+        connected=True,
+        provider=account.provider,
+        email=account.email,
+    )
 
 
 def _mailbox_entry(account: ConnectedAccount) -> MailboxEntryResponse:
     return MailboxEntryResponse(
+        id=account.id,
         connected=True,
         provider=account.provider,
         email=account.email,
         sync=_sync_response(account),
         chat_write=_chat_write(account),
     )
-
 
 def _user_response(user: User, session: Session) -> UserResponse:
     accounts = active_mailboxes(session, user.id)

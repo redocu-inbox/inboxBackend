@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import text
 from sqlmodel import Session, select
 
@@ -24,6 +25,7 @@ LIST_KEYS = {
     "received_at",
     "is_read",
     "provider",
+    "has_draft",
     "conversation_id",
     "priority_score",
     "priority_band",
@@ -48,6 +50,7 @@ LIST_KEYS = {
 
 DETAIL_KEYS = LIST_KEYS | {
     "body_text",
+    "body_html",
     "draft",
     "to",
     "cc",
@@ -56,6 +59,7 @@ DETAIL_KEYS = LIST_KEYS | {
     "can_edit_recipients",
     "account_id",
     "account_email",
+    "pending_send_attempt_id",
 }
 
 # Frozen reply-draft object. created_at stays on the table and is not a key.
@@ -216,9 +220,7 @@ def test_google_start_returns_an_authorization_url(client, register_user, monkey
     assert query["client_id"] == ["google-client-id"]
     assert query["redirect_uri"] == ["http://localhost:8000/auth/google/callback"]
     assert query["response_type"] == ["code"]
-    assert query["scope"] == [
-        "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send"
-    ]
+    assert query["scope"] == ["openid email https://www.googleapis.com/auth/gmail.modify"]
     assert query["access_type"] == ["offline"]
     assert query["prompt"] == ["consent"]
     assert "client_secret" not in query
@@ -252,10 +254,13 @@ def test_profile_mailbox_is_null_until_a_mailbox_is_connected(client, register_u
     assert me.status_code == 200
     assert me.json()["mailbox"] is None
 
-    _add_account(_user_id(client, headers), email="ana@outlook.com", access_token="secret-access-token")
+    account_id = _add_account(
+        _user_id(client, headers), email="ana@outlook.com", access_token="secret-access-token"
+    )
     connected_response = client.get("/users/me", headers=headers)
     connected = connected_response.json()
     assert connected["mailbox"] == {
+        "id": account_id,
         "connected": True,
         "provider": "microsoft",
         "email": "ana@outlook.com",
@@ -289,7 +294,7 @@ def test_profile_hides_a_disconnected_mailbox_and_patch_keeps_the_active_one(cli
 def test_profile_mailbox_stays_outlook_when_gmail_was_updated_later(client, register_user):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
-    _add_account(
+    outlook_id = _add_account(
         user_id,
         email="ana@outlook.com",
         updated_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
@@ -310,6 +315,7 @@ def test_profile_mailbox_stays_outlook_when_gmail_was_updated_later(client, regi
 
     me = client.get("/users/me", headers=headers).json()
     assert me["mailbox"] == {
+        "id": outlook_id,
         "connected": True,
         "provider": "microsoft",
         "email": "ana@outlook.com",
@@ -358,7 +364,13 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
     outlook = _add_account(user_id, email="ana@outlook.com", oid="oid-ana")
-    gmail = _add_account(user_id, email="ana@gmail.com", oid="sub-ana", provider="google")
+    gmail = _add_account(
+        user_id,
+        email="ana@gmail.com",
+        oid="sub-ana",
+        provider="google",
+        access_token="ana-gmail-access-token",
+    )
     _add_message(
         user_id,
         outlook,
@@ -367,7 +379,7 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
         priority_score=None,
         subject="From Outlook",
     )
-    _add_message(
+    gmail_message_id = _add_message(
         user_id,
         gmail,
         graph_id="gmail-1",
@@ -385,6 +397,7 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
     ]
     me = client.get("/users/me", headers=headers).json()
     assert me["mailbox"] == {
+        "id": outlook,
         "connected": True,
         "provider": "microsoft",
         "email": "ana@outlook.com",
@@ -392,6 +405,7 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
     idle = {"status": "idle", "last_successful_at": None, "error_code": None}
     assert me["mailboxes"] == [
         {
+            "id": gmail,
             "connected": True,
             "provider": "google",
             "email": "ana@gmail.com",
@@ -399,6 +413,7 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
             "chat_write": False,
         },
         {
+            "id": outlook,
             "connected": True,
             "provider": "microsoft",
             "email": "ana@outlook.com",
@@ -410,17 +425,39 @@ def test_inbox_lists_gmail_and_outlook_together(client, register_user, monkeypat
     response = client.post("/messages/sync", headers=headers)
     assert response.status_code == 202
     assert response.json() == {"enqueued": True, "sync_status": "pending"}
-    queued = {call.args[1] for call in app.state.arq.enqueue_job.await_args_list}
-    assert queued == {outlook, gmail}
+    queued_generations = {
+        call.args[1]: call.args[2] for call in app.state.arq.enqueue_job.await_args_list
+    }
+    assert set(queued_generations) == {outlook, gmail}
 
-    monkeypatch.setattr("app.api.auth.revoke_google_token", lambda token: None)
-    assert client.post("/auth/google/disconnect", headers=headers).status_code == 200
+    revoked: list[str] = []
+    monkeypatch.setattr("app.api.mailboxes.revoke_google_token", revoked.append)
+    path = f"/mailboxes/{gmail}/disconnect"
+    bob = register_user("bob@example.com")
+    bob_gmail = _add_account(_user_id(client, bob), email="bob@gmail.com", provider="google")
+    assert client.post(path, headers=bob).status_code == 404
+    assert revoked == []
+    assert client.get("/users/me", headers=bob).json()["mailbox"]["id"] == bob_gmail
+    assert client.get(f"/messages/{gmail_message_id}", headers=headers).status_code == 200
+
+    disconnected = client.post(path, headers=headers)
+    assert disconnected.status_code == 200
+    assert disconnected.json() == {"disconnected": True}
+    assert revoked == ["ana-gmail-access-token"]
+
     remaining = client.get("/messages", headers=headers).json()
     assert [(row["subject"], row["provider"]) for row in remaining] == [("From Outlook", "microsoft")]
-    assert client.get(f"/messages/{listed.json()[0]['id']}", headers=headers).status_code == 404
+    assert client.get(f"/messages/{gmail_message_id}", headers=headers).status_code == 404
     still = client.get("/users/me", headers=headers).json()
-    assert still["mailbox"]["provider"] == "microsoft"
-    assert [item["provider"] for item in still["mailboxes"]] == ["microsoft"]
+    assert still["mailbox"]["id"] == outlook
+    assert [item["id"] for item in still["mailboxes"]] == [outlook]
+    assert still["mailboxes"][0]["sync"]["status"] == "pending"
+    with Session(engine) as session:
+        account = session.get(ConnectedAccount, UUID(gmail))
+        assert account.disconnected_at is not None
+        assert account.access_token is None
+        assert account.sync_status == "idle"
+        assert account.sync_generation == queued_generations[gmail] + 1
 
 
 def test_message_list_contract_sort_and_total(client, register_user):
@@ -541,6 +578,8 @@ def test_message_detail_includes_body_and_hides_other_users(client, register_use
     body = detail.json()
     assert set(body) == DETAIL_KEYS
     assert body["body_text"] is None
+    assert body["body_html"] is None
+    assert body["has_draft"] is False
     assert body["draft"] is None
     assert body["priority_score"] is None
     assert body["priority_band"] is None
@@ -650,7 +689,15 @@ def _google_callback(client, query: str):
     return client.get(f"/auth/google/callback?{query}", follow_redirects=False)
 
 
-def test_google_callback_redirects_every_outcome(client, register_user, monkeypatch):
+@pytest.mark.parametrize(
+    "grant",
+    [
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+    ],
+    ids=["modify", "legacy"],
+)
+def test_google_callback_redirects_every_outcome(client, register_user, monkeypatch, grant):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
     other = register_user("bob@example.com")
@@ -670,7 +717,7 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
         "access_token": "google-access-token",
         "refresh_token": "google-refresh-token",
         "expires_in": 3600,
-        "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+        "scope": f"openid email {grant}",
     }
 
     def _boom(*args, **kwargs):
@@ -806,17 +853,19 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
     assert "google-access-token" not in location
     assert "google-refresh-token" not in location
     me = client.get("/users/me", headers=headers).json()
-    assert me["mailbox"] == {
-        "connected": True,
-        "provider": "google",
-        "email": "ana@gmail.com",
-    }
     assert "google-refresh-token" not in client.get("/users/me", headers=headers).text
     with Session(engine) as session:
         account = session.exec(
             select(ConnectedAccount).where(ConnectedAccount.provider_account_id == "sub-ana")
         ).one()
+        assert me["mailbox"] == {
+            "id": str(account.id),
+            "connected": True,
+            "provider": "google",
+            "email": "ana@gmail.com",
+        }
         assert account.provider == "google"
+        assert account.scopes == f"openid email {grant}"
         assert account.refresh_token == "google-refresh-token"
         assert account.tenant_id is None
         raw = session.execute(
