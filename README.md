@@ -108,7 +108,7 @@ app/
   security.py             Password hashing, login JWTs, EncryptedText
   api/health.py           GET /health
   api/auth.py             Register, login, and Outlook, Gmail, and Slack connect
-  api/users.py            GET and PATCH /users/me, including mailbox
+  api/users.py            GET, PATCH, and DELETE /users/me
   api/messages.py         Message list, detail, conversation, local drafts, approve, and sync
   api/graph.py            POST /webhooks/graph
   api/forms.py            Form template library and fill jobs
@@ -178,6 +178,7 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `POST /auth/logout`          | yes  | `204`. Revoke this app JWT on the server |
 | `GET /users/me`              | yes  | Read your profile, including `mailbox` and `sync` |
 | `PATCH /users/me`            | yes  | Update `display_name`. The response includes `mailbox` and `sync` too |
+| `DELETE /users/me`           | yes  | `202` with `status: pending` and `requested_at`. `409` with `Retry-After` if account activity is still in progress |
 | `GET /messages`              | yes  | List messages for every active mailbox. `X-Total-Count` is that count |
 | `GET /messages/{id}`         | yes  | One active-mailbox message, or `404` with detail `Message not found.` Detail includes `draft` or `null` |
 | `POST /messages/{id}/draft`  | yes  | Create or reset the local draft to `pending`, keep `body`, clear `error` and `graph_draft_id`, and enqueue `generate_reply_draft` |
@@ -323,6 +324,8 @@ Emails are stored in lowercase, so `Ana@x.com` and `ana@x.com` are one account. 
 `status` is `idle`, `pending`, `running`, or `failed`. `last_successful_at` is an ISO-8601 UTC timestamp (`2026-11-07T20:43:08.343229Z`) set only after a sync finishes writing messages. It stays null, or stays at the previous success, while a job is queued, running, or failed. `error_code` is `null`, `queue_unavailable`, `token_refresh_failed`, `graph_unavailable`, `gmail_unavailable`, or `slack_unavailable`. It is not an exception string and it never includes a token.
 
 `PATCH /users/me` accepts `display_name` only; omitting it leaves the name unchanged, and sending `null` clears it. Sending `email` is `422`. The patch response uses the same shape, including `mailbox` and `sync`.
+
+`DELETE /users/me` blocks access when the request is saved. At startup and every minute, the worker deletes the account's templates, filled PDFs, and staged attachments from shared storage, then removes its live database records. If a cleanup attempt fails, the request stays pending for the worker to retry.
 
 New login JWTs are HS256 with `sub`, `iat`, `exp`, `jti`, and `ver`. `ver` is `users.session_version` at the moment the token is minted. `POST /auth/logout` with that token returns `204` and stores the `jti` in `revoked_tokens` until `exp`. A later request with the same token is `401 {"detail":"Not authenticated"}`. A second login's token has a different `jti` and keeps working. Logout does not disconnect the mailbox, does not bump `session_version`, and does not affect another user.
 

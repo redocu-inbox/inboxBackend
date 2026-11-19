@@ -47,8 +47,8 @@ def _migrated_database() -> None:
 def _clean_tables() -> Iterator[None]:
     yield
     with engine.begin() as connection:
-        # Every other table references users with ON DELETE CASCADE.
-        connection.execute(text("TRUNCATE users CASCADE"))
+        # Deletion requests survive removal of their user. Other rows cascade.
+        connection.execute(text("TRUNCATE users, account_deletions CASCADE"))
 
 
 @pytest.fixture

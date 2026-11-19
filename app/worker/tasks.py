@@ -5,13 +5,20 @@ are the function names. The first argument, `ctx`, is the dict ARQ passes in.
 Further arguments are strings.
 """
 
+import asyncio
 import logging
 
 from sqlmodel import Session
 
 from app.db import engine
+from app.services.account_deletion import purge_pending_accounts
 
 logger = logging.getLogger(__name__)
+
+
+async def purge_deleted_accounts(ctx: dict) -> None:
+    """Process durable account deletion requests using the worker's storage."""
+    await asyncio.to_thread(purge_pending_accounts)
 
 
 async def send_password_reset(ctx: dict, user_id: str, request_id: str) -> None:

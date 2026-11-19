@@ -14,6 +14,7 @@ from sqlmodel import Session, select
 
 from app.models.connected_account import ConnectedAccount
 from app.models.user import utcnow
+from app.services.account_deletion import lock_account_write
 
 # A crashed worker must not pin the mailbox in pending/running forever.
 SYNC_STALE_AFTER = timedelta(minutes=10)
@@ -192,6 +193,10 @@ def request_mailbox_sync(session: Session, user_id: UUID) -> list[SyncEnqueue] |
 
 def mark_sync_enqueue_failed(session: Session, account_id: UUID, generation: int) -> None:
     """Record that this generation never reached the worker. Leave last_sync_at alone."""
+    user_id = session.scalar(select(ConnectedAccount.user_id).where(ConnectedAccount.id == account_id))
+    if user_id is None or not lock_account_write(session, user_id):
+        session.rollback()
+        return
     account = session.exec(
         select(ConnectedAccount)
         .where(ConnectedAccount.id == account_id)

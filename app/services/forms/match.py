@@ -22,6 +22,7 @@ from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.form_template import FormTemplate
 from app.models.message import Message
 from app.models.user import utcnow
+from app.services.account_deletion import lock_account_write
 from app.services.forms.schema import schema_summary
 from app.services.llm.factory import get_llm
 
@@ -174,10 +175,15 @@ def _prepare(job_id: UUID) -> MatchReady | None:
         if job is None:
             logger.warning("fill job %s was not found", job_id)
             return None
+        user_id = job.user_id
+        if not lock_account_write(session, user_id):
+            return None
         job.status = FormFillStatus.running
         job.updated_at = utcnow()
         session.add(job)
         session.commit()
+        if not lock_account_write(session, user_id):
+            return None
 
         message = session.get(Message, job.message_id) if job.message_id is not None else None
         if message is None or message.user_id != job.user_id:
@@ -250,6 +256,8 @@ def _save_extraction(job_id: UUID, ready: MatchReady, raw: str) -> bool:
         if job is None:
             logger.warning("fill job %s was not found", job_id)
             return False
+        if not lock_account_write(session, job.user_id):
+            return False
         job.template_id = ready.template_id
         if extracted is None:
             job.extracted_values = {}
@@ -295,7 +303,7 @@ def _finish(
 def _fail(job_id: UUID) -> None:
     with Session(engine) as session:
         job = session.get(FormFillJob, job_id)
-        if job is None:
+        if job is None or not lock_account_write(session, job.user_id):
             return
         job.status = FormFillStatus.failed
         job.error = MATCH_FAILED
