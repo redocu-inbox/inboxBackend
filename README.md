@@ -141,7 +141,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 | `connected_accounts` | One active Outlook mailbox, one active Gmail mailbox, and one active Slack workspace: encrypted tokens, and Graph fields when the provider is Microsoft |
 | `messages`           | A synced message or a local draft (`graph_id`, subject, preview, received time, thread id, recipients, priority score, band, reasons, and classification fields). Sync fills the score with the rule classifier and scorer |
 | `reply_drafts`       | One local reply per message: status, body, source, recipients, Outlook draft id, and error. Deleting the message or the user deletes the row |
-| `approvals`          | One row each time approve sends: who approved, who received it, the reply text, and an optional form snapshot |
+| `approvals`          | Each send attempt's saved text, recipients, optional form snapshot, provider reference, and outcome |
 | `staged_attachments` | A file uploaded from the computer. Saving a draft is what binds it to a message |
 | `form_templates`     | An uploaded PDF: storage key, tags, description, and `schema_json` (`kind` plus AcroForm fields). A row stored as `{}` reads as kind `none` |
 | `form_fill_jobs`     | One fill attempt: optional template, status, extracted values, dropped field names, confidence, error, and the filled-file path |
@@ -440,6 +440,10 @@ Watch the sync with `docker compose logs -f worker`.
 
 `POST /messages/{id}/draft` creates one local draft, or resets the existing row to `pending`. It clears `error` and `graph_draft_id`, keeps `body`, and enqueues `generate_reply_draft`. The response is `200` and the draft object: `id`, `message_id`, `status`, `body`, `source`, `graph_draft_id`, `error`, `updated_at`, `recipients`, and `attachments`. `GET /messages/{id}/draft` returns that object, or `404` with detail `Draft not found.` `PATCH /messages/{id}/draft` takes `body`, and may also take `to`, `cc`, and `attachment_ids`. A saved body is trimmed, `source` becomes `user`, and `status` becomes `ready`. Omitted recipient and file fields stay as they are. `DELETE /messages/{id}/draft` is `204` and removes only the local row. It does not change the message and it does not change Outlook.
 
+`has_draft` on list and detail reports whether non-empty reply text is saved. It stays true during regeneration and after a failed regeneration while the earlier text is still present. Use detail's `draft.status` for the generation state.
+
+Detail also returns nullable `body_html` for Outlook and Gmail. The fragment contains allowlisted text formatting, headings, lists, quotes, tables, and absolute HTTP or HTTPS links. Images, embeds, event handlers, and styles are excluded. Render `body_text` when HTML is missing or unusable, then `body_preview` when text is missing. Older rows gain HTML when the provider body is fetched again.
+
 `POST /messages/{id}/draft/outlook` writes an unsent Outlook draft. The mailbox must be Microsoft, or the response is `422` with detail `Only an Outlook mailbox can save this draft.` A Slack row is `409` with detail `Use the Slack reply endpoint.` The local draft must be `ready` with a non-empty body, or the response is `409` with detail `Draft is not ready.` When `graph_draft_id` is empty the route calls Graph `createReply`, saves that id, then PATCHes `{"body": {"contentType": "Text", "content": <local body>}}`. A later push skips `createReply` and PATCHes the same id. Success is `200`. `status` stays `ready` and `error` is cleared. A Graph failure is `502` with detail `Outlook draft could not be saved.` `status` stays `ready`. If `createReply` already returned an id, that id is kept. A token refresh failure is `502` and the local status stays `ready`. This route does not send. Sending is `POST /messages/{id}/approve`.
 
 Another user's message id is `404` with detail `Message not found.`
@@ -448,7 +452,14 @@ Another user's message id is `404` with detail `Message not found.`
 
 ### Approve and send
 
-`POST /messages/{id}/approve` sends one ready Outlook or Gmail draft. The draft must be `ready` with a non-empty body and at least one To address. Success sets `approved_at`, writes one `approvals` row, and returns the message detail. A second call is `409` with detail `This email was already sent.` and does not contact the mailbox. A Slack row is `409` with detail `Use the Slack reply endpoint.` A draft that is not ready is `409` with detail `Draft is not ready.` A mailbox whose stored scopes omit `Mail.Send` or `gmail.send` is `409` with detail `Reconnect this mailbox to send mail.` A provider failure is `502` with detail `The mailbox could not send this email.` and the draft stays unsent. `GET /approvals` lists those rows for the signed-in user, newest first.
+`POST /messages/{id}/approve` sends a ready Outlook or Gmail draft through its mailbox. Before sending, the API saves the draft snapshot and provider reference. Outlook uses `Mail.ReadWrite` to prepare the draft and `Mail.Send` to submit it. Gmail accepts `gmail.send` or `gmail.modify` for sending.
+
+- `200` returns message detail with `approved_at` set. The confirmed attempt appears in `GET /approvals`.
+- `202` returns `{"send_status":"confirmation_pending","attempt_id":"<uuid>"}` while the provider outcome is uncertain. Message detail returns that ID as `pending_send_attempt_id` so the client can restore the pending state after a reload.
+- `409` covers an already confirmed send, an unready draft, a Slack message, or missing mailbox permissions.
+- `502` means draft preparation failed or the provider definitively rejected the send. The draft can be approved again after the issue is resolved.
+
+`GET /messages/{id}/send-attempts/{attempt_id}` returns the owned attempt's `attempt_id`, `send_status` (`confirmation_pending`, `sent`, or `failed`), and `approved_at`. It can look for confirmation in the original mailbox and never submits a send. A missing result from the provider leaves confirmation pending.
 
 ## Production
 

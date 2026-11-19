@@ -28,6 +28,7 @@ from app.services.google.messages import (
 from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_access_token
 from app.services.graph.client import GraphClient
 from app.services.graph.html_text import to_plain_text
+from app.services.inbox.body_html import sanitize_body_html
 from app.services.inbox.recipients import graph_people
 from app.services.graph.subscriptions import (
     GraphSubscriptionError,
@@ -98,8 +99,9 @@ def graph_message_fields(item: dict) -> dict | None:
     is_read = item.get("isRead")
     body = item.get("body") if isinstance(item.get("body"), dict) else {}
     content = body.get("content") if isinstance(body.get("content"), str) else None
+    content_type = body.get("contentType")
     conversation = item.get("conversationId")
-    return {
+    fields = {
         "graph_id": graph_id[:512],
         "subject": to_plain_text(item.get("subject")),
         "body_preview": to_plain_text(item.get("bodyPreview")),
@@ -115,6 +117,9 @@ def graph_message_fields(item: dict) -> dict | None:
         "direction": "incoming",
         "origin": "provider",
     }
+    if content is not None and isinstance(content_type, str):
+        fields["body_html"] = sanitize_body_html(content) if content_type.lower() == "html" else None
+    return fields
 
 
 def _upsert_message(
@@ -140,6 +145,8 @@ def _upsert_message(
             **fields,
         )
     else:
+        if existing.inbox_removed_at is not None:
+            return None
         for key, value in fields.items():
             if key == "graph_id":
                 continue
@@ -218,14 +225,14 @@ def _mark_failed(session: Session, account_id: UUID, generation: int | None, err
 
 
 def _delete_provider_message(session: Session, account: ConnectedAccount, graph_id: str) -> None:
-    """Delete the local row Graph marked removed. A missing row is left alone."""
+    """Delete a removed Graph row unless an app action already hid it."""
     row = session.exec(
         select(Message).where(
             Message.connected_account_id == account.id,
             Message.graph_id == graph_id[:512],
         )
     ).first()
-    if row is not None:
+    if row is not None and row.inbox_removed_at is None:
         session.delete(row)
 
 

@@ -191,8 +191,13 @@ def test_empty_webhook_settings_still_import_outlook_and_gmail(client, register_
     assert queued.json()["enqueued"] is True
     _run(outlook_id)
     _run(gmail_id)
-    providers = {item["provider"] for item in client.get("/messages", headers=headers).json()}
-    assert providers == {"microsoft", "google"}
+    listed = client.get("/messages", headers=headers).json()
+    assert {item["provider"] for item in listed} == {"microsoft", "google"}
+    for item in listed:
+        assert "body_html" not in item
+        detail = client.get(f"/messages/{item['id']}", headers=headers).json()
+        assert detail["body_html"] == "<p>Hello</p>"
+        assert detail["body_text"] == "Hello"
     with Session(engine) as session:
         outlook = session.get(ConnectedAccount, UUID(outlook_id))
         gmail = session.get(ConnectedAccount, UUID(gmail_id))

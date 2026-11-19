@@ -67,11 +67,11 @@ def list_approvals(
     session: Session = Depends(get_session),
 ) -> list[ApprovalResponse]:
     """Newest first. X-Total-Count is this user's full approval count."""
-    visible = Approval.user_id == user.id
-    total = session.scalar(select(func.count(Approval.id)).where(visible))
+    visible = (Approval.user_id == user.id, Approval.approved_at.is_not(None))
+    total = session.scalar(select(func.count(Approval.id)).where(*visible))
     response.headers["X-Total-Count"] = str(total or 0)
     rows = session.exec(
-        select(Approval).where(visible).order_by(Approval.approved_at.desc(), Approval.id.desc()).offset(offset).limit(limit)
+        select(Approval).where(*visible).order_by(Approval.approved_at.desc(), Approval.id.desc()).offset(offset).limit(limit)
     ).all()
     return [
         ApprovalResponse(

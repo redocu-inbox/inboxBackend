@@ -108,14 +108,17 @@ def lock_active_mailbox(
     user_id: UUID,
     *,
     provider: str | None = None,
+    account_id: UUID | None = None,
 ) -> ConnectedAccount | None:
-    """Lock this user's active mailbox. `provider` limits the match to one provider."""
+    """Lock an active mailbox for this user, optionally by provider or ID."""
     filters = [
         ConnectedAccount.user_id == user_id,
         ConnectedAccount.disconnected_at.is_(None),
     ]
     if provider is not None:
         filters.append(ConnectedAccount.provider == provider)
+    if account_id is not None:
+        filters.append(ConnectedAccount.id == account_id)
     return session.exec(
         select(ConnectedAccount)
         .where(*filters)
@@ -208,6 +211,24 @@ def mark_sync_enqueue_failed(session: Session, account_id: UUID, generation: int
     session.commit()
 
 
+def disconnect_mailbox(session: Session, account: ConnectedAccount) -> None:
+    """Disconnect a mailbox row that the caller has locked."""
+    now = utcnow()
+    account.disconnected_at = now
+    account.access_token = None
+    account.refresh_token = None
+    account.token_expires_at = None
+    account.scopes = None
+    account.delta_link = None
+    account.sync_generation = int(account.sync_generation or 0) + 1
+    account.sync_status = "idle"
+    account.sync_error_code = None
+    account.sync_status_at = now
+    account.updated_at = now
+    session.add(account)
+    session.commit()
+
+
 def disconnect_active_mailbox(
     session: Session,
     user_id: UUID,
@@ -223,18 +244,5 @@ def disconnect_active_mailbox(
     account = lock_active_mailbox(session, user_id, provider=provider)
     if account is None:
         return False
-    now = utcnow()
-    account.disconnected_at = now
-    account.access_token = None
-    account.refresh_token = None
-    account.token_expires_at = None
-    account.scopes = None
-    account.delta_link = None
-    account.sync_generation = int(account.sync_generation or 0) + 1
-    account.sync_status = "idle"
-    account.sync_error_code = None
-    account.sync_status_at = now
-    account.updated_at = now
-    session.add(account)
-    session.commit()
+    disconnect_mailbox(session, account)
     return True

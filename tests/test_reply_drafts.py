@@ -20,7 +20,7 @@ from app.services.llm.providers import AnthropicClient, OpenAIClient, _anthropic
 from app.services.llm.stub import StubLLM
 from app.services.reply_drafts.generation import STUB_REPLY_SENTENCE, final_reply_body
 from app.worker.settings import WorkerSettings
-from app.worker.mail_tasks import generate_reply_draft
+from app.worker.mail_tasks import _fail_reply_draft, generate_reply_draft
 from tests.test_frontend_connect import DETAIL_KEYS, DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 _CONTRACT = {
@@ -106,6 +106,8 @@ def test_draft_routes_keep_the_contract_and_leave_the_list_alone(client, registe
     listed = client.get("/messages", headers=headers).json()
     assert set(listed[0]) == LIST_KEYS
     assert "draft" not in listed[0]
+    assert listed[0]["has_draft"] is False
+    assert detail["has_draft"] is False
 
     missing = client.get(f"/messages/{message_id}/draft")
     assert missing.status_code == 401
@@ -124,6 +126,7 @@ def test_draft_routes_keep_the_contract_and_leave_the_list_alone(client, registe
     assert saved["body"] == "Keep this reply"
     assert saved["source"] == "user"
     assert saved["status"] == "ready"
+    assert client.get("/messages", headers=headers).json()[0]["has_draft"] is True
     assert client.patch(
         f"/messages/{message_id}/draft",
         headers=headers,
@@ -137,7 +140,33 @@ def test_draft_routes_keep_the_contract_and_leave_the_list_alone(client, registe
         "detail": "Draft not found."
     }
     assert client.get(f"/messages/{message_id}", headers=headers).json()["draft"] is None
+    assert client.get("/messages", headers=headers).json()[0]["has_draft"] is False
     assert client.delete(f"/messages/{message_id}/draft", headers=headers).status_code == 404
+
+
+def test_has_draft_follows_saved_text_across_generation_states(client, register_user):
+    headers, user_id, account_id, regeneration_id = _mailbox(client, register_user)
+    _insert_draft(user_id, regeneration_id, body="Previous reply")
+    failure_id = _add_message(
+        user_id, account_id, graph_id="first-generation-failure",
+        received_at=datetime(2024, 5, 1, tzinfo=timezone.utc), priority_score=None,
+    )
+    _insert_draft(user_id, failure_id, status=ReplyDraftStatus.failed, body=" \t\n ")
+
+    regenerated = client.post(f"/messages/{regeneration_id}/draft", headers=headers)
+    assert regenerated.status_code == 200
+    assert regenerated.json()["status"] == "pending"
+    for state in ("pending", "failed"):
+        if state == "failed":
+            _fail_reply_draft(regeneration_id)
+        detail = client.get(f"/messages/{regeneration_id}", headers=headers).json()
+        assert detail["has_draft"] is True
+        assert detail["draft"]["status"] == state
+        assert detail["draft"]["body"] == "Previous reply"
+        listed = client.get("/messages", headers=headers).json()
+        assert {row["id"]: row["has_draft"] for row in listed} == {
+            regeneration_id: True, failure_id: False,
+        }
 
 
 def test_other_users_message_is_not_found(client, register_user):

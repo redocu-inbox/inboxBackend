@@ -35,6 +35,7 @@ from app.services.auth.rate_limit import (
 from app.services.google.connect import connect_google_mailbox
 from app.services.google.http import fetch_mailbox_identity
 from app.services.google.oauth import (
+    GMAIL_MODIFY_SCOPE,
     GMAIL_READONLY_SCOPE,
     GMAIL_SEND_SCOPE,
     exchange_authorization_code,
@@ -453,11 +454,12 @@ async def google_callback(
         def _google_scope(tail: str, full: str) -> bool:
             return any(part == tail or part == full or part.endswith("/" + tail) for part in granted)
 
-        # Read stays required for sync. Send is required so approve can deliver mail.
-        # A grant that omits either is revoked instead of saved.
-        if not _google_scope("gmail.readonly", GMAIL_READONLY_SCOPE) or not _google_scope(
+        # Modify includes sync and sending. Older grants can still cover both separately.
+        can_modify = _google_scope("gmail.modify", GMAIL_MODIFY_SCOPE)
+        can_read_and_send = _google_scope("gmail.readonly", GMAIL_READONLY_SCOPE) and _google_scope(
             "gmail.send", GMAIL_SEND_SCOPE
-        ):
+        )
+        if not (can_modify or can_read_and_send):
             refresh = result.get("refresh_token")
             token = refresh if isinstance(refresh, str) and refresh else result.get("access_token")
             if isinstance(token, str) and token:
