@@ -93,10 +93,10 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:5173"
 
     # When false, a mailbox sync does not enqueue form matching. Matching
-    # starts from POST /forms/jobs. Turning this on is a later change.
+    # starts from POST /forms/jobs. Setting this true does not enqueue a match.
     form_match_on_sync: bool = False
 
-    # stub for now. Later values: openai, anthropic.
+    # stub until ANTHROPIC_API_KEY is set. The hosted model is Claude.
     llm_provider: str = "stub"
     llm_model: str = ""
     openai_api_key: str = ""

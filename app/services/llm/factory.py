@@ -1,8 +1,10 @@
 """Build the configured LLM provider from application settings.
 
-`stub`, an unknown provider, and `openai` or `anthropic` with an empty key
-stay on `StubLLM`. A non-empty key returns that provider's thin client.
-`llm_model` is used when it is set.
+The hosted model is Claude. `stub`, an unknown provider, and `anthropic`
+with an empty key stay on `StubLLM`. A non-empty Anthropic key returns
+`AnthropicClient`. `llm_model` is used when it is set. An `openai` value
+with `OPENAI_API_KEY` still constructs the old client; that path is not
+the backup provider.
 """
 
 from app.config import get_settings
