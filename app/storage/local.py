@@ -1,5 +1,6 @@
 """Store files on the local disk. Fine for development; not shared across machines."""
 
+import os
 from pathlib import Path
 from shutil import rmtree
 from stat import S_ISDIR
@@ -57,7 +58,9 @@ class LocalStorage:
             path.unlink(missing_ok=True)
 
     def _resolve(self, key: str) -> Path:
-        path = (self.root / _relative_key(key)).resolve()
-        if not path.is_relative_to(self.root.resolve()):
+        root = os.path.realpath(self.root)
+        path = os.path.realpath(os.path.join(root, _relative_key(key)))
+        root_prefix = root.rstrip(os.sep) + os.sep
+        if path == root or not path.startswith(root_prefix):
             raise ValueError(f"Invalid storage key: {key!r}")
-        return path
+        return Path(path)
