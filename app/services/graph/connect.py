@@ -13,14 +13,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.models.connected_account import ConnectedAccount
-from app.models.user import User, utcnow
-from app.services.account_deletion import lock_account_write
+from app.models.user import utcnow
+from app.services.mailboxes import lock_active_mailbox, lock_mailbox_owner
 
 
 class ConnectStatus(str, Enum):
     connected = "connected"
     mailbox_taken = "mailbox_taken"
     mailbox_conflict = "mailbox_conflict"
+    mailbox_mismatch = "mailbox_mismatch"
     not_saved = "not_saved"
 
 
@@ -32,14 +33,6 @@ class ConnectOutcome:
     email: str | None = None
 
 
-def _lock_user(session: Session, user_id: UUID) -> User | None:
-    if not lock_account_write(session, user_id):
-        return None
-    return session.exec(
-        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
-    ).first()
-
-
 def _find_provider_account(
     session: Session, provider: str, provider_account_id: str
 ) -> ConnectedAccount | None:
@@ -49,21 +42,6 @@ def _find_provider_account(
             ConnectedAccount.provider == provider,
             ConnectedAccount.provider_account_id == provider_account_id,
         )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    ).first()
-
-
-def _find_active(session: Session, user_id: UUID, provider: str) -> ConnectedAccount | None:
-    """The user's active mailbox for this provider. The other provider can stay connected."""
-    return session.exec(
-        select(ConnectedAccount)
-        .where(
-            ConnectedAccount.user_id == user_id,
-            ConnectedAccount.provider == provider,
-            ConnectedAccount.disconnected_at.is_(None),
-        )
-        .order_by(ConnectedAccount.updated_at.desc(), ConnectedAccount.id.desc())
         .with_for_update()
         .execution_options(populate_existing=True)
     ).first()
@@ -81,16 +59,13 @@ def connect_mailbox(
     refresh_token: str | None,
     expires_at: datetime | None,
     scopes: str | None,
+    expected_mailbox_id: UUID | None = None,
     _retry: bool = False,
 ) -> ConnectOutcome:
     """Reconnect the same mailbox, or insert one for this provider.
 
-    Outlook and Gmail can both be active. A different account for this same
-    provider is rejected while one is still active. An account id owned by
-    another app user is rejected. Neither rejection changes the stored tokens.
-    A unique-index race is rolled back and classified instead of being left
-    half-saved. Slack user tokens have no refresh token and no expiry; those
-    arguments are null for that provider.
+    Gmail and Outlook can each have several active accounts. Slack allows one.
+    Provider identity stays unique. An explicit reconnect must match its mailbox.
     """
     if (
         not provider_account_id
@@ -103,17 +78,21 @@ def connect_mailbox(
     if tenant_id is not None and len(tenant_id) > 128:
         tenant_id = tenant_id[:128]
     try:
-        if _lock_user(session, user_id) is None:
+        if lock_mailbox_owner(session, user_id) is None:
             session.rollback()
             return ConnectOutcome(ConnectStatus.not_saved)
         existing = _find_provider_account(session, provider, provider_account_id)
-        active = _find_active(session, user_id, provider)
         if existing is not None and existing.user_id != user_id:
             session.rollback()
             return ConnectOutcome(ConnectStatus.mailbox_taken)
-        if active is not None and (existing is None or active.id != existing.id):
+        if expected_mailbox_id is not None and (existing is None or existing.id != expected_mailbox_id):
             session.rollback()
-            return ConnectOutcome(ConnectStatus.mailbox_conflict)
+            return ConnectOutcome(ConnectStatus.mailbox_mismatch)
+        if provider == "slack":
+            active = lock_active_mailbox(session, user_id, provider=provider)
+            if active is not None and (existing is None or active.id != existing.id):
+                session.rollback()
+                return ConnectOutcome(ConnectStatus.mailbox_conflict)
         now = utcnow()
         if existing is None:
             existing = ConnectedAccount(
@@ -165,17 +144,9 @@ def connect_mailbox(
                 ConnectedAccount.provider_account_id == provider_account_id,
             )
         ).first()
-        active = session.exec(
-            select(ConnectedAccount).where(
-                ConnectedAccount.user_id == user_id,
-                ConnectedAccount.provider == provider,
-                ConnectedAccount.disconnected_at.is_(None),
-            )
-        ).first()
         if existing is not None and existing.user_id != user_id:
+            session.rollback()
             return ConnectOutcome(ConnectStatus.mailbox_taken)
-        if active is not None and (existing is None or active.id != existing.id):
-            return ConnectOutcome(ConnectStatus.mailbox_conflict)
         return connect_mailbox(
             session,
             provider=provider,
@@ -187,6 +158,7 @@ def connect_mailbox(
             refresh_token=refresh_token,
             expires_at=expires_at,
             scopes=scopes,
+            expected_mailbox_id=expected_mailbox_id,
             _retry=True,
         )
 
@@ -202,6 +174,7 @@ def connect_microsoft_mailbox(
     refresh_token: str,
     expires_at: datetime,
     scopes: str | None,
+    expected_mailbox_id: UUID | None = None,
     _retry: bool = False,
 ) -> ConnectOutcome:
     """Save a Microsoft mailbox. `provider_account_id` is the Entra `oid`."""
@@ -216,5 +189,6 @@ def connect_microsoft_mailbox(
         refresh_token=refresh_token,
         expires_at=expires_at,
         scopes=scopes,
+        expected_mailbox_id=expected_mailbox_id,
         _retry=_retry,
     )

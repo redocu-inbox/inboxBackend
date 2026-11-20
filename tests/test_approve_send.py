@@ -368,11 +368,13 @@ def test_simultaneous_approvals_make_one_provider_send(client, register_user, mo
 @pytest.mark.parametrize("provider_name", ["microsoft", "google"])
 def test_send_with_lost_response_is_confirmed_without_resending(client, register_user, monkeypatch, provider_name):
     headers, message_id = _ready_reply(client, register_user, provider_name)
+    _add_account(_user_id(client, headers), provider=provider_name, email="other@example.com", access_token="wrong-mailbox-token")
     sent_reference = []
     looked_up = []
     confirmation_visible = False
 
     def provider(request, *, timeout):
+        assert request.get_header("Authorization") == "Bearer secret-access-token"
         if request.full_url.endswith("/createReply"):
             return BytesIO(b'{"id":"immutable-draft"}')
         if request.get_method() == "PATCH":

@@ -22,6 +22,7 @@ def connect_google_mailbox(
     refresh_token: str,
     expires_at: datetime,
     scopes: str | None,
+    expected_mailbox_id: UUID | None = None,
 ) -> ConnectOutcome:
     """Save a Google mailbox. `provider_account_id` is the OpenID `sub`."""
     return connect_mailbox(
@@ -35,4 +36,5 @@ def connect_google_mailbox(
         refresh_token=refresh_token,
         expires_at=expires_at,
         scopes=scopes,
+        expected_mailbox_id=expected_mailbox_id,
     )

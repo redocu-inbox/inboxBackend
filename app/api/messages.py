@@ -1071,12 +1071,12 @@ def attach_filled_form(
 _SYNC_RANK = {"failed": 3, "running": 2, "pending": 1, "idle": 0}
 
 
-def _combined_sync_status(requested: list) -> Literal["idle", "pending", "running", "failed"]:
+def _combined_sync_status(requested: list[str]) -> Literal["idle", "pending", "running", "failed"]:
     """The busiest mailbox wins, so one running sync is not hidden by an idle one."""
     status = "idle"
-    for item in requested:
-        if _SYNC_RANK.get(item.sync_status, 0) > _SYNC_RANK[status]:
-            status = item.sync_status
+    for state in requested:
+        if _SYNC_RANK.get(state, 0) > _SYNC_RANK[status]:
+            status = state
     return status
 
 
@@ -1088,10 +1088,8 @@ async def sync_messages(
 ) -> SyncResponse:
     """Enqueue sync_mailbox_delta for every active mailbox.
 
-    Outlook and Gmail are both queued. `enqueued` is true when this call took
-    a new generation for at least one of them. A mailbox that is already
-    pending or running is left alone. Queuing does not set last_successful_at.
-    A queue outage is 503 and that mailbox is failed, not idle.
+    Each mailbox is attempted independently. When nothing can be queued and
+    no sync is in flight, report a queue outage as 503.
     """
     requested = request_mailbox_sync(session, user.id)
     if not requested:
@@ -1100,8 +1098,11 @@ async def sync_messages(
             detail="No mailbox is connected.",
         )
     enqueued = False
+    statuses = []
+    first_failure = None
     for item in requested:
         if not item.enqueued:
+            statuses.append(item.sync_status)
             continue
         try:
             await get_arq(request).enqueue_job(
@@ -1111,12 +1112,18 @@ async def sync_messages(
             )
         except Exception as exc:
             mark_sync_enqueue_failed(session, item.account_id, item.generation)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Mailbox sync could not be queued.",
-            ) from exc
+            statuses.append("failed")
+            if first_failure is None:
+                first_failure = exc
+            continue
+        statuses.append(item.sync_status)
         enqueued = True
-    return SyncResponse(enqueued=enqueued, sync_status=_combined_sync_status(requested))
+    if first_failure is not None and not enqueued and not {"pending", "running"}.intersection(statuses):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Mailbox sync could not be queued.",
+        ) from first_failure
+    return SyncResponse(enqueued=enqueued, sync_status=_combined_sync_status(statuses))
 
 
 class ReadStateInput(BaseModel):

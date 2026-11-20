@@ -4,6 +4,7 @@ Register and login are plain `def` routes because password hashing is deliberate
 slow. FastAPI runs them in a thread pool, so hashing does not block the event loop.
 """
 
+from dataclasses import dataclass
 from datetime import timedelta
 import logging
 import re
@@ -22,6 +23,7 @@ from urllib.parse import urlencode
 
 from app.api.deps import _bearer, get_arq, get_current_user, get_session
 from app.config import get_settings
+from app.models.connected_account import ConnectedAccount
 from app.models.revoked_token import RevokedToken
 from app.models.user import User, utcnow
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
@@ -57,7 +59,10 @@ from app.services.slack.oauth import (
 )
 from app.services.mailboxes import (
     disconnect_active_mailbox,
+    disconnect_mailbox,
     lock_active_mailbox,
+    lock_active_mailboxes,
+    lock_mailbox_owner,
     mark_sync_enqueue_failed,
 )
 
@@ -118,8 +123,16 @@ _ERR_STATE = "invalid_state"
 _ERR_TOKEN = "token_exchange"
 _ERR_TAKEN = "mailbox_taken"
 _ERR_CONFLICT = "mailbox_conflict"
+_ERR_MISMATCH = "mailbox_mismatch"
 
 _UNAVAILABLE = object()
+
+
+@dataclass(frozen=True)
+class MailboxReconnect:
+    provider: str
+    user_id: UUID
+    mailbox_id: UUID
 
 
 def _token_response(session: Session, user: User) -> TokenResponse:
@@ -293,7 +306,7 @@ def _redis_client() -> redis.Redis:
     )
 
 
-def _consume_oauth_user_id(state: str) -> UUID | None | object:
+def _consume_oauth_state(state: str) -> UUID | MailboxReconnect | None | object:
     """Read and delete the one-time state.
 
     None means the state is missing, malformed, or unknown.
@@ -314,15 +327,21 @@ def _consume_oauth_user_id(state: str) -> UUID | None | object:
         return None
     try:
         text = raw.decode() if isinstance(raw, bytes) else str(raw)
+        if ":" in text:
+            provider, user_id, mailbox_id = text.split(":")
+            if provider not in {"google", "microsoft"}:
+                return None
+            return MailboxReconnect(provider, UUID(user_id), UUID(mailbox_id))
         return UUID(text)
     except (UnicodeDecodeError, ValueError):
         return None
 
 
-def _store_oauth_state(state: str, user_id: UUID) -> None:
+def _store_oauth_state(state: str, user_id: UUID, target: MailboxReconnect | None = None) -> None:
+    value = str(user_id) if target is None else f"{target.provider}:{user_id}:{target.mailbox_id}"
     client = _redis_client()
     try:
-        client.setex(f"oauth_state:{state}", _STATE_TTL_SECONDS, str(user_id))
+        client.setex(f"oauth_state:{state}", _STATE_TTL_SECONDS, value)
     finally:
         client.close()
 
@@ -338,12 +357,37 @@ def _delete_oauth_state(state: str) -> None:
         logger.warning("oauth state cleanup failed")
 
 
+def _reconnect_target(
+    session: Session, user_id: UUID, provider: str, mailbox_id: UUID | None,
+) -> MailboxReconnect | None:
+    if mailbox_id is None:
+        return None
+    account = session.get(ConnectedAccount, mailbox_id)
+    if account is None or account.user_id != user_id or account.provider != provider:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Mailbox not found.")
+    return MailboxReconnect(provider, user_id, mailbox_id)
+
+
+def _consume_email_state(state: str, provider: str) -> tuple[UUID, UUID | None] | None:
+    identity = _consume_oauth_state(state)
+    if isinstance(identity, UUID):
+        return identity, None
+    if isinstance(identity, MailboxReconnect) and identity.provider == provider:
+        return identity.user_id, identity.mailbox_id
+    return None
+
+
 @router.get("/microsoft/start", status_code=status.HTTP_200_OK)
-def microsoft_start(user: User = Depends(get_current_user)) -> MicrosoftStartResponse:
+def microsoft_start(
+    mailbox_id: UUID | None = None,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> MicrosoftStartResponse:
     """Return Microsoft's authorize URL. The Bearer token is not copied into it."""
     state = secrets.token_urlsafe(32)
+    target = _reconnect_target(session, user.id, "microsoft", mailbox_id)
     try:
-        _store_oauth_state(state, user.id)
+        _store_oauth_state(state, user.id, target)
     except Exception as exc:
         logger.warning("oauth state store unavailable")
         raise HTTPException(
@@ -356,6 +400,7 @@ def microsoft_start(user: User = Depends(get_current_user)) -> MicrosoftStartRes
             settings.graph_scope_list,
             state=state,
             redirect_uri=settings.graph_redirect_uri,
+            prompt="select_account",
         )
     except Exception as exc:
         _delete_oauth_state(state)
@@ -384,7 +429,11 @@ def _exchange_code(code: str) -> dict | None:
 
 
 @router.get("/google/start", status_code=status.HTTP_200_OK)
-def google_start(user: User = Depends(get_current_user)) -> MicrosoftStartResponse:
+def google_start(
+    mailbox_id: UUID | None = None,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> MicrosoftStartResponse:
     """Return Google's authorize URL. The Bearer token is not copied into it."""
     settings = get_settings()
     if not settings.google_client_id or not settings.google_redirect_uri:
@@ -394,8 +443,9 @@ def google_start(user: User = Depends(get_current_user)) -> MicrosoftStartRespon
             detail="Gmail connect is temporarily unavailable.",
         )
     state = secrets.token_urlsafe(32)
+    target = _reconnect_target(session, user.id, "google", mailbox_id)
     try:
-        _store_oauth_state(state, user.id)
+        _store_oauth_state(state, user.id, target)
     except Exception as exc:
         logger.warning("oauth state store unavailable")
         raise HTTPException(
@@ -425,10 +475,10 @@ async def google_callback(
 ) -> RedirectResponse:
     """Finish Google login and send the browser back to the configured frontend.
 
-    Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
+    Success returns the connected mailbox ID to the frontend inbox.
     Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
     The error is one of google_denied, invalid_state, token_exchange,
-    mailbox_taken, or mailbox_conflict. google_denied is also used when Google
+    mailbox_taken, or mailbox_mismatch. google_denied is also used when Google
     returns a token whose scopes omit Gmail read access: the user can untick
     Gmail on the consent screen, and that grant is revoked instead of saved.
     Provider text, codes, and tokens are not copied into the URL. Unexpected
@@ -437,20 +487,21 @@ async def google_callback(
     token is not described as a failed exchange.
     """
     del error_description  # logged nowhere and never copied into the redirect
-    persisted = False
+    connected = None
     try:
         if error:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_GOOGLE_DENIED, provider="Google")
         if not code or not state:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_STATE, provider="Google")
 
-        user_id = _consume_oauth_user_id(state)
-        if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
+        identity_state = _consume_email_state(state, "google")
+        if identity_state is None:
             return _inbox_failure(_ERR_STATE, provider="Google")
+        user_id, expected_mailbox_id = identity_state
         if session.get(User, user_id) is None or account_is_deleting(session, user_id):
             return _inbox_failure(_ERR_STATE, provider="Google")
 
@@ -473,7 +524,13 @@ async def google_callback(
         if not (can_modify or can_read_and_send):
             refresh = result.get("refresh_token")
             token = refresh if isinstance(refresh, str) and refresh else result.get("access_token")
-            if isinstance(token, str) and token:
+            identity = fetch_mailbox_identity(result["access_token"])
+            existing = identity and session.scalar(select(ConnectedAccount.id).where(
+                ConnectedAccount.provider == "google",
+                ConnectedAccount.provider_account_id == identity.provider_account_id,
+                ConnectedAccount.disconnected_at.is_(None),
+            ))
+            if identity and existing is None and isinstance(token, str) and token:
                 revoke_google_token(token)
             return _inbox_failure(_ERR_GOOGLE_DENIED, provider="Google")
         refresh_token = result.get("refresh_token")
@@ -496,14 +553,15 @@ async def google_callback(
             refresh_token=refresh_token,
             expires_at=utcnow() + timedelta(seconds=expires_in),
             scopes=result.get("scope") if isinstance(result.get("scope"), str) else None,
+            expected_mailbox_id=expected_mailbox_id,
         )
         if outcome.status is ConnectStatus.mailbox_taken:
             return _inbox_failure(_ERR_TAKEN, provider="Google")
-        if outcome.status is ConnectStatus.mailbox_conflict:
-            return _inbox_failure(_ERR_CONFLICT, provider="Google")
+        if outcome.status is ConnectStatus.mailbox_mismatch:
+            return _inbox_failure(_ERR_MISMATCH, provider="Google")
         if outcome.status is not ConnectStatus.connected or outcome.account_id is None:
             return _inbox_failure(_ERR_TOKEN, provider="Google")
-        persisted = True
+        connected = {"connected": "1", "email": outcome.email or identity.email, "mailbox_id": str(outcome.account_id)}
         try:
             await get_arq_enqueue(request, outcome.account_id, outcome.generation)
         except Exception as exc:
@@ -514,11 +572,11 @@ async def google_callback(
             )
             if outcome.generation is not None:
                 mark_sync_enqueue_failed(session, outcome.account_id, outcome.generation)
-        return _inbox_redirect(connected="1", email=outcome.email or identity.email)
+        return _inbox_redirect(**connected)
     except Exception as exc:
         logger.warning("Google callback failed error_type=%s", type(exc).__name__)
-        if persisted:
-            return _inbox_redirect(connected="1")
+        if connected:
+            return _inbox_redirect(**connected)
         return _inbox_failure(_ERR_TOKEN, provider="Google")
 
 
@@ -533,23 +591,11 @@ def google_disconnect(
     alone. Revoke failures are logged without the token; the local tokens are
     still deleted so this API cannot refresh access.
     """
-    account = lock_active_mailbox(session, user.id, provider="google")
-    if account is None:
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No mailbox is connected.",
-        )
+    account = _legacy_email_mailbox(session, user.id, "google")
     token = account.refresh_token or account.access_token
-    copied = token if isinstance(token, str) and token else None
-    session.rollback()
-    if copied:
-        revoke_google_token(copied)
-    if not disconnect_active_mailbox(session, user.id, provider="google"):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No mailbox is connected.",
-        )
+    disconnect_mailbox(session, account)
+    if token:
+        revoke_google_token(token)
     return DisconnectResponse(disconnected=True)
 
 
@@ -600,20 +646,20 @@ async def slack_callback(
     """
     if not slack_is_configured():
         if state:
-            _consume_oauth_user_id(state)
+            _consume_oauth_state(state)
         return _inbox_failure(_ERR_SLACK_UNCONFIGURED, provider="Slack")
     persisted = False
     try:
         if error:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_SLACK_DENIED, provider="Slack")
         if not code or not state:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_STATE, provider="Slack")
 
-        user_id = _consume_oauth_user_id(state)
+        user_id = _consume_oauth_state(state)
         if user_id is _UNAVAILABLE or user_id is None or not isinstance(user_id, UUID):
             return _inbox_failure(_ERR_STATE, provider="Slack")
         if session.get(User, user_id) is None or account_is_deleting(session, user_id):
@@ -686,17 +732,25 @@ def slack_disconnect(
     return DisconnectResponse(disconnected=True)
 
 
+def _legacy_email_mailbox(session: Session, user_id: UUID, provider: str) -> ConnectedAccount:
+    accounts = (
+        lock_active_mailboxes(session, user_id, provider=provider)
+        if lock_mailbox_owner(session, user_id) is not None else []
+    )
+    if len(accounts) > 1:
+        raise HTTPException(status.HTTP_409_CONFLICT, "choose_mailbox")
+    if not accounts:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No mailbox is connected.")
+    return accounts[0]
+
+
 @router.post("/microsoft/disconnect")
 def microsoft_disconnect(
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> DisconnectResponse:
     """Clear the active Outlook mailbox's tokens and hide it. Messages stay in the database."""
-    if not disconnect_active_mailbox(session, user.id, provider="microsoft"):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No mailbox is connected.",
-        )
+    disconnect_mailbox(session, _legacy_email_mailbox(session, user.id, "microsoft"))
     return DisconnectResponse(disconnected=True)
 
 
@@ -711,31 +765,30 @@ async def microsoft_callback(
 ) -> RedirectResponse:
     """Finish Microsoft login and send the browser back to the configured frontend.
 
-    Success lands on `{FRONTEND_URL}/inbox?connected=1&email=...`.
+    Success returns the connected mailbox ID to the frontend inbox.
     Failure lands on `{FRONTEND_URL}/inbox?connected=0&error=...`.
     The error is one of microsoft_denied, invalid_state, token_exchange,
-    mailbox_taken, or mailbox_conflict. Provider text, codes, and tokens are
+    mailbox_taken, or mailbox_mismatch. Provider text, codes, and tokens are
     not copied into the URL. Unexpected failures also redirect to token_exchange
     unless the mailbox row was already committed, in which case the redirect is
     connected=1 so a saved refresh token is not described as a failed exchange.
     """
     del error_description  # logged nowhere and never copied into the redirect
-    persisted = False
+    connected = None
     try:
         if error:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_DENIED)
         if not code or not state:
             if state:
-                _consume_oauth_user_id(state)
+                _consume_oauth_state(state)
             return _inbox_failure(_ERR_STATE)
 
-        user_id = _consume_oauth_user_id(state)
-        if user_id is _UNAVAILABLE or user_id is None:
+        identity_state = _consume_email_state(state, "microsoft")
+        if identity_state is None:
             return _inbox_failure(_ERR_STATE)
-        if not isinstance(user_id, UUID):
-            return _inbox_failure(_ERR_STATE)
+        user_id, expected_mailbox_id = identity_state
         if session.get(User, user_id) is None or account_is_deleting(session, user_id):
             return _inbox_failure(_ERR_STATE)
 
@@ -774,14 +827,15 @@ async def microsoft_callback(
             refresh_token=refresh_token,
             expires_at=utcnow() + timedelta(seconds=expires_in),
             scopes=result.get("scope") if isinstance(result.get("scope"), str) else None,
+            expected_mailbox_id=expected_mailbox_id,
         )
         if outcome.status is ConnectStatus.mailbox_taken:
             return _inbox_failure(_ERR_TAKEN)
-        if outcome.status is ConnectStatus.mailbox_conflict:
-            return _inbox_failure(_ERR_CONFLICT)
+        if outcome.status is ConnectStatus.mailbox_mismatch:
+            return _inbox_failure(_ERR_MISMATCH)
         if outcome.status is not ConnectStatus.connected or outcome.account_id is None:
             return _inbox_failure(_ERR_TOKEN)
-        persisted = True
+        connected = {"connected": "1", "email": outcome.email or email, "mailbox_id": str(outcome.account_id)}
         try:
             await get_arq_enqueue(request, outcome.account_id, outcome.generation)
         except Exception as exc:
@@ -792,11 +846,11 @@ async def microsoft_callback(
             )
             if outcome.generation is not None:
                 mark_sync_enqueue_failed(session, outcome.account_id, outcome.generation)
-        return _inbox_redirect(connected="1", email=outcome.email or email)
+        return _inbox_redirect(**connected)
     except Exception as exc:
         logger.warning("Microsoft callback failed error_type=%s", type(exc).__name__)
-        if persisted:
-            return _inbox_redirect(connected="1")
+        if connected:
+            return _inbox_redirect(**connected)
         return _inbox_failure(_ERR_TOKEN)
 
 

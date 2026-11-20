@@ -153,7 +153,7 @@ def google_authorization_url(state: str) -> str:
             "scope": _GOOGLE_SCOPE,
             "state": state,
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "select_account consent",
         }
     )
     return f"{_AUTHORIZATION_URL}?{query}"

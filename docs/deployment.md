@@ -123,7 +123,7 @@ A separate always-on API and worker, with durable Postgres, durable Redis, and a
 
 ## Migration and rollback
 
-Current head is `b7d3e9a41c20`.
+Current head is `9e8b2cc6f304`. It follows the provider folder migration and removes the one-active-account indexes for Gmail and Outlook. Provider identity and the Slack limit stay unique.
 
 Apply:
 
@@ -139,15 +139,17 @@ docker compose -f docker-compose.deploy.yml --profile migrate run --rm migrate
 
 The lock id is fixed in `app.deploy.migrate`. It is not a secret. The connection that holds it stays open until Alembic returns, then the lock is released. Closing the connection also releases it.
 
-Roll back the image before you roll back the schema. Columns added by `b7d3e9a41c20` are ignored by an older build that does not select them. Downgrade that revision anyway only from a backup: it drops the new message and sync columns, and it writes an empty string into null access tokens so the old NOT NULL column can be restored. Prefer restoring the database backup over `alembic downgrade`.
+For the multi-mailbox release, apply this migration before starting the new API or enabling the frontend account picker. A Render service that starts Uvicorn directly needs the migration as a separate release step. The `python -m app.deploy.demo` start command already runs it when `RUN_MIGRATIONS` is enabled. Confirm the applied revision with `alembic current`.
+
+The previous index rules can only be restored once each user has at most one active Outlook mailbox and one active Gmail mailbox. The downgrade refuses conflicting rows. Before returning to an API that assumes one mailbox per provider, resolve any extra mailboxes while the ID-based disconnect route is still deployed.
+
+After resolving extra connections, roll back the image before rolling back the schema. Verify the current revision and target the preceding revision when rolling back just this migration.
 
 ```bash
 alembic current
-alembic downgrade b7d3e9a41c20
-alembic upgrade head
+alembic downgrade 8cfe3352ae10
 ```
 
-`alembic downgrade b7d3e9a41c20` moves from head to the previous revision. Read `alembic history` before you type it.
 
 ## Verify the 30-day deletion window
 
