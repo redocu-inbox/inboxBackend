@@ -141,6 +141,8 @@ The lock id is fixed in `app.deploy.migrate`. It is not a secret. The connection
 
 For the multi-mailbox release, apply this migration before starting the new API or enabling the frontend account picker. A Render service that starts Uvicorn directly needs the migration as a separate release step. The `python -m app.deploy.demo` start command already runs it when `RUN_MIGRATIONS` is enabled. Confirm the applied revision with `alembic current`.
 
+If account deletion is already deployed, drain and stop the old API and worker before starting the new versions against the same database. This release changes how both processes derive account advisory lock keys. Apply the same coordinated stop and start if rolling back across this change.
+
 The previous index rules can only be restored once each user has at most one active Outlook mailbox and one active Gmail mailbox. The downgrade refuses conflicting rows. Before returning to an API that assumes one mailbox per provider, resolve any extra mailboxes while the ID-based disconnect route is still deployed.
 
 After resolving extra connections, roll back the image before rolling back the schema. Verify the current revision and target the preceding revision when rolling back just this migration.
