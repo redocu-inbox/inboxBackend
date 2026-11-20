@@ -9,7 +9,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine.url import make_url
 
@@ -58,6 +58,8 @@ class Settings(BaseSettings):
 
     storage_backend: str = "local"
     storage_local_path: str = "./storage"
+
+    stripe_secret_key: SecretStr = SecretStr("")
 
     # Microsoft Graph app used to connect a mailbox and list recent messages.
     graph_client_id: str = ""

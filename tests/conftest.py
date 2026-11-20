@@ -6,7 +6,7 @@ engine from the settings at import time.
 
 import os
 from collections.abc import Callable, Iterator
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from cryptography.fernet import Fernet
@@ -75,3 +75,22 @@ def register_user(client: TestClient) -> Callable[[str], dict[str, str]]:
         return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
     return _register
+
+
+@pytest.fixture
+def deletion_rate_store(monkeypatch):
+    redis_client = Mock()
+    redis_client.eval.return_value = 1
+    monkeypatch.setattr("app.services.auth.rate_limit._client", lambda: redis_client)
+    return redis_client
+
+
+@pytest.fixture
+def delete_account(client: TestClient, deletion_rate_store):
+    def _delete(headers: dict[str, str], email: str):
+        return client.request(
+            "DELETE", "/users/me", headers=headers,
+            json={"confirmation_email": email, "password": "correct-horse-battery"},
+        )
+
+    return _delete

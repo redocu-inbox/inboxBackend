@@ -4,14 +4,20 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlmodel import Session, select
 
 from app.api.deps import get_current_user, get_deletion_user, get_session
 from app.models.account_deletion import AccountDeletion
 from app.models.connected_account import ConnectedAccount
 from app.models.user import User, utcnow
+from app.security import verify_password
+from app.services.auth.rate_limit import (
+    RateLimitExceeded,
+    RateLimitUnavailable,
+    enforce_account_deletion_limit,
+)
 from app.services.mailboxes import SYNC_STATUSES
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -68,6 +74,14 @@ class UpdateProfileRequest(BaseModel):
 class AccountDeletionResponse(BaseModel):
     status: Literal["pending"] = "pending"
     requested_at: datetime
+
+
+class AccountDeletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation_email: str = Field(min_length=1, max_length=320)
+    password: SecretStr = Field(min_length=1, max_length=128)
+    mfa_code: SecretStr | None = None
 
 
 def active_mailboxes(session: Session, user_id: UUID) -> list[ConnectedAccount]:
@@ -199,14 +213,28 @@ def update_me(
     responses={status.HTTP_409_CONFLICT: {"description": "Account activity is in progress. Retry shortly."}},
 )
 def request_account_deletion(
+    body: AccountDeletionRequest,
     user: User = Depends(get_deletion_user),
     session: Session = Depends(get_session),
 ) -> AccountDeletionResponse:
-    """Record one deletion request and block account activity once it commits."""
+    """Verify the account owner and block account activity once the request commits."""
+    if body.confirmation_email.strip().casefold() != user.email.casefold():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "confirmation_email_mismatch")
+    if body.mfa_code is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "mfa_verification_unavailable")
+    try:
+        enforce_account_deletion_limit(str(user.id))
+    except RateLimitExceeded:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited") from None
+    except RateLimitUnavailable:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "deletion_confirmation_unavailable") from None
+    if not verify_password(body.password.get_secret_value(), user.hashed_password):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "incorrect_password")
+
     deletion = session.get(AccountDeletion, user.id)
     if deletion is not None:
         return AccountDeletionResponse(requested_at=deletion.requested_at)
-    deletion = AccountDeletion(user_id=user.id)
+    deletion = AccountDeletion(user_id=user.id, stripe_customer_id=user.stripe_customer_id)
     response = AccountDeletionResponse(requested_at=deletion.requested_at)
     session.add(deletion)
     session.commit()

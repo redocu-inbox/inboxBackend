@@ -16,3 +16,5 @@ class AccountDeletion(SQLModel, table=True):
     user_id: UUID = Field(primary_key=True)
     requested_at: datetime = Field(default_factory=utcnow, sa_type=DateTime(timezone=True), nullable=False)
     local_purged_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    stripe_customer_id: str | None = Field(default=None, max_length=255, repr=False)
+    stripe_deleted_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))

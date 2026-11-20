@@ -11,7 +11,7 @@ import logging
 from sqlmodel import Session
 
 from app.db import engine
-from app.services.account_deletion import purge_pending_accounts
+from app.services.account_deletion import purge_pending_accounts, purge_pending_stripe_customers
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 async def purge_deleted_accounts(ctx: dict) -> None:
     """Process durable account deletion requests using the worker's storage."""
     await asyncio.to_thread(purge_pending_accounts)
+
+
+async def purge_deleted_stripe_customers(ctx: dict) -> None:
+    """Retry Stripe cleanup from the durable deletion requests."""
+    await asyncio.to_thread(purge_pending_stripe_customers)
 
 
 async def send_password_reset(ctx: dict, user_id: str, request_id: str) -> None:

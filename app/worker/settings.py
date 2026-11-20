@@ -23,7 +23,7 @@ from app.worker.mail_tasks import (
     sync_connected_mailboxes,
     sync_mailbox_delta,
 )
-from app.worker.tasks import heartbeat, purge_deleted_accounts, send_password_reset
+from app.worker.tasks import heartbeat, purge_deleted_accounts, purge_deleted_stripe_customers, send_password_reset
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ def _cron_jobs() -> list:
             )
         )
     jobs.append(cron(purge_deleted_accounts, run_at_startup=True))
+    jobs.append(cron(purge_deleted_stripe_customers, run_at_startup=True))
     return jobs
 
 

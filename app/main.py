@@ -9,8 +9,11 @@ from contextlib import asynccontextmanager
 
 from arq import create_pool
 from arq.connections import RedisSettings
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.config import get_settings
@@ -37,6 +40,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Inbox API", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    if request.method == "DELETE" and request.url.path == "/users/me":
+        # The default validation response can echo submitted credentials.
+        return JSONResponse(status_code=422, content={"detail": "invalid_deletion_confirmation"})
+    return await request_validation_exception_handler(request, exc)
+
 
 # Browsers block a Vite app on :5173 from calling an API on :8000 unless the
 # API explicitly allows that origin. This middleware adds those headers.
