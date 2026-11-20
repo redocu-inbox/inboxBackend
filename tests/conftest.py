@@ -59,6 +59,7 @@ def client(tmp_path, monkeypatch) -> TestClient:
     storage = LocalStorage(str(tmp_path))
     monkeypatch.setattr("app.services.forms.pipeline.get_storage", lambda: storage)
     monkeypatch.setattr("app.storage.get_storage", lambda: storage)
+    monkeypatch.setattr("app.worker.mail_tasks.read_provider_folders", lambda *_: {})
     app.state.arq = AsyncMock()
     return TestClient(app)
 

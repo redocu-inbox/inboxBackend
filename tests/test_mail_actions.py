@@ -2,8 +2,10 @@
 
 import asyncio
 import json
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from threading import Event
 from urllib.error import URLError
 from uuid import UUID
 
@@ -14,7 +16,7 @@ from app.db import engine
 from app.models.connected_account import ConnectedAccount
 from app.models.message import Message
 from app.services.google.oauth import GMAIL_MODIFY_SCOPE, GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE
-from app.services.inbox import mail_actions
+from app.services.inbox import folder_sync, mail_actions
 from app.worker import mail_tasks
 from tests.test_frontend_connect import _add_account, _add_message, _user_id
 from tests.test_mailbox_reliability import GRAPH_ITEM, _gmail_item
@@ -64,7 +66,8 @@ def provider_requests(monkeypatch):
         requests.append(
             (request.get_method(), request.full_url, request.get_header("Authorization"), payload)
         )
-        return nullcontext()
+        new_id = "moved-" + payload["destinationId"] if payload and "destinationId" in payload else None
+        return BytesIO(json.dumps({"id": new_id}).encode())
 
     monkeypatch.setattr(mail_actions, "urlopen", capture)
     monkeypatch.setattr(mail_tasks, "_ensure_graph_subscription", lambda session, account_id: None)
@@ -162,6 +165,113 @@ def test_moved_message_stays_out_of_inbox_after_sync(
         message = session.get(Message, UUID(message_id))
         assert message.inbox_removed_at is not None
         assert message.subject == "Hello"
+
+    destination = "archive" if action == "archive" else "deleted"
+    listed = client.get(f"/messages?folder={destination}", headers=headers).json()
+    assert [(item["id"], item["folder"], item["account_id"]) for item in listed] == [
+        (message_id, destination, accounts[provider]),
+    ]
+    body = {"message_ids": [message_id], "folder": "inbox", "expected_folder": destination}
+    response = client.patch("/messages/folder", headers=headers, json=body)
+    assert response.json() == {"updated": [{"id": message_id, "folder": "inbox"}], "failed": []}
+    after_restore = client.get(f"/messages/{message_id}", headers=headers).json()
+    assert after_restore["folder"] == "inbox"
+    if provider == "microsoft":
+        old_folder = "archive" if action == "archive" else "deleteditems"
+        assert provider_requests[-1] == (
+            "POST", f"https://graph.microsoft.com/v1.0/me/messages/moved-{old_folder}/move",
+            "Bearer microsoft-token", {"destinationId": "inbox"},
+        )
+    else:
+        assert provider_requests[-1] == ("POST", f"{_GMAIL_URL}/modify", "Bearer google-token", {"addLabelIds": ["INBOX"]})
+        if action == "trash":
+            assert provider_requests[-2] == ("POST", f"{_GMAIL_URL}/untrash", "Bearer google-token", None)
+    count = len(provider_requests)
+    assert client.patch("/messages/folder", headers=headers, json=body).json()["failed"][0]["id"] == message_id
+    assert len(provider_requests) == count
+
+
+def test_batch_read_updates_owned_mail_on_both_providers_and_reports_failures(client, register_user, inbox, provider_requests):
+    headers, _, messages = inbox
+    other = register_user("foreign@example.com")
+    other_id = _user_id(client, other)
+    external_account = _add_account(other_id)
+    external_message = _add_message(other_id, external_account, graph_id="foreign", received_at=datetime.now(timezone.utc), priority_score=None)
+    own = list(messages.values())
+
+    response = client.patch("/messages/read-state", headers=headers, json={"message_ids": [own[0], external_message, own[1]], "is_read": True})
+    assert response.status_code == 200
+    assert response.json() == {
+        "updated": [{"id": id, "is_read": True} for id in own],
+        "failed": [{"id": external_message, "detail": "Message not found."}],
+    }
+    assert [item[2] for item in provider_requests] == ["Bearer microsoft-token", "Bearer google-token"]
+    duplicate = client.patch("/messages/read-state", headers=headers, json={"message_ids": [own[0]] * 2, "is_read": False})
+    assert duplicate.status_code == 422
+    assert len(provider_requests) == 2
+
+
+def test_simultaneous_archive_requests_move_the_outlook_message_once(client, inbox, monkeypatch):
+    headers, _, messages = inbox
+    provider_called = Event()
+    finish = Event()
+    calls = []
+
+    def move(request, *, timeout):
+        calls.append(request.full_url)
+        provider_called.set()
+        assert finish.wait(5)
+        return BytesIO(b'{"id":"archived-id"}')
+
+    def archive():
+        return client.patch("/messages/folder", headers=headers, json={
+            "message_ids": [messages["microsoft"]], "folder": "archive",
+        })
+
+    monkeypatch.setattr(mail_actions, "urlopen", move)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(archive)
+        try:
+            assert provider_called.wait(5)
+            second = pool.submit(archive)
+        finally:
+            finish.set()
+        assert first.result(timeout=5).json() == second.result(timeout=5).json()
+    assert calls == [f"{_GRAPH_URL}/move"]
+
+
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+def test_sync_reconciles_a_known_message_moved_at_the_provider(client, inbox, monkeypatch, provider):
+    headers, accounts, messages = inbox
+
+    def respond(request, *, timeout):
+        if provider == "google":
+            data = {"id": _SHARED_ID, "labelIds": ["TRASH", "UNREAD"]}
+        elif request.full_url.endswith("/$batch"):
+            requests = json.loads(request.data)["requests"]
+            assert requests[-1]["headers"] == {"Prefer": 'IdType="ImmutableId"'}
+            data = {"responses": [
+                *({"id": name, "status": 200, "body": {"id": f"folder-{name}"}}
+                  for name in ("inbox", "archive", "deleteditems")),
+                {"id": "0", "status": 200, "body": {"parentFolderId": "folder-archive", "isRead": True}},
+            ]}
+        else:
+            payload = json.loads(request.data)
+            result = "stable-id" if payload["targetIdType"] == "restImmutableEntryId" else "rest-archive-id"
+            data = {"value": [{"sourceId": payload["inputIds"][0], "targetId": result}]}
+        return BytesIO(json.dumps(data).encode())
+
+    monkeypatch.setattr(mail_tasks, "read_provider_folders", folder_sync.read_provider_folders)
+    monkeypatch.setattr(folder_sync, "urlopen", respond)
+    monkeypatch.setattr(mail_tasks, "_ensure_graph_subscription", lambda *_: None)
+    monkeypatch.setattr(mail_tasks, "collect_gmail_messages", lambda _: [])
+    monkeypatch.setattr(mail_tasks, "_graph_get", lambda *_: {"value": [{"id": _SHARED_ID, "@removed": {"reason": "deleted"}}]})
+    _run_sync(accounts[provider])
+    detail = client.get(f"/messages/{messages[provider]}", headers=headers).json()
+    assert detail["folder"] == ("deleted" if provider == "google" else "archive")
+    with Session(engine) as session:
+        row = session.get(Message, UUID(messages[provider]))
+        assert row.graph_id == (_SHARED_ID if provider == "google" else "rest-archive-id")
 
 
 def test_sync_started_before_read_action_discards_its_snapshot(client, inbox, monkeypatch, provider_requests):

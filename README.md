@@ -201,6 +201,8 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `POST /forms/jobs/{job_id}/refill` | yes | Replace `extracted_values`, set `pending`, and enqueue `run_form_fill` |
 | `POST /messages/new` | yes | Save a new email or a forward. Does not contact the mailbox |
 | `GET /messages/{id}/conversation` | yes | Plain-text history for this mailbox's copy of the thread. Local drafts are omitted |
+| `PATCH /messages/read-state` | yes | Change `is_read` in Gmail or Outlook and acknowledge each selected message |
+| `PATCH /messages/folder` | yes | Move selected mail to Inbox, Archive, or Deleted and acknowledge each message |
 | `POST /messages/{id}/approve` | yes | Submit a ready Outlook or Gmail draft once. Set `approved_at` when the send is confirmed. A Slack row is `409` |
 | `POST /messages/{id}/draft/attachments` | yes | Attach a completed PDF to an unsent Outlook draft. Does not send |
 | `POST /attachments` | yes | Stage one file from the computer. Saving a draft is what binds it |

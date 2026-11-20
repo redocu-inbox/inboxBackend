@@ -30,6 +30,7 @@ from app.services.google.tokens import GoogleTokenUnavailable, refresh_google_ac
 from app.services.graph.client import GraphClient
 from app.services.graph.html_text import to_plain_text
 from app.services.inbox.body_html import sanitize_body_html
+from app.services.inbox.folder_sync import FolderState, read_provider_folders
 from app.services.inbox.recipients import graph_people
 from app.services.graph.subscriptions import (
     GraphSubscriptionError,
@@ -140,6 +141,13 @@ def _upsert_message(
         )
     ).first()
     if existing is None:
+        if account.provider == "microsoft" and session.scalar(
+            select(Message.id).where(
+                Message.connected_account_id == account.id,
+                Message.previous_provider_id == fields["graph_id"],
+            ).limit(1)
+        ) is not None:
+            return None
         existing = Message(
             user_id=account.user_id,
             connected_account_id=account.id,
@@ -229,16 +237,71 @@ def _mark_failed(session: Session, account_id: UUID, generation: int | None, err
     session.commit()
 
 
-def _delete_provider_message(session: Session, account: ConnectedAccount, graph_id: str) -> None:
-    """Delete a removed Graph row unless an app action already hid it."""
-    row = session.exec(
-        select(Message).where(
-            Message.connected_account_id == account.id,
-            Message.graph_id == graph_id[:512],
+def _folder_snapshot(
+    session: Session,
+    account: ConnectedAccount,
+    *,
+    inbox_ids: set[str],
+    removed_ids: set[str] | None = None,
+) -> tuple[list[str], dict[str, FolderState]]:
+    # Inbox feeds are bounded and cannot identify a destination merely from absence.
+    # Rotate checks among known messages and leave recently acknowledged moves alone.
+    candidates = select(Message.graph_id).where(
+        Message.connected_account_id == account.id,
+        Message.origin == "provider",
+        (Message.folder_checked_at.is_(None)) | (Message.folder_checked_at < utcnow() - timedelta(minutes=1)),
+    )
+    if account.provider == "microsoft":
+        candidates = candidates.where(
+            (Message.inbox_removed_at.is_not(None)) | Message.graph_id.in_(removed_ids or ()),
         )
-    ).first()
-    if row is not None and row.inbox_removed_at is None:
-        session.delete(row)
+    elif inbox_ids:
+        candidates = candidates.where(
+            (Message.inbox_removed_at.is_not(None)) | ~Message.graph_id.in_(inbox_ids),
+        )
+    ids = list(session.exec(candidates.order_by(Message.folder_checked_at.asc().nulls_first(), Message.id).limit(12)))
+    return ids, read_provider_folders(account.provider, account.access_token or "", ids)
+
+
+def _apply_folder_snapshot(
+    session: Session, account: ConnectedAccount, ids: list[str], states: dict[str, FolderState],
+    *, removed_ids: set[str] | None = None,
+) -> None:
+    removed = removed_ids or set()
+    if not ids and not removed:
+        return
+    rows = session.exec(select(Message).where(
+        Message.connected_account_id == account.id, Message.graph_id.in_(set(ids) | removed),
+    )).all()
+    now = utcnow()
+    for row in rows:
+        old_id = row.graph_id
+        state = states.get(old_id)
+        if old_id in ids:
+            row.folder_checked_at = now
+        if state is None:
+            if old_id in removed and row.inbox_removed_at is None:
+                row.mail_folder = None
+                row.inbox_removed_at = now
+            session.add(row)
+            continue
+        if state.missing and old_id in removed and row.inbox_removed_at is None:
+            session.delete(row)
+            continue
+        if state.provider_id != old_id:
+            if session.scalar(select(Message.id).where(
+                Message.connected_account_id == account.id, Message.graph_id == state.provider_id,
+            )) is not None:
+                continue
+            row.previous_provider_id = old_id
+            row.graph_id = state.provider_id
+        row.mail_folder = state.folder
+        row.inbox_removed_at = None if state.folder == "inbox" else (row.inbox_removed_at or now)
+        if state.is_read is not None:
+            row.is_read = state.is_read
+        row.updated_at = now
+        session.add(row)
+    session.flush()
 
 
 def _subscription_settings(account_id: UUID) -> tuple[str, str] | None:
@@ -346,6 +409,9 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             if locked.access_token is None:
                 raise MailboxNotWritable()
             items = collect_gmail_messages(locked.access_token)
+        checked, folders = _folder_snapshot(
+            session, locked, inbox_ids={item["id"] for item in items if isinstance(item.get("id"), str)},
+        )
     except MailboxNotWritable:
         logger.info("sync_mailbox_delta stopped account=%s job_id=%s", account_id, ctx.get("job_id"))
         return
@@ -393,6 +459,7 @@ def _sync_google_mailbox(session: Session, account_id: UUID, claimed: int | None
             session.rollback()
             logger.info("sync_mailbox_delta discarded account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
+        _apply_folder_snapshot(session, locked, checked, folders)
         for item in items:
             _classify_saved(
                 session,
@@ -547,6 +614,8 @@ async def sync_mailbox_delta(
             if locked.access_token is None:
                 raise MailboxNotWritable()
             delta = await GraphClient(locked).sync_inbox_delta(_graph_get)
+            removed = set(delta.removed_ids)
+            checked, folders = _folder_snapshot(session, locked, inbox_ids=set(), removed_ids=removed)
         except MailboxNotWritable:
             logger.info("sync_mailbox_delta stopped account=%s job_id=%s", account_id, ctx.get("job_id"))
             return
@@ -581,9 +650,10 @@ async def sync_mailbox_delta(
                     ctx.get("job_id"),
                 )
                 return
-            for removed_id in delta.removed_ids:
-                _delete_provider_message(session, locked, removed_id)
+            _apply_folder_snapshot(session, locked, checked, folders, removed_ids=removed)
             for item in delta.changed:
+                if item.get("id") in removed:
+                    continue
                 _classify_saved(
                     session,
                     _upsert_message(session, locked, item),

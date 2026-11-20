@@ -24,7 +24,10 @@ LIST_KEYS = {
     "from_email",
     "received_at",
     "is_read",
+    "folder",
     "provider",
+    "account_id",
+    "account_email",
     "has_draft",
     "conversation_id",
     "priority_score",
@@ -57,8 +60,6 @@ DETAIL_KEYS = LIST_KEYS | {
     "reply_to",
     "reply_all_recipients",
     "can_edit_recipients",
-    "account_id",
-    "account_email",
     "pending_send_attempt_id",
 }
 
@@ -542,6 +543,7 @@ def test_message_list_contract_sort_and_total(client, register_user):
     assert item["from_name"] is None
     assert item["from_email"] is None
     assert item["is_read"] is None
+    assert item["folder"] == "inbox"
     assert item["conversation_id"] is None
     assert item["priority_score"] == 50
     assert item["priority_band"] is None

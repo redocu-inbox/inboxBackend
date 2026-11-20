@@ -1,19 +1,24 @@
 import app.db
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, Date, DateTime, Text, UniqueConstraint
+from sqlalchemy import Column, Date, DateTime, Index, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import SQLModel, Field
 
 from app.models.user import utcnow
 
+MailFolder = Literal["inbox", "archive", "deleted"]
+
+
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
     __table_args__ = (
         UniqueConstraint("connected_account_id", "graph_id", name="uq_messages_account_graph_id"),
+        Index("ix_messages_previous_provider", "connected_account_id", "previous_provider_id",
+              postgresql_where=text("previous_provider_id IS NOT NULL")),
     )
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
@@ -29,6 +34,9 @@ class Message(SQLModel, table=True):
     is_read: bool | None = Field(default=None)
     # Set after the provider confirms an app-initiated archive or trash action.
     inbox_removed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    mail_folder: str | None = Field(default=None, max_length=16)
+    folder_checked_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+    previous_provider_id: str | None = Field(default=None, max_length=512)
     body_text: str | None = Field(default=None, sa_column=Column(Text))
     # A separate, sanitized HTML fragment for message detail.
     body_html: str | None = Field(default=None, sa_column=Column(Text))

@@ -9,11 +9,12 @@ column is [] in JSON. user_corrected is false until a correction.
 priority_scored_at is stored and is not returned. suggested_form is the
 newest needs_review or completed fill job for that message, or null.
 detail.draft is the local reply draft, or null. has_draft reports saved reply text.
-The list omits archived and trashed messages, draft details, and message bodies.
+The default list omits archived and trashed messages, draft details, and bodies.
 """
 
 import logging
 from datetime import date, datetime
+from time import monotonic
 from typing import Any, Literal
 from urllib.error import HTTPError
 from uuid import UUID
@@ -34,7 +35,7 @@ from app.models.classification_correction import (
 from app.models.connected_account import ConnectedAccount
 from app.models.form_fill_job import FormFillJob, FormFillStatus
 from app.models.form_template import FormTemplate
-from app.models.message import Message
+from app.models.message import MailFolder, Message
 from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.models.user import User, utcnow
 from app.services.forms.suggest import SuggestedForm, suggested_forms_for_messages
@@ -64,7 +65,7 @@ from app.services.inbox.attachments import payloads as attachment_payloads
 from app.services.inbox.attachments import bind_attachments, expire_unbound
 from app.services.inbox.compose import create_local_email
 from app.services.inbox.history import conversation_page
-from app.services.inbox.mail_actions import MoveAction, write_provider_message
+from app.services.inbox.mail_actions import DESTINATION, MoveAction, write_provider_message
 from app.services.inbox.recipients import normalize_list, reply_all, saved_or_default
 from app.services.mailboxes import lock_active_mailbox, mark_sync_enqueue_failed, request_mailbox_sync
 from app.services.priority.apply import message_fields
@@ -144,6 +145,9 @@ class MessageResponse(BaseModel):
     from_email: str | None = None
     received_at: datetime
     is_read: bool | None = None
+    folder: MailFolder | None = None
+    account_id: UUID | None = None
+    account_email: str | None = None
     provider: str | None = None
     has_draft: bool
     conversation_id: str | None = None
@@ -176,8 +180,6 @@ class MessageDetailResponse(MessageResponse):
     reply_to: list[str] = Field(default_factory=list)
     reply_all_recipients: DraftRecipientsResponse | None = None
     can_edit_recipients: bool = False
-    account_id: UUID | None = None
-    account_email: str | None = None
     pending_send_attempt_id: UUID | None = None
 
 
@@ -253,7 +255,7 @@ class ClassificationPatch(BaseModel):
         return text
 
 
-def _visible_message_filter(user_id: UUID):
+def _visible_message_filter(user_id: UUID, folder: MailFolder = "inbox"):
     """Inbox messages on this user's active mailboxes."""
     active_ids = select(ConnectedAccount.id).where(
         ConnectedAccount.user_id == user_id,
@@ -262,7 +264,7 @@ def _visible_message_filter(user_id: UUID):
     return (
         Message.user_id == user_id,
         Message.connected_account_id.in_(active_ids),
-        Message.inbox_removed_at.is_(None),
+        Message.inbox_removed_at.is_(None) if folder == "inbox" else Message.mail_folder == folder,
     )
 
 
@@ -292,8 +294,11 @@ def _suggested_response(suggested: SuggestedForm | None) -> SuggestedFormRespons
 
 
 def _message_response(
-    row: Message, provider: str | None, suggested: SuggestedForm | None, *, draft_text: str | None
+    row: Message, provider: str, account_email: str, suggested: SuggestedForm | None, *, draft_text: str | None
 ) -> MessageResponse:
+    folder = row.mail_folder
+    if folder is None and provider in _WRITE_SCOPES and row.origin == "provider" and row.inbox_removed_at is None:
+        folder = "inbox"
     return MessageResponse(
         id=row.id,
         subject=row.subject,
@@ -303,6 +308,9 @@ def _message_response(
         received_at=row.received_at,
         is_read=row.is_read,
         provider=provider,
+        folder=folder,
+        account_id=row.connected_account_id,
+        account_email=account_email,
         has_draft=bool(draft_text and draft_text.strip()),
         priority_score=row.priority_score,
         priority_band=row.priority_band,
@@ -342,15 +350,16 @@ def list_messages(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     sort: Literal["received_at", "priority"] = Query(default="received_at"),
+    folder: MailFolder = Query(default="inbox"),
     user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ) -> list[MessageResponse]:
     """List this user's mail from every active mailbox. X-Total-Count ignores limit and offset."""
-    visible = _visible_message_filter(user.id)
+    visible = _visible_message_filter(user.id, folder)
     total = session.scalar(select(func.count(Message.id)).where(*visible))
     response.headers["X-Total-Count"] = str(total or 0)
     rows = session.exec(
-        select(Message, ConnectedAccount.provider, ReplyDraft.body)
+        select(Message, ConnectedAccount.provider, ConnectedAccount.email, ReplyDraft.body)
         .join(ConnectedAccount, ConnectedAccount.id == Message.connected_account_id)
         .outerjoin(ReplyDraft, ReplyDraft.message_id == Message.id)
         .options(defer(Message.body_html))
@@ -359,10 +368,10 @@ def list_messages(
         .offset(offset)
         .limit(limit)
     ).all()
-    suggestions = suggested_forms_for_messages(session, [row.id for row, _, _ in rows])
+    suggestions = suggested_forms_for_messages(session, [row.id for row, _, _, _ in rows])
     return [
-        _message_response(row, provider, suggestions.get(row.id), draft_text=draft_text)
-        for row, provider, draft_text in rows
+        _message_response(row, provider, email, suggestions.get(row.id), draft_text=draft_text)
+        for row, provider, email, draft_text in rows
     ]
 
 
@@ -437,7 +446,7 @@ def _detail_response(
 ) -> MessageDetailResponse:
     suggested = suggested_forms_for_messages(session, [row.id]).get(row.id)
     draft = _load_draft(session, row.id)
-    item = _message_response(row, account.provider, suggested, draft_text=draft.body if draft else None)
+    item = _message_response(row, account.provider, account.email, suggested, draft_text=draft.body if draft else None)
     draft_body = _draft_response(session, draft) if draft is not None else None
     everyone = reply_all(row, account)
     reply_all_recipients = (
@@ -455,8 +464,6 @@ def _detail_response(
         reply_to=_string_list(row.reply_to),
         reply_all_recipients=reply_all_recipients,
         can_edit_recipients=can_edit,
-        account_id=account.id,
-        account_email=account.email,
         pending_send_attempt_id=pending_send_attempt_id(session, row.id) if row.approved_at is None else None,
     )
 
@@ -1116,11 +1123,79 @@ class ReadStateInput(BaseModel):
     is_read: StrictBool
 
 
+class MailActionBatch(BaseModel):
+    message_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+    @field_validator("message_ids")
+    @classmethod
+    def _unique(cls, ids: list[UUID]) -> list[UUID]:
+        if len(set(ids)) != len(ids):
+            raise ValueError("Choose different messages.")
+        return ids
+
+
+class ReadStateBatch(MailActionBatch, ReadStateInput):
+    pass
+
+
+class FolderBatch(MailActionBatch):
+    folder: MailFolder
+    expected_folder: MailFolder | None = None
+
+
+class MailActionFailure(BaseModel):
+    id: UUID
+    detail: str
+
+
+class ReadStateUpdate(BaseModel):
+    id: UUID
+    is_read: bool
+
+
+class FolderUpdate(BaseModel):
+    id: UUID
+    folder: MailFolder
+
+
+class ReadStateActionResult(BaseModel):
+    updated: list[ReadStateUpdate]
+    failed: list[MailActionFailure]
+
+
+class FolderActionResult(BaseModel):
+    updated: list[FolderUpdate]
+    failed: list[MailActionFailure]
+
+
+def _apply_mail_batch(
+    session: Session, user: User, ids: list[UUID], change: bool | MoveAction,
+    expected_folder: MailFolder | None = None,
+) -> tuple[list[UUID], list[MailActionFailure]]:
+    # A large batch should still return acknowledged partial results when the provider is slow.
+    until = monotonic() + 30
+    updated = []
+    failed = []
+    for message_id in ids:
+        if monotonic() >= until:
+            failed.append(MailActionFailure(id=message_id, detail="The mailbox was slow. Try this email again."))
+            continue
+        try:
+            _apply_mail_change(session, user, message_id, change, expected_folder)
+        except HTTPException as exc:
+            session.rollback()
+            failed.append(MailActionFailure(id=message_id, detail=str(exc.detail)))
+        else:
+            updated.append(message_id)
+    return updated, failed
+
+
 def _apply_mail_change(
     session: Session,
     user: User,
     message_id: UUID,
     change: bool | MoveAction,
+    expected_folder: MailFolder | None = None,
 ) -> None:
     row, _ = _visible_message(session, user, message_id)
     user_id = user.id
@@ -1157,30 +1232,43 @@ def _apply_mail_change(
             raise HTTPException(404, "Message not found.")
 
     row = session.get(Message, message_id, populate_existing=True, with_for_update=True)
-    if row is None or row.inbox_removed_at is not None:
-        raise HTTPException(404, "Inbox message not found.")
+    if row is None or (row.inbox_removed_at is not None and row.mail_folder is None):
+        raise HTTPException(404, "Message folder is unknown. Sync the mailbox and try again.")
+
+    current = row.mail_folder or "inbox"
+    destination = DESTINATION[change] if not isinstance(change, bool) else None
+    if expected_folder is not None and current != expected_folder:
+        raise HTTPException(409, "That email moved again. Refresh to see its current folder.")
+    if destination == current:
+        return
 
     token = account.access_token
     if not token or not scope_granted(account.scopes, scope):
         raise HTTPException(409, _RECONNECT_FOR_ACTIONS)
 
     try:
-        write_provider_message(account.provider, token, row.graph_id, change)
+        provider_id = write_provider_message(account.provider, token, row.graph_id, change, current)
     except HTTPError as exc:
         exc.close()
         if exc.code in {401, 403}:
             raise HTTPException(409, _RECONNECT_FOR_ACTIONS) from None
         if exc.code == 404:
             raise HTTPException(404, "Message no longer available.") from None
-        raise HTTPException(502, "The provider could not update this message.") from None
+        raise HTTPException(502, "The provider could not confirm this change. Sync the mailbox before retrying.") from None
     except OSError:
-        raise HTTPException(502, "The provider could not update this message.") from None
+        raise HTTPException(502, "The provider could not confirm this change. Sync the mailbox before retrying.") from None
 
     now = utcnow()
     if isinstance(change, bool):
         row.is_read = change
     else:
-        row.inbox_removed_at = now
+        row.mail_folder = destination
+        row.inbox_removed_at = None if destination == "inbox" else now
+        row.folder_checked_at = now
+        if provider_id and provider_id != row.graph_id:
+            if current == "inbox":
+                row.previous_provider_id = row.graph_id
+            row.graph_id = provider_id
     row.updated_at = now
 
     # A worker may already have fetched the pre-action version of the inbox.
@@ -1193,6 +1281,33 @@ def _apply_mail_change(
     session.add(row)
     session.add(account)
     session.commit()
+
+
+@router.patch("/messages/read-state")
+def set_messages_read_state(
+    body: ReadStateBatch,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> ReadStateActionResult:
+    updated, failed = _apply_mail_batch(session, user, body.message_ids, body.is_read)
+    return ReadStateActionResult(
+        updated=[ReadStateUpdate(id=message_id, is_read=body.is_read) for message_id in updated],
+        failed=failed,
+    )
+
+
+@router.patch("/messages/folder")
+def move_messages(
+    body: FolderBatch,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> FolderActionResult:
+    action: MoveAction = {"archive": "archive", "deleted": "trash", "inbox": "restore"}[body.folder]
+    updated, failed = _apply_mail_batch(session, user, body.message_ids, action, body.expected_folder)
+    return FolderActionResult(
+        updated=[FolderUpdate(id=message_id, folder=body.folder) for message_id in updated],
+        failed=failed,
+    )
 
 
 @router.patch("/messages/{message_id}/read-state", status_code=204)
