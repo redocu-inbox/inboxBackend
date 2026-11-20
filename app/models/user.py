@@ -17,6 +17,7 @@ class User(SQLModel, table=True):
     display_name: str | None = Field(default=None, max_length=256)
     # None means the account cannot log in with a password.
     hashed_password: str | None = Field(default=None, max_length=255, repr=False)
+    stripe_customer_id: str | None = Field(default=None, max_length=255, unique=True, repr=False)
     # Legacy JWTs have no jti. Logout of one of those rejects tokens whose iat
     # is at or before this instant. JWTs that carry a jti ignore this column.
     auth_valid_after: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))

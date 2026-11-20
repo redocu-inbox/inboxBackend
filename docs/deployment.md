@@ -72,7 +72,7 @@ Inside this compose file both listen assumptions use port 8000 on the API contai
 
 `rediss://` is the TLS Redis scheme. ARQ's `RedisSettings.from_dsn` sets TLS when it sees that scheme. `redis://` is plain TCP, which is only appropriate on a private network. This repository does not open either URL during tests.
 
-A Neon-style URL is a direct host plus TLS, with the driver name changed:
+Use the Postgres provider's direct host with TLS and the SQLAlchemy driver scheme:
 
 ```text
 postgresql+psycopg://USER:PASSWORD@DIRECT_HOST/DB?sslmode=require
@@ -149,6 +149,99 @@ alembic upgrade head
 
 `alembic downgrade b7d3e9a41c20` moves from head to the previous revision. Read `alembic history` before you type it.
 
+## Verify the 30-day deletion window
+
+Redocu's backend runs on Render and its frontend runs on Cloudflare Workers. Record the production settings and capture date before confirming the window. Include every copy that can contain data covered by the commitment.
+
+- **Render backend.** Capture the production workspace plan, the API and worker storage configuration, and any workspace log stream or service override. If PDFs and attachments use a persistent disk, check that the storage path is under its mount. Render publishes 7 days for Hobby service logs, 14 for Pro, and 30 for Scale and Enterprise. Persistent-disk snapshots are available for 7 days after creation. Check the retention of each external log destination separately. [Service logs](https://render.com/docs/logging#retention-period) · [Disk snapshots](https://render.com/docs/disks#disk-snapshots) · [Log streams](https://render.com/docs/log-streams)
+- **Inbox database.** Identify the PostgreSQL provider and resource from the backend's production configuration. Record the provider and resource name and keep the connection string private. Capture the actual recovery window and inventory backups, restored instances, and copies for previews or testing. For managed Render Postgres, use the database's **Recovery** page. [Render Postgres recovery](https://render.com/docs/postgresql-backups)
+- **Cloudflare frontend.** The `ai-inbox` Worker's repository configuration enables observability. Check the deployed Worker's **Observability** settings and any OpenTelemetry exports, Logpush jobs, or Tail Workers, including destination retention. Track D1 recovery and exports for the production and preview waitlist databases separately from the inbox database. [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) · [D1 recovery](https://developers.cloudflare.com/d1/reference/time-travel/)
+- **Exports and other copies.** Record where database exports, copied disks, and log exports are stored and how long each destination keeps them. Verify lifecycle settings at the destination. Check which data is present in any additional log types covered by the commitment.
+
+### Reapply account deletions after a restore
+
+Keep a current, access-controlled copy of the deletion records outside the database and disk being restored. Verify that it includes every accepted deletion through the recovery cutover. A backup taken before a deletion can contain the account and lack its deletion record. A disk snapshot can also predate the database restore point. Keep the restored database and storage isolated until replay and verification finish.
+
+With the Stripe cleanup migration applied, export the latest records from the authoritative database. This file contains internal account IDs and any Stripe customer IDs still needed for cleanup. Store it in the restricted recovery location. Record the source and export time with the file.
+
+```bash
+: "${CURRENT_PSQL_URL:?Set the authoritative database URL}"
+umask 077
+psql "$CURRENT_PSQL_URL" -X -v ON_ERROR_STOP=1 \
+  -c '\copy (SELECT user_id, requested_at, stripe_customer_id, stripe_deleted_at FROM account_deletions) TO STDOUT WITH CSV HEADER' \
+  > "account-deletions.csv"
+```
+
+Migrate the isolated restored database to the same schema. Run this in `psql` against that database with `ON_ERROR_STOP` enabled. Use the secured export path and verify the `COPY` row count against the authoritative ledger.
+
+```sql
+BEGIN;
+CREATE TEMP TABLE deletion_replay (
+    user_id uuid PRIMARY KEY,
+    requested_at timestamptz NOT NULL,
+    stripe_customer_id varchar(255),
+    stripe_deleted_at timestamptz
+) ON COMMIT DROP;
+\copy deletion_replay FROM 'account-deletions.csv' WITH CSV HEADER
+
+INSERT INTO account_deletions AS saved (
+    user_id, requested_at, stripe_customer_id, stripe_deleted_at
+)
+SELECT user_id, requested_at, stripe_customer_id, stripe_deleted_at
+FROM deletion_replay
+ON CONFLICT (user_id) DO UPDATE SET
+    requested_at = LEAST(saved.requested_at, EXCLUDED.requested_at),
+    local_purged_at = NULL,
+    stripe_customer_id = EXCLUDED.stripe_customer_id,
+    stripe_deleted_at = EXCLUDED.stripe_deleted_at;
+COMMIT;
+```
+
+Replay local cleanup with the database URL and storage path of the isolated restore. Resetting `local_purged_at` makes the worker sweep restored files even when the restored database already had a completed deletion. The one-shot command runs local cleanup and verifies the database and the two file directories for every deletion record. A nonzero exit keeps the restore out of service until cleanup can be rerun successfully.
+
+```bash
+: "${RESTORED_DATABASE_URL:?Set the isolated restore database URL}"
+: "${RESTORED_STORAGE_PATH:?Set the isolated restore storage path}"
+DATABASE_URL="$RESTORED_DATABASE_URL" STORAGE_BACKEND=local \
+  STORAGE_LOCAL_PATH="$RESTORED_STORAGE_PATH" STRIPE_SECRET_KEY= python - <<'PY'
+from pathlib import Path
+
+from sqlalchemy import func
+from sqlmodel import Session, select
+
+from app.config import get_settings
+from app.db import engine
+from app.models.account_deletion import AccountDeletion
+from app.models.user import User
+from app.services.account_deletion import purge_pending_accounts
+
+purge_pending_accounts()
+with Session(engine) as session:
+    pending = session.scalar(
+        select(func.count()).select_from(AccountDeletion).where(AccountDeletion.local_purged_at.is_(None))
+    )
+    restored_users = session.scalar(
+        select(func.count()).select_from(User).join(AccountDeletion, AccountDeletion.user_id == User.id)
+    )
+    deleted_ids = session.exec(select(AccountDeletion.user_id)).all()
+
+root = Path(get_settings().storage_local_path)
+restored_paths = 0
+for user_id in deleted_ids:
+    for directory in ("forms", "attachments"):
+        try:
+            (root / directory / str(user_id)).lstat()
+        except FileNotFoundError:
+            continue
+        restored_paths += 1
+if pending or restored_users or restored_paths:
+    raise SystemExit("Account deletion replay incomplete; keep the restore isolated.")
+print(f"Verified account deletion replay for {len(deleted_ids)} records.")
+PY
+```
+
+The November 19, 2026 local drill used a PostgreSQL dump and a file copy with two synthetic accounts. Replay removed the deleted account and its files from both a database-and-file restore and a file-only restore. The other account and its files passed verification in both cases.
+
 ## Entra
 
 Register a Web platform redirect, not a SPA redirect. The URI is exactly:
@@ -189,4 +282,4 @@ Sync pulls DMs, group DMs, and channel messages that @-mention the connected use
 
 ## What is still blocked
 
-No Render, Neon, Redis, or Entra resource was created from here. No container image was built in this environment (Docker is not installed). Pytest covers the production setting rules, Redis URL parsing, the migration lock, and the process supervisor. It does not open a TLS connection to Neon or Redis, and it does not prove a free web service stays inside a vendor's quota.
+Pytest covers the production setting rules, Redis URL parsing, the migration lock, and the process supervisor. Hosted TLS connectivity, deployed retention settings, and service quotas each require verification in the deployment environment.

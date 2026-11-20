@@ -206,7 +206,7 @@ def request_account_deletion(
     deletion = session.get(AccountDeletion, user.id)
     if deletion is not None:
         return AccountDeletionResponse(requested_at=deletion.requested_at)
-    deletion = AccountDeletion(user_id=user.id)
+    deletion = AccountDeletion(user_id=user.id, stripe_customer_id=user.stripe_customer_id)
     response = AccountDeletionResponse(requested_at=deletion.requested_at)
     session.add(deletion)
     session.commit()
