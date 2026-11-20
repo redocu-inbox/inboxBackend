@@ -101,6 +101,8 @@ def test_delta_link_is_stored_and_reused(client, register_user, monkeypatch):
 
 
 def test_removed_item_is_deleted_and_page_21_is_not_requested(client, register_user, monkeypatch, caplog):
+    from app.services.inbox.folder_sync import FolderState
+
     headers = register_user("removed@example.com")
     user_id = _user_id(client, headers)
     account_id = _outlook(user_id)
@@ -127,6 +129,10 @@ def test_removed_item_is_deleted_and_page_21_is_not_requested(client, register_u
             ],
             "@odata.deltaLink": _STORED,
         },
+    )
+    monkeypatch.setattr(
+        "app.worker.mail_tasks.read_provider_folders",
+        lambda provider, token, ids: {"gone": FolderState("gone", None, missing=True)},
     )
     _run(account_id)
     with Session(engine) as session:

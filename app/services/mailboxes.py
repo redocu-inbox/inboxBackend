@@ -1,4 +1,4 @@
-"""One active mailbox per app user, and the sync lifecycle for it.
+"""Mailbox selection, disconnects, and the per-mailbox sync lifecycle.
 
 Historical rows are kept. Disconnect and the one-mailbox migration set
 `disconnected_at` and, on an explicit disconnect, clear tokens. They do not
@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlmodel import Session, select
 
 from app.models.connected_account import ConnectedAccount
-from app.models.user import utcnow
+from app.models.user import User, utcnow
 from app.services.account_deletion import lock_account_write
 
 # A crashed worker must not pin the mailbox in pending/running forever.
@@ -129,15 +129,28 @@ def lock_active_mailbox(
     ).first()
 
 
-def lock_active_mailboxes(session: Session, user_id: UUID) -> list[ConnectedAccount]:
-    """Lock every active mailbox for this user. Outlook and Gmail can both be held."""
+def lock_mailbox_owner(session: Session, user_id: UUID) -> User | None:
+    """Serialize OAuth connections with provider-only mailbox selection."""
+    if not lock_account_write(session, user_id):
+        return None
+    return session.exec(
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+    ).first()
+
+
+def lock_active_mailboxes(
+    session: Session, user_id: UUID, *, provider: str | None = None,
+) -> list[ConnectedAccount]:
+    """Lock all matching active mailboxes in a consistent order."""
+    query = select(ConnectedAccount).where(
+        ConnectedAccount.user_id == user_id,
+        ConnectedAccount.disconnected_at.is_(None),
+    )
+    if provider is not None:
+        query = query.where(ConnectedAccount.provider == provider)
     return list(
         session.exec(
-            select(ConnectedAccount)
-            .where(
-                ConnectedAccount.user_id == user_id,
-                ConnectedAccount.disconnected_at.is_(None),
-            )
+            query
             .order_by(ConnectedAccount.id)
             .with_for_update()
             .execution_options(populate_existing=True)

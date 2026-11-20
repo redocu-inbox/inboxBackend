@@ -1,4 +1,4 @@
-"""One mailbox, OAuth redirects, Graph text, sync lifecycle, disconnect, and logout."""
+"""OAuth redirects, mailbox isolation, Graph text, sync lifecycle, and logout."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -18,8 +18,9 @@ from app.models.connected_account import ConnectedAccount
 from app.models.form_template import FormTemplate
 from app.models.message import Message
 from app.models.user import User
+from app.services.google.http import GoogleMailboxIdentity
 from app.services.google.messages import GmailRequestError, gmail_message_fields
-from app.services.google.oauth import GoogleTokenUnavailable
+from app.services.google.oauth import GMAIL_MODIFY_SCOPE, GoogleTokenUnavailable
 from app.services.graph.tokens import TokenRefreshError
 from app.services.graph.connect import ConnectStatus, connect_microsoft_mailbox
 from app.services.graph.html_text import to_plain_text
@@ -106,7 +107,7 @@ def test_frontend_url_rejects_open_redirect_and_header_injection():
     Settings(_env_file=None, frontend_url="http://localhost:5173/")
 
 
-def test_second_microsoft_account_is_rejected_without_touching_tokens(client, register_user, monkeypatch):
+def test_second_microsoft_account_is_connected_without_touching_the_first(client, register_user, monkeypatch):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
     account_id = _add_account(user_id, email="first@outlook.com", oid="oid-first", access_token="keep-me")
@@ -127,15 +128,123 @@ def test_second_microsoft_account_is_rejected_without_touching_tokens(client, re
         follow_redirects=False,
     )
     assert response.status_code == 302
-    assert parse_qs(urlsplit(response.headers["location"]).query)["error"] == ["mailbox_conflict"]
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    assert query["connected"] == ["1"]
+    (second_id,) = query["mailbox_id"]
+    assert second_id != account_id
     assert "new-access" not in response.headers["location"]
     assert "new-refresh" not in response.headers["location"]
-    app.state.arq.enqueue_job.assert_not_awaited()
+    app.state.arq.enqueue_job.assert_awaited_once_with("sync_mailbox_delta", second_id, 1)
     with Session(engine) as session:
         account = session.get(ConnectedAccount, UUID(account_id))
         assert account.email == "first@outlook.com"
         assert account.access_token == "keep-me"
         assert account.disconnected_at is None
+        assert session.get(ConnectedAccount, UUID(second_id)).access_token == "new-access"
+
+
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+def test_same_provider_connect_reconnect_sync_and_disconnect_are_isolated(client, register_user, monkeypatch, provider):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    revoked = []
+    monkeypatch.setattr("app.api.auth.revoke_google_token", revoked.append)
+    monkeypatch.setattr("app.api.mailboxes.revoke_google_token", revoked.append)
+    monkeypatch.setattr("app.worker.mail_tasks._ensure_graph_subscription", lambda *_: None)
+
+    def callback(identity, token, target=None, *, gmail_access=True):
+        email = f"{identity}@example.com"
+        state = user_id if target is None else f"{provider}:{user_id}:{target}"
+        _patch_redis(monkeypatch, state.encode())
+        if provider == "google":
+            monkeypatch.setattr("app.api.auth.exchange_authorization_code", lambda _: {
+                "access_token": token, "refresh_token": f"refresh-{token}",
+                "expires_in": 3600, "scope": f"openid email {GMAIL_MODIFY_SCOPE}" if gmail_access else "openid email",
+            })
+            monkeypatch.setattr("app.api.auth.fetch_mailbox_identity", lambda _: GoogleMailboxIdentity(identity, email))
+        else:
+            monkeypatch.setattr("app.api.auth.build_msal_app", lambda: _Msal({
+                "access_token": token, "refresh_token": f"refresh-{token}", "expires_in": 3600,
+                "scope": "Mail.ReadWrite Mail.Send", "id_token_claims": {"oid": identity, "preferred_username": email},
+            }))
+        response = client.get(f"/auth/{provider}/callback", params={"code": "abc", "state": "s" * 43}, follow_redirects=False)
+        assert response.status_code == 302
+        return parse_qs(urlsplit(response.headers["location"]).query)
+
+    (first,) = callback("first", "access-first")["mailbox_id"]
+    (second,) = callback("second", "access-second")["mailbox_id"]
+    assert second != first
+    assert callback("first", "wrong", second)["error"] == ["mailbox_mismatch"]
+    if provider == "google":
+        assert callback("first", "incomplete", second, gmail_access=False)["error"] == ["google_denied"]
+        assert revoked == []
+    assert callback("second", "renewed-second", second)["mailbox_id"] == [second]
+    assert [call.args[1:] for call in app.state.arq.enqueue_job.await_args_list] == [(first, 1), (second, 1), (second, 2)]
+    profile = client.get("/users/me", headers=headers).json()
+    assert [(row["id"], row["email"]) for row in profile["mailboxes"]] == [
+        (first, "first@example.com"), (second, "second@example.com"),
+    ]
+
+    legacy = client.post(f"/auth/{provider}/disconnect", headers=headers)
+    assert (legacy.status_code, legacy.json()) == (409, {"detail": "choose_mailbox"})
+    assert revoked == []
+
+    disconnect_in_flight = False
+    tokens = []
+
+    def fetch(token):
+        tokens.append(token)
+        message_id = "same-provider-id"
+        if disconnect_in_flight and token == "access-first":
+            assert client.post(f"/mailboxes/{first}/disconnect", headers=headers).status_code == 200
+            message_id = "would-resurrect"
+        if provider == "google":
+            return [_gmail_item(message_id=message_id, unread=token == "access-first")]
+        return {"value": [{**GRAPH_ITEM, "id": message_id, "isRead": token != "access-first"}]}
+
+    monkeypatch.setattr("app.worker.mail_tasks.collect_gmail_messages", fetch)
+    monkeypatch.setattr("app.worker.mail_tasks._graph_get", lambda _url, token: fetch(token))
+    asyncio.run(sync_mailbox_delta({}, first, 1))
+    asyncio.run(sync_mailbox_delta({}, second, 2))
+    saved = {row["account_id"]: row for row in client.get("/messages", headers=headers).json()}
+    assert set(saved) == {first, second}
+    assert saved[first]["is_read"] is False and saved[second]["is_read"] is True
+    assert tokens == ["access-first", "renewed-second"]
+
+    disconnect_in_flight = True
+    asyncio.run(sync_mailbox_delta({}, first, 1))
+    profile = client.get("/users/me", headers=headers).json()
+    (still_connected,) = profile["mailboxes"]
+    assert still_connected["id"] == second and still_connected["sync"]["status"] == "idle"
+    assert [row["id"] for row in client.get("/messages", headers=headers).json()] == [saved[second]["id"]]
+    assert revoked == (["refresh-access-first"] if provider == "google" else [])
+    with Session(engine) as session:
+        assert session.get(ConnectedAccount, UUID(first)).access_token is None
+        assert session.get(ConnectedAccount, UUID(second)).access_token == "renewed-second"
+        assert session.get(Message, UUID(saved[first]["id"])) is not None
+        assert session.scalar(select(Message.id).where(Message.graph_id == "would-resurrect")) is None
+
+
+def test_manual_sync_attempts_the_next_mailbox_when_one_enqueue_fails(client, register_user):
+    headers = register_user("ana@example.com")
+    user_id = _user_id(client, headers)
+    ids = sorted([
+        _add_account(user_id, provider="google", email="first@gmail.com"),
+        _add_account(user_id, provider="google", email="second@gmail.com"),
+    ])
+
+    async def enqueue(_job, account_id, _generation):
+        if account_id == ids[0]:
+            raise ConnectionError("queue failed for the first mailbox")
+
+    app.state.arq.enqueue_job.side_effect = enqueue
+    response = client.post("/messages/sync", headers=headers)
+    assert response.status_code == 202
+    assert response.json() == {"enqueued": True, "sync_status": "failed"}
+    assert [call.args[1] for call in app.state.arq.enqueue_job.await_args_list] == ids
+    syncs = {row["id"]: row["sync"] for row in client.get("/users/me", headers=headers).json()["mailboxes"]}
+    assert syncs[ids[0]]["error_code"] == "queue_unavailable"
+    assert syncs[ids[1]]["status"] == "pending"
 
 
 def test_reconnect_same_oid_updates_the_one_row(client, register_user, monkeypatch):
@@ -840,7 +949,8 @@ def test_logout_revokes_only_that_jti_and_legacy_tokens_follow_iat(client, regis
     assert client.get("/users/me", headers=bob).status_code == 200
 
 
-def test_concurrent_connect_leaves_one_active_mailbox():
+@pytest.mark.parametrize("same_identity", [False, True])
+def test_concurrent_connect_uses_provider_identity(same_identity):
     with Session(engine) as session:
         user = User(email=f"{uuid4()}@example.com", hashed_password="x")
         session.add(user)
@@ -871,14 +981,13 @@ def test_concurrent_connect_leaves_one_active_mailbox():
 
     threads = [
         threading.Thread(target=attempt, args=("oid-a", "a@outlook.com")),
-        threading.Thread(target=attempt, args=("oid-b", "b@outlook.com")),
+        threading.Thread(target=attempt, args=("oid-a" if same_identity else "oid-b", "b@outlook.com")),
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    assert outcomes.count(ConnectStatus.connected) == 1
-    assert ConnectStatus.mailbox_conflict in outcomes or ConnectStatus.not_saved in outcomes
+    assert outcomes == [ConnectStatus.connected, ConnectStatus.connected]
     with Session(engine) as session:
         active = session.exec(
             select(ConnectedAccount).where(
@@ -886,8 +995,9 @@ def test_concurrent_connect_leaves_one_active_mailbox():
                 ConnectedAccount.disconnected_at.is_(None),
             )
         ).all()
-        assert len(active) == 1
-        assert active[0].access_token in {"access-oid-a", "access-oid-b"}
+        expected = {"access-oid-a"} if same_identity else {"access-oid-a", "access-oid-b"}
+        assert len(active) == len(expected)
+        assert {row.access_token for row in active} == expected
 
 
 def test_extra_mailbox_migration_preserves_tokens_and_messages():

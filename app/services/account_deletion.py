@@ -1,7 +1,6 @@
 """Fence account activity and remove data for accepted deletion requests."""
 
 import logging
-from hashlib import blake2b
 from uuid import UUID
 
 from sqlalchemy import Connection, delete, text
@@ -18,8 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 def _lock_key(user_id: UUID) -> int:
-    digest = blake2b(user_id.bytes, digest_size=8, person=b"account-deletion").digest()
-    return int.from_bytes(digest, byteorder="big", signed=True)
+    # PostgreSQL's advisory lock takes a signed bigint. The low half of a v4
+    # account UUID supplies 62 random bits, and the UUID still scopes all writes.
+    return int.from_bytes(user_id.bytes[-8:], byteorder="big", signed=True)
 
 
 def account_is_deleting(session: Session, user_id: UUID) -> bool:

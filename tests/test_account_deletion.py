@@ -18,7 +18,7 @@ from app.models.password_reset import PasswordResetToken
 from app.models.reply_draft import ReplyDraft
 from app.models.staged_attachment import StagedAttachment
 from app.models.user import User, utcnow
-from app.services.account_deletion import purge_pending_accounts
+from app.services.account_deletion import lock_account_write, purge_pending_accounts
 from app.services.forms.filler import PdfFormFiller
 from app.worker.form_tasks import run_form_fill
 from app.worker.mail_tasks import sync_mailbox_delta
@@ -134,6 +134,20 @@ def test_deletion_can_retry_after_a_request_that_already_committed(client, regis
     with Session(engine) as session:
         assert session.get(AccountDeletion, user_id) is None
     assert delete_account(headers, "busy@example.com").status_code == 202
+
+
+def test_worker_write_lock_delays_deletion_for_its_account(client, register_user, delete_account):
+    headers = register_user("worker-busy@example.com")
+    other_headers = register_user("worker-unrelated@example.com")
+    user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
+
+    with Session(engine) as worker_session:
+        assert lock_account_write(worker_session, user_id)
+        assert delete_account(headers, "worker-busy@example.com").status_code == 409
+        assert delete_account(other_headers, "worker-unrelated@example.com").status_code == 202
+        worker_session.commit()
+
+    assert delete_account(headers, "worker-busy@example.com").status_code == 202
 
 
 def test_queued_mailbox_and_password_reset_work_skip_deleting_user(client, register_user, monkeypatch, delete_account):

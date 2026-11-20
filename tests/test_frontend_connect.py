@@ -24,7 +24,10 @@ LIST_KEYS = {
     "from_email",
     "received_at",
     "is_read",
+    "folder",
     "provider",
+    "account_id",
+    "account_email",
     "has_draft",
     "conversation_id",
     "priority_score",
@@ -57,8 +60,6 @@ DETAIL_KEYS = LIST_KEYS | {
     "reply_to",
     "reply_all_recipients",
     "can_edit_recipients",
-    "account_id",
-    "account_email",
     "pending_send_attempt_id",
 }
 
@@ -96,8 +97,8 @@ class _Msal:
     def __init__(self, result: dict | None = None):
         self.result = result or {}
 
-    def get_authorization_request_url(self, scopes, state, redirect_uri):
-        return f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state={state}"
+    def get_authorization_request_url(self, scopes, state, redirect_uri, prompt):
+        return f"https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state={state}&prompt={prompt}"
 
     def acquire_token_by_authorization_code(self, code, scopes, redirect_uri):
         return self.result
@@ -186,9 +187,17 @@ def test_microsoft_start_returns_an_authorization_url(client, register_user, mon
     body = response.json()
     assert set(body) == {"authorization_url"}
     assert body["authorization_url"].startswith("https://login.microsoftonline.com/")
+    assert _query(body["authorization_url"])["prompt"] == ["select_account"]
     assert token not in body["authorization_url"]
     assert store.saved is not None
     assert store.saved[2] == _user_id(client, headers)
+
+    user_id = _user_id(client, headers)
+    mailbox_id = _add_account(user_id)
+    reconnect = client.get("/auth/microsoft/start", headers=headers, params={"mailbox_id": mailbox_id})
+    assert reconnect.status_code == 200
+    assert store.saved[2] == f"microsoft:{user_id}:{mailbox_id}"
+    assert client.get("/auth/microsoft/start", headers=headers, params={"mailbox_id": str(uuid4())}).status_code == 404
 
 
 def test_google_start_returns_an_authorization_url(client, register_user, monkeypatch):
@@ -222,7 +231,7 @@ def test_google_start_returns_an_authorization_url(client, register_user, monkey
     assert query["response_type"] == ["code"]
     assert query["scope"] == ["openid email https://www.googleapis.com/auth/gmail.modify"]
     assert query["access_type"] == ["offline"]
-    assert query["prompt"] == ["consent"]
+    assert query["prompt"] == ["select_account consent"]
     assert "client_secret" not in query
     assert token not in body["authorization_url"]
     assert "google-client-secret" not in body["authorization_url"]
@@ -542,6 +551,7 @@ def test_message_list_contract_sort_and_total(client, register_user):
     assert item["from_name"] is None
     assert item["from_email"] is None
     assert item["is_read"] is None
+    assert item["folder"] == "inbox"
     assert item["conversation_id"] is None
     assert item["priority_score"] == 50
     assert item["priority_band"] is None
@@ -676,8 +686,9 @@ def test_callback_redirects_every_outcome(client, register_user, monkeypatch):
     base = get_settings().frontend_url.rstrip("/")
     assert location.startswith(f"{base}/inbox?")
     assert "email=ana%40outlook.com" in location
-    assert _query(location) == {"connected": ["1"], "email": ["ana@outlook.com"]}
-    assert client.get("/users/me", headers=headers).json()["mailbox"]["email"] == "ana@outlook.com"
+    mailbox = client.get("/users/me", headers=headers).json()["mailbox"]
+    assert _query(location) == {"connected": ["1"], "email": ["ana@outlook.com"], "mailbox_id": [mailbox["id"]]}
+    assert mailbox["email"] == "ana@outlook.com"
     with Session(engine) as session:
         account = session.exec(
             select(ConnectedAccount).where(ConnectedAccount.provider_account_id == "oid-ana")
@@ -809,8 +820,9 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
         lambda access_token: GoogleMailboxIdentity("sub-ana", "ana@gmail.com"),
     )
     both = _google_callback(client, f"code=abc&state={_OAUTH_STATE}")
-    assert _query(both.headers["location"]) == {"connected": ["1"], "email": ["ana@gmail.com"]}
     together = client.get("/users/me", headers=headers).json()
+    gmail = next(row for row in together["mailboxes"] if row["provider"] == "google")
+    assert _query(both.headers["location"]) == {"connected": ["1"], "email": ["ana@gmail.com"], "mailbox_id": [gmail["id"]]}
     assert together["mailbox"]["provider"] == "microsoft"
     assert together["mailbox"]["email"] == "ana@outlook.com"
     assert {item["provider"] for item in together["mailboxes"]} == {"google", "microsoft"}
@@ -849,10 +861,10 @@ def test_google_callback_redirects_every_outcome(client, register_user, monkeypa
     location = success.headers["location"]
     base = get_settings().frontend_url.rstrip("/")
     assert location.startswith(f"{base}/inbox?")
-    assert _query(location) == {"connected": ["1"], "email": ["ana@gmail.com"]}
     assert "google-access-token" not in location
     assert "google-refresh-token" not in location
     me = client.get("/users/me", headers=headers).json()
+    assert _query(location) == {"connected": ["1"], "email": ["ana@gmail.com"], "mailbox_id": [me["mailbox"]["id"]]}
     assert "google-refresh-token" not in client.get("/users/me", headers=headers).text
     with Session(engine) as session:
         account = session.exec(

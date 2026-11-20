@@ -18,7 +18,7 @@ You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or a
 | F | Frontend connection: `authorization_url` from Microsoft start, callback redirect to `FRONTEND_URL`, `mailbox` on `GET /users/me`, `POST /messages/sync`, and the frozen message list and detail contract |
 | F2 | One active Outlook mailbox per user, callback failures always redirect, Graph sender/read/plain-text body, sync status, disconnect, and server-side logout |
 | 6 | Rule classification, priority scoring, and a correction route for each synced Outlook and Gmail message. Contract: [docs/phase-6-priority-scoring.md](docs/phase-6-priority-scoring.md) |
-| Gmail | Gmail connect (`/auth/google/start`, callback, disconnect). One Outlook mailbox and one Gmail mailbox can both stay connected, and `GET /messages` lists both. Sync reads the inbox. Sending is the later approve route |
+| Gmail | Gmail connect (`/auth/google/start`, callback, disconnect). Multiple Gmail and Outlook mailboxes can stay connected and each syncs its own inbox |
 | 7 | Local reply drafts, including an unsent Outlook push. A Gmail message is not pushed |
 | 8 | Form library: an upload stores AcroForm fields in `schema_json`. Templates can be listed, edited, and deleted |
 | 9A | Fill an AcroForm from known values. The owner downloads the PDF |
@@ -138,7 +138,7 @@ Every row that belongs to a person hangs off `users.id`. Deleting a user cascade
 | Table                | Holds |
 | -------------------- | ----- |
 | `users`              | Email, optional display name, Argon2 password hash |
-| `connected_accounts` | One active Outlook mailbox, one active Gmail mailbox, and one active Slack workspace: encrypted tokens, and Graph fields when the provider is Microsoft |
+| `connected_accounts` | Gmail and Outlook mailboxes and one active Slack workspace per user. Stores encrypted tokens and Outlook subscription fields |
 | `messages`           | A synced message or a local draft (`graph_id`, subject, preview, received time, thread id, recipients, priority score, band, reasons, and classification fields). Sync fills the score with the rule classifier and scorer |
 | `reply_drafts`       | One local reply per message: status, body, source, recipients, Outlook draft id, and error. Deleting the message or the user deletes the row |
 | `approvals`          | Each send attempt's saved text, recipients, optional form snapshot, provider reference, and outcome |
@@ -201,6 +201,8 @@ Connecting a mailbox writes the email, tenant id, scopes, and encrypted tokens. 
 | `POST /forms/jobs/{job_id}/refill` | yes | Replace `extracted_values`, set `pending`, and enqueue `run_form_fill` |
 | `POST /messages/new` | yes | Save a new email or a forward. Does not contact the mailbox |
 | `GET /messages/{id}/conversation` | yes | Plain-text history for this mailbox's copy of the thread. Local drafts are omitted |
+| `PATCH /messages/read-state` | yes | Change `is_read` in Gmail or Outlook and acknowledge each selected message |
+| `PATCH /messages/folder` | yes | Move selected mail to Inbox, Archive, or Deleted and acknowledge each message |
 | `POST /messages/{id}/approve` | yes | Submit a ready Outlook or Gmail draft once. Set `approved_at` when the send is confirmed. A Slack row is `409` |
 | `POST /messages/{id}/draft/attachments` | yes | Attach a completed PDF to an unsent Outlook draft. Does not send |
 | `POST /attachments` | yes | Stage one file from the computer. Saving a draft is what binds it |
@@ -325,7 +327,7 @@ Emails are stored in lowercase, so `Ana@x.com` and `ana@x.com` are one account. 
 {"connected": true, "provider": "microsoft", "email": "ana@outlook.com"}
 ```
 
-`mailbox` is the active Outlook mailbox when one is connected, and otherwise the active Gmail mailbox. It stays on Outlook while both are connected, so a client that labels `mailbox` as Outlook and disconnects it does not clear Gmail. `mailboxes` lists every active mailbox. With both providers connected it contains one `google` entry and one `microsoft` entry, and each entry includes that mailbox's own `sync`. Neither object includes tokens, scopes, or the delta link. The top-level `sync` is `null` when nothing is connected. Otherwise it is the busier mailbox: `failed`, then `running`, then `pending`, then `idle`. `last_successful_at` on that top-level object is the latest success across them.
+`mailboxes` lists all active accounts with their own IDs and sync state, sorted by provider and email. Several Gmail or Outlook accounts can be active at once. The legacy `mailbox` field prefers the first Outlook entry, then the first Gmail entry. Use the array and mailbox IDs for actions. The top-level `sync` summarizes account status and reports the latest success across them.
 
 ```json
 {"status": "idle", "last_successful_at": null, "error_code": null}
@@ -400,7 +402,7 @@ The start route stores `oauth_state:<state>` in Redis for 600 seconds, mapped to
 Success:
 
 ```text
-{FRONTEND_URL}/inbox?connected=1&email=ana%40outlook.com
+{FRONTEND_URL}/inbox?connected=1&email=ana%40outlook.com&mailbox_id=<uuid>
 ```
 
 Failure uses `connected=0` and one of these `error` values. The provider's own text is logged on the server and is not put in the URL.
@@ -411,15 +413,17 @@ Failure uses `connected=0` and one of these `error` values. The provider's own t
 | `invalid_state` | `code` or `state` is missing, the state is not 32–128 url-safe characters, Redis could not be read, or the state is expired, already used, or not a user id |
 | `token_exchange` | The code exchange failed, the token response is incomplete, or an unexpected error happened before the mailbox row was committed. General failure for the SPA |
 | `mailbox_taken` | That Microsoft `oid` is already stored for a different app user, including a disconnected row. This user's mailbox is not changed |
-| `mailbox_conflict` | This user already has a different active mailbox for this same provider. Disconnect that one first. The other provider is left connected |
+| `mailbox_mismatch` | The provider account selected during a reconnect differs from the requested mailbox |
 
 The redirect target is only `FRONTEND_URL` from the server environment. The request cannot choose a different host. Provider text, the authorization code, and tokens are not placed in the URL. If Redis is down, start returns `503 {"detail":"Outlook connect is temporarily unavailable."}` and the callback returns `invalid_state` without calling Microsoft.
 
-The callback finds `connected_accounts` by provider `microsoft` and that `oid`. The same user connecting that same mailbox again, including after disconnect, updates the email, tenant id (`tid`), and tokens and clears `disconnected_at`. A different Outlook account while one Outlook mailbox is active returns `mailbox_conflict` and does not write. A connected Gmail mailbox does not block Outlook, and Outlook does not block Gmail. The user row is locked for the duration of the decision, and the unique indexes `uq_connected_accounts_one_active_microsoft` and `uq_connected_accounts_one_active_google`, plus `(provider, provider_account_id)`, reject a second active account for the same provider. A lost race rolls back and redirects with `mailbox_conflict` or `mailbox_taken`. It does not return `500`.
+The Outlook and Gmail start routes prompt for account selection. For reconnecting a specific account, include its UUID as `?mailbox_id=...`. The callback matches the provider identity to that mailbox before saving tokens. A new provider identity adds another mailbox. Reconnecting the same identity updates the existing row and retains its UUID. The `(provider, provider_account_id)` uniqueness rule protects mailbox ownership across Redocu users.
 
 On success the new tokens are committed before the worker is enqueued, because Microsoft may have rotated the refresh token and rolling that back would destroy the only working credential. The row is `sync.status` `pending`. If the enqueue fails, the tokens stay, `sync.status` becomes `failed`, `error_code` is `queue_unavailable`, `last_successful_at` is unchanged, and the browser still lands on `connected=1`.
 
 `POST /auth/microsoft/disconnect` with the bearer token clears `access_token`, `refresh_token`, `scopes`, `token_expires_at`, and `delta_link`, sets `disconnected_at`, and bumps `sync_generation` so a queued or running job cannot write tokens or messages back. Messages and form rows stay. The list and detail routes hide that mail until the same Microsoft account connects again. Another user's mailbox is not touched. No active mailbox is `404 {"detail":"No mailbox is connected."}`. Success is `200 {"disconnected": true}`. This does not call Microsoft to revoke the grant. The stored refresh token is gone, so this API cannot refresh access. The user can still remove the app in their Microsoft account if they want the grant itself revoked. One Graph call already in flight can finish at Microsoft, and its result is discarded.
+
+Use `POST /mailboxes/{id}/disconnect` to select a mailbox. The legacy Gmail and Outlook routes return `409 {"detail":"choose_mailbox"}` whenever multiple active accounts of that provider exist.
 
 `GET /users/me` then shows the active mailboxes. `POST /messages/sync` locks each one. When a mailbox has no job in flight it bumps that generation, sets `pending`, and enqueues `sync_mailbox_delta` with the account id and that generation. Outlook and Gmail are both queued. A mailbox that is already pending or running is left alone:
 
@@ -433,7 +437,7 @@ On success the new tokens are committed before the worker is enqueued, because M
 {"enqueued": false, "sync_status": "running"}
 ```
 
-`pending` or `running` older than 10 minutes is treated as abandoned and a new generation is queued. The old job then sees the generation mismatch and does not write. If Redis rejects the enqueue, the response is `503 {"detail":"Mailbox sync could not be queued."}` and `sync.status` is `failed` with `queue_unavailable`. With no mailbox the status is `404` and the detail is `No mailbox is connected.`
+`pending` or `running` older than 10 minutes is treated as abandoned. A new generation fences out the previous job. An enqueue failure marks that mailbox `failed` with `queue_unavailable`. Other mailboxes are still attempted. The endpoint returns `503` if nothing can be queued and no sync is in progress. With no mailbox it returns `404`.
 
 ```bash
 curl -X POST http://localhost:8000/messages/sync \
@@ -539,19 +543,19 @@ Create an OAuth client in Google Cloud:
 | `TOKEN_ENCRYPTION_KEY` | Fernet key for the token columns. The same key used for Microsoft |
 | `FRONTEND_URL` | Where the callback sends the browser. Production `https://redocu.app` |
 
-The authorize URL requests `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.send`, with `access_type=offline` and `prompt=consent`, so Google returns a refresh token. `GET /auth/google/start` with the Bearer token returns `{"authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..."}`. The Bearer token is not copied into that URL. Missing client id or redirect URI, or Redis down, is `503 {"detail":"Gmail connect is temporarily unavailable."}`.
+The authorize URL requests `openid`, `email`, and `gmail.modify`, with `access_type=offline` and `prompt=select_account consent`. `GET /auth/google/start` with the Bearer token returns `{"authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..."}`. Missing client ID or redirect URI, or Redis downtime, returns `503`.
 
 The callback is `GET /auth/google/callback`. It deletes the one-time Redis state, exchanges the code at `https://oauth2.googleapis.com/token`, and reads `sub` and `email` from `https://www.googleapis.com/oauth2/v3/userinfo`. Tokens are encrypted on `connected_accounts` with `provider` `google`. `provider_account_id` is the OpenID `sub`. Success and failure use the same inbox redirect as Microsoft.
 
 | `error` | When |
 | ------- | ---- |
-| `google_denied` | Google sent an `error` query parameter (the user cancelled, or consent was denied), or the token's scopes do not include both `gmail.readonly` and `gmail.send`. The token is revoked and no mailbox is saved |
+| `google_denied` | Google reported an error or the grant lacks Gmail access. An incomplete grant is revoked only when its identity can be verified and has no active mailbox |
 | `invalid_state` | `code` or `state` is missing, the state is unusable, or Redis could not be read |
 | `token_exchange` | The code exchange failed, userinfo failed, the refresh token was missing, or an unexpected error happened before the row was committed |
 | `mailbox_taken` | That Google `sub` is already stored for a different app user |
-| `mailbox_conflict` | This user already has a different active Gmail mailbox. Disconnect it first. Outlook is left connected |
+| `mailbox_mismatch` | The Google account selected during reconnect differs from the requested mailbox |
 
-`POST /auth/google/disconnect` revokes the refresh token at `https://oauth2.googleapis.com/revoke`, then clears the local tokens and sets `disconnected_at`. Messages stay in the database and disappear from `GET /messages` until that same Google account connects again. Success is `200 {"disconnected": true}`. No active Gmail mailbox is `404 {"detail":"No mailbox is connected."}`. `POST /auth/microsoft/disconnect` does not clear a Gmail row. A revoke that Google refuses is logged as a status code only. The local tokens are still deleted.
+`POST /mailboxes/{id}/disconnect` clears the selected mailbox locally and asks Google to revoke its grant. Its messages stay stored and disappear from the inbox until that account connects again. With one active Gmail mailbox, the legacy `POST /auth/google/disconnect` does the same thing. With multiple active Gmail mailboxes it returns `409 choose_mailbox`.
 
 `GET /users/me` lists both providers in `mailboxes` when both are connected. `POST /messages/sync` enqueues `sync_mailbox_delta` for each active mailbox. The worker does not send the Google token to Microsoft.
 
@@ -565,7 +569,7 @@ Check a test user against `https://redocu.app` only after the Render service has
 6. `GET /messages` lists recent mail from every connected mailbox, newest first. Each item includes `provider` (`google` or `microsoft`). Open one and confirm `body_text` is plain text.
 7. Cancel consent once and confirm the inbox URL is `connected=0&error=google_denied`, with no Google error text in the query.
 8. Disconnect Gmail. Those messages leave the list. Outlook mail stays. Connecting the same Google account again shows the stored Gmail messages beside the Outlook mail.
-9. A second Gmail account, while the first is still connected, returns `mailbox_conflict` and does not replace the stored Gmail tokens. Outlook is unchanged.
+9. Connect a second Gmail account and verify both IDs appear. Sync both, then disconnect one by ID and confirm the sibling stays connected with its own mail.
 
 ## Connecting Slack
 

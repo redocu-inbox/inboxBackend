@@ -93,7 +93,7 @@ def active_mailboxes(session: Session, user_id: UUID) -> list[ConnectedAccount]:
                 ConnectedAccount.user_id == user_id,
                 ConnectedAccount.disconnected_at.is_(None),
             )
-            .order_by(ConnectedAccount.provider, ConnectedAccount.email)
+            .order_by(ConnectedAccount.provider, ConnectedAccount.email, ConnectedAccount.id)
         ).all()
     )
 
