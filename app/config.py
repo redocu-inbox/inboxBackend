@@ -98,10 +98,9 @@ class Settings(BaseSettings):
     # starts from POST /forms/jobs. Setting this true does not enqueue a match.
     form_match_on_sync: bool = False
 
-    # stub until ANTHROPIC_API_KEY is set. The hosted model is Claude.
+    # Enable hosted Claude explicitly with anthropic and a nonblank API key.
     llm_provider: str = "stub"
     llm_model: str = ""
-    openai_api_key: str = ""
     anthropic_api_key: str = ""
 
     # fake and console are local only. production must be resend or disabled.
@@ -112,6 +111,16 @@ class Settings(BaseSettings):
     forwarded_for_hops: int = 0
     password_reset_limit: int = 5
     password_reset_window_seconds: int = 3600
+
+    @field_validator("llm_provider")
+    @classmethod
+    def _validate_llm_provider(cls, value: str) -> str:
+        provider = value.strip().lower()
+        if provider not in {"anthropic", "stub"}:
+            raise ValueError(
+                "LLM_PROVIDER must be 'anthropic' for Claude or 'stub' for local development"
+            )
+        return provider
 
     @field_validator("mailbox_sync_interval_minutes", mode="before")
     @classmethod
