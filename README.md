@@ -1,8 +1,8 @@
 # Inbox API
 
-Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. An account can register and log in, connect Outlook, Gmail, and Slack, and read those sources in one list. Each synced message gets a rule-based category and priority score. A message can hold a local reply draft. An Outlook draft can be saved unsent, and a completed PDF can be attached to that unsent draft. Approving a ready Outlook or Gmail draft sends that email once and writes an approval row. Slack replies and new Slack messages use their own send routes. PDF form templates can be uploaded, and the AcroForm fields are stored on the template. Posting field values fills that PDF, and the owner can download it. A job without values matches one of that user's templates from the message text and asks Claude for field values when `ANTHROPIC_API_KEY` is set. With no key, that job stops for review and stores no PDF. List and detail include `suggested_form` for the newest reviewable fill on that message. The worker syncs each connected mailbox on a timer while the process is awake, and a Microsoft Graph webhook can enqueue an Outlook delta sync. The frontend connection lets a Vite app start Microsoft, Google, or Slack login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list.
+Backend for an AI-powered inbox. This repository runs a FastAPI app, an ARQ worker, Postgres 16 with pgvector, and Redis, all started with Docker Compose. An account can register and log in, connect Outlook, Gmail, and Slack, and read those sources in one list. Each synced message gets a rule-based category and priority score. A message can hold a local reply draft. An Outlook draft can be saved unsent, and a completed PDF can be attached to that unsent draft. Approving a ready Outlook or Gmail draft sends that email once and writes an approval row. Slack replies and new Slack messages use their own send routes. PDF form templates can be uploaded, and the AcroForm fields are stored on the template. Posting field values fills that PDF, and the owner can download it. A job without values matches one of that user's templates from the message text and asks Claude for field values when hosted processing is enabled. In stub mode, that job stops for review and stores no PDF. List and detail include `suggested_form` for the newest reviewable fill on that message. The worker syncs each connected mailbox on a timer while the process is awake, and a Microsoft Graph webhook can enqueue an Outlook delta sync. The frontend connection lets a Vite app start Microsoft, Google, or Slack login, land back on its own origin, read the connected mailbox, ask for a sync, and render the message list.
 
-The hosted model for reply drafts and form extraction is Claude. Set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`. `LLM_MODEL` overrides the default `claude-3-5-haiku-latest`. The local default stays `stub` when that key is empty. ChatGPT is not a backup provider.
+Reply drafts, AI compose, and form-field extraction use the local stub by default. To use Claude, follow [LLM setup](#llm-setup).
 
 You need [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or another Docker engine with Compose v2). You do not need a local Python install to run the stack.
 
@@ -123,7 +123,7 @@ app/
   services/inbox/         Threads, recipients, forwards, staged files, and approve-and-send
   services/mail/          Outlook and Gmail send used by approve
   services/forms/         Template storage, AcroForm schema, matching, suggestions, fill jobs, and PDF filling
-  services/llm/           Claude when ANTHROPIC_API_KEY is set; otherwise the stub
+  services/llm/           Local stub and opt-in Claude provider
   worker/                 ARQ settings. Mail jobs, form jobs, and the remaining jobs are separate modules
   storage/                Local filesystem storage, with a seam for S3/R2 later
 alembic/                  Schema migrations
@@ -225,7 +225,7 @@ ARQ job names are the function names. Mail jobs are in `app/worker/mail_tasks.py
 | `match_form_template`       | `POST /forms/jobs` when `values` is omitted | Scores that user's AcroForm templates, or uses the template the request already set. A JSON object of field values is saved and `run_form_fill` is enqueued. The stub, and any reply that is not a JSON object, finishes `needs_review` with confidence `0` and no file. A missing Anthropic key stays on the stub. It does not call Graph, Gmail, or Slack |
 | `run_form_fill`             | `POST /forms/jobs` when `values` is sent, and `POST /forms/jobs/{id}/refill` | Writes the saved values into the AcroForm and stores `forms/{user_id}/{job_id}/filled.pdf`. A template with no fillable fields fails. An empty value map finishes `needs_review` and stores no file. An unexpected error stays `running` until the third try, then fails with a short error |
 | `renew_graph_subscriptions` | cron at 00:00 and 12:00 | Renews Outlook subscriptions that expire within 24 hours. A 404 creates the subscription again. A 429 waits for Retry-After once, then the job fails so ARQ can retry |
-| `generate_reply_draft`      | `POST /messages/{id}/draft` | Writes the local reply body. The stub stores a fixed sentence. With an Anthropic key, the stored body is the Claude text. It does not call Graph |
+| `generate_reply_draft`      | `POST /messages/{id}/draft` | Writes the local reply body. The stub stores a fixed sentence. With Claude enabled, the stored body is the Claude text. It does not call Graph |
 | `sync_connected_mailboxes` | cron every 5 minutes by default | Syncs every connected Outlook, Gmail, and Slack mailbox through `sync_mailbox_delta`. Skips a mailbox that is already pending or running. One account's token or provider error does not stop the others |
 
 `sync_mailbox_delta` takes the account or subscription id, and an optional generation integer. It loads the `connected_accounts` row whose `graph_subscription_id` equals the first string. When no row matches and the string is a UUID, it loads that primary key. The connect callback and `POST /messages/sync` pass the account id and the generation they just stored. The webhook passes only a Graph subscription id. With `graph_subscription_id` empty, that lookup misses, the job logs that no account was found, and it returns. A disconnected mailbox or a generation that is no longer current returns without calling Graph.
@@ -242,7 +242,17 @@ When the worker starts, it runs that job for every connected mailbox, including 
 
 `SCORING_TIMEZONE` defaults to `America/New_York`. Today, tomorrow, weekdays, and due or overdue use that zone. An unknown value falls back to `America/New_York`. None of these settings are required.
 
-Reply drafts and form-field extraction call `get_llm()`. The hosted model is Claude. `LLM_PROVIDER=anthropic` with a non-empty `ANTHROPIC_API_KEY` returns that client. `LLM_MODEL` is sent when it is set; an empty model uses `claude-3-5-haiku-latest`. `LLM_PROVIDER=stub` (the default), an unknown provider, or `anthropic` with an empty key returns `StubLLM`. `complete` still returns the fixed string `[stub llm]`. That stub is the local stand-in used in development and tests. ChatGPT is not a backup provider. `.env.example` and `deploy.env.example` ask for the Anthropic key. If `LLM_PROVIDER=openai` and `OPENAI_API_KEY` are both set, the factory still builds the old client. New configuration uses Claude.
+### LLM setup
+
+Reply drafts, AI compose, and form-field extraction share the same provider settings. `LLM_PROVIDER=stub` is the default and makes no LLM network requests. `LLM_PROVIDER=anthropic` opts in to Claude when `ANTHROPIC_API_KEY` is nonblank. A blank key selects the stub. Any other provider value, including `openai`, causes a startup validation error.
+
+To enable Claude, set `LLM_PROVIDER=anthropic`, supply `ANTHROPIC_API_KEY` through your environment or host's secret settings, and set `LLM_MODEL` to an active Claude API model. Both example files list `claude-haiku-4-5-20251001`. Set the model explicitly because the application's fallback, Claude Haiku 3.5, has been retired. [Anthropic model lifecycle](https://platform.claude.com/docs/en/about-claude/model-deprecations)
+
+### LLM rollout checks
+
+1. Inspect the effective environment for the API and worker. With `docker-compose.deploy.yml`, both read `deploy.env`. On Render, check each service's **Environment** page and linked environment groups. If the service runs `python -m app.deploy.demo`, both processes share that service's environment. Service-level values take precedence over linked groups. [Render environment settings](https://render.com/docs/configure-environment-variables)
+2. Before deploying, remove `OPENAI_API_KEY` and replace any `LLM_PROVIDER=openai` setting. For a stub-only rollout, confirm `LLM_PROVIDER=stub` for both processes. For a Claude rollout, confirm both processes have `LLM_PROVIDER=anthropic`, the same intended active `LLM_MODEL`, and a nonblank `ANTHROPIC_API_KEY`. Record only whether the key is configured.
+3. After deploy, confirm the API and worker start successfully. Use test data to generate a reply draft, compose an unsent email, and extract fields from a form.
 
 ## Why SQLModel
 
@@ -451,7 +461,7 @@ Detail also returns nullable `body_html` for Outlook and Gmail. The fragment con
 
 Another user's message id is `404` with detail `Message not found.`
 
-`generate_reply_draft` copies the subject, body, and preview inside a database session, then calls Claude after that session closes when an Anthropic key is set. On the stub, including a missing key, the stored body is `Thanks for your message. I will review it and reply shortly.` With the key set, the stored body is the Claude text. Success sets `status` to `ready` and `source` to `llm`. `StubLLM.complete` still returns `[stub llm]`. A failed run sets `status` to `failed` and `error` to `generation failed`, and it keeps the existing body. If the queue rejects the job, the response is `503` with detail `Reply draft could not be queued.` The row is `failed`, the error is `generation failed`, and the body is kept.
+`generate_reply_draft` copies the subject, body, and preview inside a database session, then calls the configured LLM after that session closes. In stub mode, the stored body is `Thanks for your message. I will review it and reply shortly.` With Claude enabled, the stored body is the Claude text. Success sets `status` to `ready` and `source` to `llm`. `StubLLM.complete` still returns `[stub llm]`. A failed run sets `status` to `failed` and `error` to `generation failed`, and it keeps the existing body. If the queue rejects the job, the response is `503` with detail `Reply draft could not be queued.` The row is `failed`, the error is `generation failed`, and the body is kept.
 
 ### Approve and send
 
@@ -497,7 +507,7 @@ CORS allows `GET`, `POST`, `PATCH`, `DELETE`, and `OPTIONS`. `DELETE /messages/{
 Deploy:
 
 1. Back up Postgres.
-2. Set the environment above in `deploy.env`. Do not point `FRONTEND_URL` at a path. Do not commit that file.
+2. Set the environment above in `deploy.env` or your host's environment settings. Use an origin with no path for `FRONTEND_URL` and keep secrets out of git. Complete the [LLM rollout checks](#llm-rollout-checks).
 3. Run `python -m app.deploy.migrate_once` once. It holds a Postgres advisory lock. The API and the worker do not migrate on their own.
 4. Start the API and the worker as two processes. Restart them together so they share the new columns.
 5. Existing JWTs without `jti` keep working until they expire. New logins get a `jti`. `POST /auth/logout` stores that `jti` in Postgres. A Redis restart does not undo a logout.

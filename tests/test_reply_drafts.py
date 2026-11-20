@@ -1,13 +1,17 @@
 """Local reply drafts, the unsent Outlook push, and the stub LLM fallback."""
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 from sqlmodel import Session, select
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import engine
 from app.main import app
 from app.models.connected_account import ConnectedAccount
@@ -16,11 +20,12 @@ from app.models.reply_draft import ReplyDraft, ReplyDraftStatus
 from app.services.graph.drafts import GraphDraftError
 from app.services.graph.tokens import TokenRefreshError
 from app.services.llm.factory import get_llm
-from app.services.llm.providers import AnthropicClient, OpenAIClient, _anthropic_text, _openai_text
 from app.services.llm.stub import StubLLM
-from app.services.reply_drafts.generation import STUB_REPLY_SENTENCE, final_reply_body
-from app.worker.settings import WorkerSettings
+from app.services.reply_drafts.generation import STUB_REPLY_SENTENCE
+from app.worker.form_tasks import match_form_template
 from app.worker.mail_tasks import _fail_reply_draft, generate_reply_draft
+from app.worker.settings import WorkerSettings
+from tests.pdf_fixtures import text_field_pdf_bytes
 from tests.test_frontend_connect import DETAIL_KEYS, DRAFT_KEYS, LIST_KEYS, _add_account, _add_message, _user_id
 
 _CONTRACT = {
@@ -281,72 +286,130 @@ def test_failed_regenerate_keeps_the_pending_body(client, register_user, monkeyp
     assert failed["source"] == "user"
 
 
-def test_configured_provider_stores_model_text_and_a_blank_key_stays_on_the_stub(
-    client, register_user, monkeypatch
-):
+@pytest.fixture(params=["stub", "blank-key", "claude", "timeout"])
+def llm_transport(request, monkeypatch):
+    mode = request.param
     settings = get_settings()
-    monkeypatch.setattr(settings, "llm_provider", "openai")
-    monkeypatch.setattr(settings, "openai_api_key", "")
-    monkeypatch.setattr(settings, "anthropic_api_key", "   ")
-    monkeypatch.setattr(settings, "llm_model", "")
-    assert isinstance(get_llm(), StubLLM)
-    monkeypatch.setattr(settings, "llm_provider", "anthropic")
-    assert isinstance(get_llm(), StubLLM)
-    monkeypatch.setattr(settings, "llm_provider", "unknown")
-    assert isinstance(get_llm(), StubLLM)
-    monkeypatch.setattr(settings, "llm_provider", "stub")
-    assert isinstance(get_llm(), StubLLM)
-
-    monkeypatch.setattr(settings, "llm_provider", "openai")
-    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
-    monkeypatch.setattr(settings, "llm_model", "gpt-test")
-    client_model = get_llm()
-    assert isinstance(client_model, OpenAIClient)
-    assert client_model.model == "gpt-test"
-    monkeypatch.setattr(settings, "llm_model", "")
-    assert get_llm().model == "gpt-4o-mini"
-    monkeypatch.setattr(settings, "llm_provider", "anthropic")
-    monkeypatch.setattr(settings, "anthropic_api_key", "sk-ant")
+    monkeypatch.setattr(settings, "llm_provider", "stub" if mode == "stub" else "anthropic")
+    monkeypatch.setattr(settings, "anthropic_api_key", " " if mode == "blank-key" else "test-key")
     monkeypatch.setattr(settings, "llm_model", "claude-test")
-    anthropic = get_llm()
-    assert isinstance(anthropic, AnthropicClient)
-    assert anthropic.model == "claude-test"
-    assert _openai_text({"choices": [{"message": {"content": "Hello"}}]}) == "Hello"
-    assert _anthropic_text({"content": [{"type": "text", "text": "Hello"}]}) == "Hello"
-    with pytest.raises(RuntimeError):
-        _openai_text({"choices": []})
 
-    def explode(*_args, **_kwargs):
-        raise AssertionError("llm client opened a socket")
+    transport = Mock(side_effect=None if mode == "claude" else TimeoutError)
+    monkeypatch.setattr("app.services.llm.providers.urlopen", transport)
+    effective_mode = "stub" if mode == "blank-key" else mode
+    yield effective_mode, transport
 
-    monkeypatch.setattr("app.services.llm.providers.urlopen", explode)
-    headers, _user_id, _account_id, message_id = _mailbox(client, register_user, email="model@example.com")
-    assert client.post(f"/messages/{message_id}/draft", headers=headers).status_code == 200
-    monkeypatch.setattr(settings, "llm_provider", "openai")
-    monkeypatch.setattr(settings, "openai_api_key", "")
+    if effective_mode == "stub":
+        transport.assert_not_called()
+    else:
+        transport.assert_called()
+        request_body = json.loads(transport.call_args.args[0].data)
+        assert request_body["model"] == "claude-test"
+
+
+def _claude_response(text: str) -> BytesIO:
+    return BytesIO(json.dumps({"content": [{"type": "text", "text": text}]}).encode())
+
+
+def test_legacy_openai_config_is_rejected(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    with pytest.raises(ValidationError, match="LLM_PROVIDER must be 'anthropic'.*'stub'"):
+        Settings(_env_file=None)
+
+
+def test_reply_draft_llm(client, register_user, llm_transport):
+    mode, transport = llm_transport
+    transport.return_value = _claude_response("  See you Thursday. ")
+    headers, user_id, _, message_id = _mailbox(client, register_user)
+    _insert_draft(user_id, message_id, body="Keep this reply", source="user")
+    path = f"/messages/{message_id}/draft"
+
+    response = client.post(path, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
     asyncio.run(generate_reply_draft({}, message_id))
-    blank = client.get(f"/messages/{message_id}/draft", headers=headers).json()
-    assert blank["body"] == STUB_REPLY_SENTENCE
-    assert final_reply_body("stub", "[stub llm]") == STUB_REPLY_SENTENCE
+    draft = client.get(path, headers=headers).json()
 
-    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
-    monkeypatch.setattr(settings, "llm_model", "gpt-test")
-    with Session(engine) as session:
-        draft = session.exec(select(ReplyDraft).where(ReplyDraft.message_id == UUID(message_id))).one()
-        draft.status = ReplyDraftStatus.pending
-        session.add(draft)
-        session.commit()
+    if mode == "timeout":
+        assert draft["status"] == "failed"
+        assert draft["error"] == "generation failed"
+        assert draft["body"] == "Keep this reply"
+        assert draft["source"] == "user"
+    else:
+        assert draft["status"] == "ready"
+        assert draft["error"] is None
+        assert draft["body"] == (STUB_REPLY_SENTENCE if mode == "stub" else "See you Thursday.")
+        assert draft["source"] == "llm"
 
-    async def complete(self, *, system, user):
-        assert self.model == "gpt-test"
-        return "  See you Thursday. "
 
-    monkeypatch.setattr(OpenAIClient, "complete", complete)
-    asyncio.run(generate_reply_draft({}, message_id))
-    ready = client.get(f"/messages/{message_id}/draft", headers=headers).json()
-    assert ready["status"] == "ready"
-    assert ready["body"] == "See you Thursday."
-    assert ready["source"] == "llm"
+def test_ai_compose_llm(client, register_user, llm_transport):
+    mode, transport = llm_transport
+    transport.return_value = _claude_response("  See you Thursday. ")
+    headers, _, account_id, _ = _mailbox(client, register_user)
+
+    response = client.post(
+        "/messages/new",
+        headers=headers,
+        json={
+            "account_id": account_id,
+            "to": ["maya@example.com"],
+            "subject": "Thursday",
+            "instructions": "Confirm Thursday.",
+        },
+    )
+
+    if mode == "timeout":
+        assert response.status_code == 503
+        assert response.json() == {"detail": "The draft could not be written."}
+    else:
+        assert response.status_code == 201, response.text
+        draft = response.json()["draft"]
+        assert draft["status"] == "ready"
+        assert draft["source"] == "llm"
+        assert draft["body"] == ("[stub llm]" if mode == "stub" else "See you Thursday.")
+
+
+def test_form_extraction_llm(client, register_user, llm_transport):
+    mode, transport = llm_transport
+    transport.return_value = _claude_response('{"Name": "Ada"}')
+    headers, _, _, message_id = _mailbox(client, register_user)
+    uploaded = client.post(
+        "/forms/templates",
+        headers=headers,
+        files={"file": ("intake.pdf", text_field_pdf_bytes("Name"), "application/pdf")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+
+    created = client.post(
+        "/forms/jobs",
+        headers=headers,
+        json={"template_id": uploaded.json()["id"], "message_id": message_id},
+    )
+    assert created.status_code == 200, created.text
+    job_id = created.json()["id"]
+    path = f"/forms/jobs/{job_id}"
+    queue = AsyncMock()
+
+    if mode == "timeout":
+        with pytest.raises(RuntimeError, match="llm_unavailable"):
+            asyncio.run(match_form_template({"redis": queue, "job_try": 1}, job_id))
+        assert client.get(path, headers=headers).json()["status"] == "running"
+        asyncio.run(match_form_template({"redis": queue, "job_try": 3}, job_id))
+        assert transport.call_count == 2
+    else:
+        asyncio.run(match_form_template({"redis": queue, "job_try": 1}, job_id))
+
+    job = client.get(path, headers=headers).json()
+    if mode == "claude":
+        assert job["status"] == "pending"
+        assert job["extracted_values"] == {"Name": "Ada"}
+        queue.enqueue_job.assert_awaited_once_with("run_form_fill", job_id)
+    else:
+        assert job["status"] == ("failed" if mode == "timeout" else "needs_review")
+        assert job["error"] == ("The form could not be matched." if mode == "timeout" else None)
+        assert job["extracted_values"] == {}
+        assert job["file_ready"] is False
+        queue.enqueue_job.assert_not_awaited()
 
 
 def test_outlook_push_creates_then_patches_the_same_unsent_draft(client, register_user, monkeypatch):
