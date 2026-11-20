@@ -28,24 +28,24 @@ class _StripeResponse(io.BytesIO):
         return self.url
 
 
-def _stage_deletion(client, register_user, *, link_before_request=True):
+def _stage_deletion(client, register_user, delete_account, *, link_before_request=True):
     headers = register_user("stripe@example.com")
     user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
     if not link_before_request:
-        assert client.delete("/users/me", headers=headers).status_code == 202
+        assert delete_account(headers, "stripe@example.com").status_code == 202
     with Session(engine) as session:
         user = session.get(User, user_id)
         user.stripe_customer_id = _CUSTOMER_ID
         session.commit()
     if link_before_request:
         assert "stripe_customer_id" not in client.get("/users/me", headers=headers).json()
-        assert client.delete("/users/me", headers=headers).status_code == 202
+        assert delete_account(headers, "stripe@example.com").status_code == 202
     return user_id
 
 
 @pytest.mark.parametrize("stripe_received_delete", [False, True])
-def test_stripe_cleanup_retries_after_local_purge(client, register_user, monkeypatch, stripe_received_delete):
-    user_id = _stage_deletion(client, register_user)
+def test_stripe_cleanup_retries_after_local_purge(client, register_user, delete_account, monkeypatch, stripe_received_delete):
+    user_id = _stage_deletion(client, register_user, delete_account)
     asyncio.run(purge_deleted_accounts({}))
 
     monkeypatch.setattr(get_settings(), "stripe_secret_key", SecretStr("sk_test_example"))
@@ -89,8 +89,8 @@ def test_stripe_cleanup_retries_after_local_purge(client, register_user, monkeyp
 
 
 @pytest.mark.parametrize("outcome", ["wrong_owner", "missing_customer"])
-def test_stripe_cleanup_requires_confirmation(client, register_user, monkeypatch, outcome):
-    user_id = _stage_deletion(client, register_user)
+def test_stripe_cleanup_requires_confirmation(client, register_user, delete_account, monkeypatch, outcome):
+    user_id = _stage_deletion(client, register_user, delete_account)
     monkeypatch.setattr(get_settings(), "stripe_secret_key", SecretStr("sk_test_example"))
     methods = []
 
@@ -112,8 +112,8 @@ def test_stripe_cleanup_requires_confirmation(client, register_user, monkeypatch
     assert methods == ["GET"]
 
 
-def test_local_purge_preserves_a_backfilled_customer_without_stripe_credentials(client, register_user, monkeypatch):
-    user_id = _stage_deletion(client, register_user, link_before_request=False)
+def test_local_purge_preserves_a_backfilled_customer_without_stripe_credentials(client, register_user, delete_account, monkeypatch):
+    user_id = _stage_deletion(client, register_user, delete_account, link_before_request=False)
     monkeypatch.setattr(get_settings(), "stripe_secret_key", SecretStr(""))
 
     def deny_network(*_args, **_kwargs):

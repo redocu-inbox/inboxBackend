@@ -48,14 +48,14 @@ def _upload_attachment(client, headers) -> UUID:
     return UUID(response.json()["id"])
 
 
-def test_request_is_durable_and_blocks_access_for_only_its_owner(client, register_user):
+def test_request_is_durable_and_blocks_access_for_only_its_owner(client, register_user, delete_account):
     headers = register_user("delete@example.com")
     other = register_user("other@example.com")
     user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
     assert client.delete("/users/me").status_code == 401
 
-    accepted = client.delete("/users/me", headers=headers)
-    repeated = client.delete("/users/me", headers=headers)
+    accepted = delete_account(headers, " DELETE@example.com ")
+    repeated = delete_account(headers, "delete@example.com")
     assert accepted.status_code == repeated.status_code == 202
     assert accepted.json() == repeated.json()
     assert accepted.json()["status"] == "pending"
@@ -76,7 +76,45 @@ def test_request_is_durable_and_blocks_access_for_only_its_owner(client, registe
         assert session.get(AccountDeletion, user_id) is not None
 
 
-def test_deletion_can_retry_after_a_request_that_already_committed(client, register_user):
+@pytest.mark.parametrize(
+    ("body", "expected_status", "detail"),
+    [
+        ({"confirmation_email": "confirm@example.com"}, 422, "invalid_deletion_confirmation"),
+        ({"confirmation_email": "confirm@example.com", "password": "secret" * 30}, 422, "invalid_deletion_confirmation"),
+        ({"confirmation_email": "confirm@example.com", "password": "secret", "unknown": "private input"}, 422, "invalid_deletion_confirmation"),
+        ({"confirmation_email": "other@example.com", "password": "correct-horse-battery"}, 422, "confirmation_email_mismatch"),
+        ({"confirmation_email": "confirm@example.com", "password": "wrong password"}, 403, "incorrect_password"),
+        ({"confirmation_email": "confirm@example.com", "password": " correct-horse-battery "}, 403, "incorrect_password"),
+        ({"confirmation_email": "confirm@example.com", "password": "correct-horse-battery", "mfa_code": "123456"}, 422, "mfa_verification_unavailable"),
+    ],
+)
+def test_confirmation_failure_preserves_account(client, register_user, deletion_rate_store, body, expected_status, detail):
+    headers = register_user("confirm@example.com")
+    response = client.request("DELETE", "/users/me", headers=headers, json=body)
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": detail}
+    assert client.get("/users/me", headers=headers).status_code == 200
+    with Session(engine) as session:
+        assert session.exec(select(AccountDeletion)).first() is None
+
+
+def test_rate_limit_and_store_failure_do_not_accept_deletion(client, register_user, deletion_rate_store, delete_account):
+    headers = register_user("limited@example.com")
+    deletion_rate_store.eval.return_value = 6
+    limited = delete_account(headers, "limited@example.com")
+    assert limited.status_code == 429
+    assert limited.json() == {"detail": "rate_limited"}
+
+    deletion_rate_store.eval.side_effect = ConnectionError
+    unavailable = delete_account(headers, "limited@example.com")
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {"detail": "deletion_confirmation_unavailable"}
+    assert client.get("/users/me", headers=headers).status_code == 200
+    with Session(engine) as session:
+        assert session.exec(select(AccountDeletion)).first() is None
+
+
+def test_deletion_can_retry_after_a_request_that_already_committed(client, register_user, delete_account):
     headers = register_user("busy@example.com")
     user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
     template_id = _upload_template(client, headers)
@@ -84,7 +122,7 @@ def test_deletion_can_retry_after_a_request_that_already_committed(client, regis
     async def check_during_enqueue(_name, job_id):
         with Session(engine) as session:
             assert session.get(FormFillJob, UUID(job_id)) is not None
-        response = await asyncio.to_thread(client.delete, "/users/me", headers=headers)
+        response = await asyncio.to_thread(delete_account, headers, "busy@example.com")
         assert response.status_code == 409
         assert response.headers["Retry-After"] == "1"
 
@@ -95,10 +133,10 @@ def test_deletion_can_retry_after_a_request_that_already_committed(client, regis
     assert created.status_code == 200
     with Session(engine) as session:
         assert session.get(AccountDeletion, user_id) is None
-    assert client.delete("/users/me", headers=headers).status_code == 202
+    assert delete_account(headers, "busy@example.com").status_code == 202
 
 
-def test_queued_mailbox_and_password_reset_work_skip_deleting_user(client, register_user, monkeypatch):
+def test_queued_mailbox_and_password_reset_work_skip_deleting_user(client, register_user, monkeypatch, delete_account):
     headers = register_user("queued@example.com")
     user_id = client.get("/users/me", headers=headers).json()["id"]
     account_id = _add_account(user_id, provider="google", email="queued@gmail.com")
@@ -108,7 +146,7 @@ def test_queued_mailbox_and_password_reset_work_skip_deleting_user(client, regis
     monkeypatch.setattr("app.worker.mail_tasks.refresh_google_access_token", provider)
     assert client.post("/auth/forgot-password", json={"email": "queued@example.com"}).status_code == 202
     _, _, request_id = client.app.state.arq.enqueue_job.await_args.args
-    assert client.delete("/users/me", headers=headers).status_code == 202
+    assert delete_account(headers, "queued@example.com").status_code == 202
 
     asyncio.run(send_password_reset({}, user_id, request_id))
     asyncio.run(sync_mailbox_delta({}, account_id))
@@ -121,7 +159,7 @@ def test_queued_mailbox_and_password_reset_work_skip_deleting_user(client, regis
 
 @pytest.mark.parametrize("purge_before_save", [False, True])
 def test_form_fill_cannot_save_after_deletion_is_requested(
-    client, register_user, tmp_path, monkeypatch, purge_before_save
+    client, register_user, tmp_path, monkeypatch, purge_before_save, delete_account
 ):
     headers = register_user("filling@example.com")
     template_id = _upload_template(client, headers)
@@ -134,7 +172,7 @@ def test_form_fill_cannot_save_after_deletion_is_requested(
     class DeletingFiller(PdfFormFiller):
         def fill(self, template, values):
             result = super().fill(template, values)
-            assert client.delete("/users/me", headers=headers).status_code == 202
+            assert delete_account(headers, "filling@example.com").status_code == 202
             if purge_before_save:
                 purge_pending_accounts()
             return result
@@ -152,7 +190,7 @@ def test_form_fill_cannot_save_after_deletion_is_requested(
     assert list(tmp_path.rglob("filled.pdf")) == []
 
 
-def test_worker_purges_only_owned_rows_and_files(client, register_user, tmp_path):
+def test_worker_purges_only_owned_rows_and_files(client, register_user, tmp_path, delete_account):
     headers = register_user("purge@example.com")
     other = register_user("keep@example.com")
     user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
@@ -177,7 +215,7 @@ def test_worker_purges_only_owned_rows_and_files(client, register_user, tmp_path
     other_file = tmp_path / f"attachments/{other_id}/{other_attachment}"
     (tmp_path / f"attachments/{user_id}/link").symlink_to(other_file)
 
-    assert client.delete("/users/me", headers=headers).status_code == 202
+    assert delete_account(headers, "purge@example.com").status_code == 202
     asyncio.run(purge_deleted_accounts({}))
     asyncio.run(purge_deleted_accounts({}))
 
@@ -197,15 +235,15 @@ def test_worker_purges_only_owned_rows_and_files(client, register_user, tmp_path
     assert client.get("/users/me", headers=other).status_code == 200
 
 
-def test_worker_retries_after_removing_only_some_files(client, register_user, tmp_path, monkeypatch):
+def test_worker_retries_after_removing_only_some_files(client, register_user, tmp_path, monkeypatch, delete_account):
     headers = register_user("retry@example.com")
     other = register_user("next@example.com")
     user_id = UUID(client.get("/users/me", headers=headers).json()["id"])
     other_id = UUID(client.get("/users/me", headers=other).json()["id"])
     template_id = UUID(_upload_template(client, headers))
     attachment_id = _upload_attachment(client, headers)
-    assert client.delete("/users/me", headers=headers).status_code == 202
-    assert client.delete("/users/me", headers=other).status_code == 202
+    assert delete_account(headers, "retry@example.com").status_code == 202
+    assert delete_account(other, "next@example.com").status_code == 202
 
     file_store = storage.get_storage()
     delete_tree = file_store.delete_tree

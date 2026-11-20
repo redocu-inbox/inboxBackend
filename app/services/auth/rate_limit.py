@@ -1,4 +1,4 @@
-"""Fixed-window counters for password reset. Redis stores hashes, not raw emails."""
+"""Fixed-window counters for account authentication flows."""
 
 import hashlib
 import ipaddress
@@ -22,7 +22,7 @@ class RateLimitUnavailable(Exception):
 
 
 class RateLimitExceeded(Exception):
-    """The email bucket or the IP bucket is over the window limit."""
+    """An attempt bucket is over the window limit."""
 
 
 def _digest(value: str) -> str:
@@ -71,16 +71,22 @@ def enforce_password_reset_limit(*, email: str, ip: str) -> None:
         f"pwdreset:email:{_digest(email)}",
         f"pwdreset:ip:{_digest(ip)}",
     )
+    _enforce_limit(keys, settings.password_reset_limit, settings.password_reset_window_seconds)
+
+
+def enforce_account_deletion_limit(user_id: str) -> None:
+    """Limit password checks for an authenticated account independently of password reset."""
+    _enforce_limit((f"account-delete:user:{_digest(user_id)}",), limit=5, window_seconds=15 * 60)
+
+
+def _enforce_limit(keys: tuple[str, ...], limit: int, window_seconds: int) -> None:
     try:
         client = _client()
         try:
-            counts = [
-                int(client.eval(_SCRIPT, 1, key, str(settings.password_reset_window_seconds)))
-                for key in keys
-            ]
+            counts = [int(client.eval(_SCRIPT, 1, key, str(window_seconds))) for key in keys]
         finally:
             client.close()
-    except Exception as exc:
+    except Exception:
         raise RateLimitUnavailable() from None
-    if any(count > settings.password_reset_limit for count in counts):
+    if any(count > limit for count in counts):
         raise RateLimitExceeded()
