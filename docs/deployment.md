@@ -170,7 +170,16 @@ Do this only after the process is up, Postgres has the `vector` extension, and t
 3. `GET /auth/microsoft/start` with that bearer token returns `authorization_url` on `https://login.microsoftonline.com/`. The token is not in that URL.
 4. Open the URL in a browser, sign in, and stop on `https://redocu.app/inbox`. Success is `connected=1`. Failure is `connected=0` and one of `microsoft_denied`, `invalid_state`, `token_exchange`, `mailbox_taken`, `mailbox_conflict`.
 5. `GET /users/me` shows `mailbox.email`. `POST /messages/sync` returns 202. Poll `GET /messages` until rows appear or `sync.status` is `idle` or `failed`.
-6. Stop. Do not call a send endpoint. This API does not implement send. Do not grant `Mail.Send` for this test.
+6. Stop after sync. This smoke test ends before approving a reply.
+
+## Approve & send release check
+
+1. Deploy the API on Render before releasing the confirmation UI on Cloudflare. Run `python -m app.deploy.migrate_once` as part of the API release and check that the deployment is healthy. The confirmation UI uses `GET /messages/{id}/send-attempts/{attempt_id}` and reads `pending_send_attempt_id` from message detail after a reload.
+2. Connect dedicated test mailboxes. Outlook needs `Mail.ReadWrite` to prepare drafts and `Mail.Send` to submit them. Gmail needs `gmail.send` or `gmail.modify` to send. Reconnect test mailboxes whose existing consent lacks the send permission.
+3. From an inbox you control, send a fresh message to each test mailbox. Open each message in redocu, generate a reply, save a distinct edit, and click **Approve & send**. Check that the edited reply arrives once, from the original message's mailbox, and that redocu adds one approval record.
+4. When Outlook returns pending confirmation, reload and use **Check send status** on the same message. The app should show **Sent** once it finds the provider's sent copy. If confirmation stays pending, check that mailbox's Sent folder and keep the attempt pending while the outcome is uncertain.
+
+Run double-click and lost-response checks with simulated providers before rollout. A second approval request must use the existing attempt and the provider must receive exactly one send request.
 
 ## Slack
 

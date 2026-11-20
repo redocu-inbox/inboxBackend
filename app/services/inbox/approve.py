@@ -355,11 +355,14 @@ def approve_message(session: Session, user: User, message_id: UUID) -> tuple[Mes
         else:
             mail_send.send_outlook_draft(token, reference)
     except mail_send.MailSendUncertain:
-        message = _message(session, user_id, message_id)
-        return message, None if message.approved_at is not None else attempt_id
+        pass
     except mail_send.MailSendError:
         _finish_attempt(session, message_id, attempt_id, sent=False)
         raise HTTPException(502, "The mailbox could not send this email.") from None
+    else:
+        # Graph accepts the submission before the sent copy is available.
+        if is_gmail:
+            _finish_attempt(session, message_id, attempt_id, sent=True)
 
-    _finish_attempt(session, message_id, attempt_id, sent=True)
-    return _message(session, user_id, message_id), None
+    message = _message(session, user_id, message_id)
+    return message, attempt_id if message.approved_at is None else None

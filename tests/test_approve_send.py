@@ -10,6 +10,7 @@ from io import BytesIO
 from threading import Event
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
+from urllib.response import addinfourl
 from uuid import UUID
 
 import pytest
@@ -61,7 +62,7 @@ def _draft(
         session.commit()
 
 
-def test_approve_sends_the_edited_recipients_once(client, register_user, monkeypatch):
+def test_outlook_acceptance_waits_for_confirmation_without_resending(client, register_user, monkeypatch):
     headers = register_user("ana@example.com")
     user_id = _user_id(client, headers)
     account_id = _add_account(user_id, email="ana@outlook.com")
@@ -83,6 +84,7 @@ def test_approve_sends_the_edited_recipients_once(client, register_user, monkeyp
     )
     assert updated.status_code == 200
     calls = []
+    confirmation_visible = False
 
     def provider(request, *, timeout):
         assert request.get_header("Authorization") == "Bearer secret-access-token"
@@ -96,12 +98,20 @@ def test_approve_sends_the_edited_recipients_once(client, register_user, monkeyp
                 attempt = session.exec(select(Approval)).one()
                 assert attempt.provider_reference == "immutable-draft"
                 assert attempt.approved_at is None
+            return addinfourl(BytesIO(), {}, request.full_url, 202)
+        if request.get_method() == "GET":
+            if not confirmation_visible:
+                raise HTTPError(request.full_url, 404, "Not indexed yet", {}, BytesIO())
+            return BytesIO(b'{"isDraft":false,"sentDateTime":"2026-11-19T20:00:00Z"}')
         return BytesIO()
 
     monkeypatch.setattr(mail_send, "urlopen", provider)
-    first = client.post(f"/messages/{message_id}/approve", headers=headers)
-    assert first.status_code == 200
-    assert first.json()["approved_at"] is not None
+    path = f"/messages/{message_id}/approve"
+    first = client.post(path, headers=headers)
+    assert first.status_code == 202
+    pending = first.json()
+    assert pending["send_status"] == "confirmation_pending"
+    attempt_id = pending["attempt_id"]
     assert calls == [
         ("POST", f"{_GRAPH}/translateExchangeIds", {
             "inputIds": ["saved-draft"],
@@ -116,11 +126,36 @@ def test_approve_sends_the_edited_recipients_once(client, register_user, monkeyp
         }),
         ("POST", f"{_GRAPH}/messages/immutable-draft/send", None),
     ]
-    second = client.post(f"/messages/{message_id}/approve", headers=headers)
-    assert second.status_code == 409
-    assert len(calls) == 3
+    detail_path = f"/messages/{message_id}"
+    status_path = f"{detail_path}/send-attempts/{attempt_id}"
+    detail = client.get(detail_path, headers=headers).json()
+    assert detail["pending_send_attempt_id"] == attempt_id
+    assert detail["approved_at"] is None
+    assert client.get("/approvals", headers=headers).json() == []
+
+    repeated = client.post(path, headers=headers)
+    assert repeated.status_code == 202
+    assert repeated.json() == pending
+    check = client.get(status_path, headers=headers)
+    assert check.status_code == 200
+    assert check.json() == {**pending, "approved_at": None}
+    assert client.get("/approvals", headers=headers).json() == []
+
+    confirmation_visible = True
+    confirmed = client.get(status_path, headers=headers)
+    assert confirmed.status_code == 200
+    assert confirmed.json()["send_status"] == "sent"
+    assert confirmed.json()["attempt_id"] == attempt_id
+    detail = client.get(detail_path, headers=headers).json()
+    assert detail["pending_send_attempt_id"] is None
+    assert detail["approved_at"] == confirmed.json()["approved_at"]
+    assert detail["approved_at"] is not None
+    assert client.post(path, headers=headers).status_code == 409
     other = register_user("bob@example.com")
-    assert client.post(f"/messages/{message_id}/approve", headers=other).status_code == 404
+    assert client.post(path, headers=other).status_code == 404
+    assert calls[3:] == [
+        ("GET", f"{_GRAPH}/messages/immutable-draft?$select=isDraft,sentDateTime", None),
+    ] * 3
     record = client.get("/approvals", headers=headers)
     assert record.status_code == 200
     assert record.headers["X-Total-Count"] == "1"
@@ -182,7 +217,7 @@ def test_forward_sends_the_composed_body_and_not_the_source_file(client, registe
 
     monkeypatch.setattr(mail_send, "urlopen", provider)
     response = client.post(f"/messages/{forward_id}/approve", headers=headers)
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert calls == [
         (f"{_GRAPH}/messages", {
             "body": {"contentType": "Text", "content": "Please see the note."},
@@ -303,7 +338,7 @@ def test_simultaneous_approvals_make_one_provider_send(client, register_user, mo
         sends.append(path)
         send_entered.set()
         assert response_allowed.wait(5)
-        return BytesIO()
+        return addinfourl(BytesIO(), {}, request.full_url, 202)
 
     monkeypatch.setattr(mail_send, "urlopen", provider)
     path = f"/messages/{message_id}/approve"
@@ -322,10 +357,12 @@ def test_simultaneous_approvals_make_one_provider_send(client, register_user, mo
                 assert attempt.approved_at is None
         finally:
             response_allowed.set()
-        assert first.result(timeout=5).status_code == 200
+        original = first.result(timeout=5)
+        assert original.status_code == 202
+        assert original.json() == second.json()
 
     assert len(sends) == 1
-    assert len(client.get("/approvals", headers=headers).json()) == 1
+    assert client.get("/approvals", headers=headers).json() == []
 
 
 @pytest.mark.parametrize("provider_name", ["microsoft", "google"])
